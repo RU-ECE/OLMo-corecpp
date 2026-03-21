@@ -1,62 +1,38 @@
-# build artifacts
-
-.eggs/
-.mypy_cache
-*.egg-info/
+# Build
 build/
-dist/
-pip-wheel-metadata/
-private/
-tmp/
+*.o
+*.a
+*.so
+*.dylib
 
-# dev tools
+# Data files (too large for git)
+data/*.npy
+data/*.bin
+data/*.tok
 
-.envrc
-.python-version
-.idea
-.venv/
+# Checkpoints
+checkpoints/
+*.pt
+*.ckpt
+
+# IDE
 .vscode/
-.cursor/
-/*.iml
-pyrightconfig.json
-.ruff.toml
-uv.lock
-
-
-# jupyter notebooks
-
-.ipynb_checkpoints
-
-
-# miscellaneous
-
-.cache/
-doc/_build/
+.idea/
 *.swp
+*.swo
+*~
+
+# OS
 .DS_Store
+Thumbs.db
 
+# Third-party deps (fetched by CMake)
+third_party/
 
-# python
+# Benchmark outputs
+benchmark_results.json
 
+# Python
+__pycache__/
 *.pyc
-*.pyo
-__pycache__
-
-
-# testing and continuous integration
-
-.coverage
-.pytest_cache/
-.benchmarks
-
-# documentation build artifacts
-
-docs/build
-site/
-
-# runs
-/runs/
-/wandb/
-/scratch/
-core
-/dataset-cache/
+.venv/

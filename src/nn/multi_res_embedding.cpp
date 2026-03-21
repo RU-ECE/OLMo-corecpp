@@ -1,0 +1,277 @@
+#include "olmo_cpp/nn/multi_res_embedding.hpp"
+#include "olmo_cpp/data/bpe_tokenizer.hpp"
+#include <algorithm>
+#include <cctype>
+#include <iostream>
+
+namespace olmo_cpp {
+
+// ── djb2 hash for character trigrams ──────────────────────────────────
+static inline uint32_t djb2_trigram(char a, char b, char c) {
+  uint32_t h = 5381;
+  h = h * 33 + static_cast<uint8_t>(a);
+  h = h * 33 + static_cast<uint8_t>(b);
+  h = h * 33 + static_cast<uint8_t>(c);
+  return h;
+}
+
+// ── Classify a BPE token string into a syntactic role ────────────────
+static SyntacticRole classify_bpe_token(const std::string& tok) {
+  if (tok.empty()) return SyntacticRole::OTHER;
+
+  // Check for whitespace prefix (BPE continuation token — starts with Ġ or space)
+  bool has_space_prefix = false;
+  size_t start = 0;
+  if (tok.size() >= 2 && static_cast<uint8_t>(tok[0]) == 0xC4 &&
+      static_cast<uint8_t>(tok[1]) == 0xA0) {
+    // UTF-8 Ġ (U+0120) — GPT-2's representation of leading space
+    has_space_prefix = true;
+    start = 2;
+  } else if (tok[0] == ' ') {
+    has_space_prefix = true;
+    start = 1;
+  }
+
+  // After stripping prefix, analyze the content
+  std::string content = tok.substr(start);
+  if (content.empty()) return SyntacticRole::CONTINUATION;
+
+  bool all_alpha = true;
+  bool all_lower = true;
+  bool has_digit = false;
+  bool has_alpha = false;
+  bool starts_upper = false;
+  bool all_punct = true;
+
+  for (size_t i = 0; i < content.size(); ++i) {
+    char c = content[i];
+    if (std::isalpha(static_cast<unsigned char>(c))) {
+      has_alpha = true;
+      all_punct = false;
+      if (i == 0 && std::isupper(static_cast<unsigned char>(c))) starts_upper = true;
+      if (!std::islower(static_cast<unsigned char>(c))) all_lower = false;
+    } else if (std::isdigit(static_cast<unsigned char>(c))) {
+      has_digit = true;
+      all_alpha = false;
+      all_punct = false;
+    } else {
+      all_alpha = false;
+      all_lower = false;
+    }
+  }
+
+  if (has_digit) return SyntacticRole::NUMBER_LIKE;
+  if (all_punct) return SyntacticRole::PUNCT;
+  if (has_space_prefix && has_alpha) return SyntacticRole::CONTINUATION;
+  if (starts_upper && has_alpha) return SyntacticRole::PROPER_NOUN;
+  if (all_alpha && all_lower) return SyntacticRole::WORD;
+  return SyntacticRole::OTHER;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+
+MultiResEmbeddingImpl::MultiResEmbeddingImpl(
+    int64_t vocab_size, int64_t d_model,
+    const MultiResConfig& config,
+    const std::string& bpe_vocab_path)
+    : vocab_size_(vocab_size), d_model_(d_model), config_(config) {
+
+  // Stream 1: Semantic embedding (standard)
+  token_embed_ = register_module(
+      "token_embed", torch::nn::Embedding(vocab_size, d_model));
+
+  // Stream 2: Dual codebook — syntactic role embedding
+  role_embed_ = register_module(
+      "role_embed",
+      torch::nn::Embedding(config.num_syntactic_roles, config.role_embed_dim));
+  role_proj_ = register_module(
+      "role_proj",
+      torch::nn::Linear(torch::nn::LinearOptions(config.role_embed_dim, d_model).bias(false)));
+  build_role_map();
+
+  // Stream 3: Character trigrams (morphological)
+  if (config.enable_char_trigrams) {
+    char_embed_ = register_module(
+        "char_embed",
+        torch::nn::Embedding(config.char_trigram_buckets, config.char_embed_dim));
+    char_proj_ = register_module(
+        "char_proj",
+        torch::nn::Linear(torch::nn::LinearOptions(config.char_embed_dim, d_model).bias(false)));
+    build_char_trigram_map(bpe_vocab_path);
+  }
+
+  // Stream 4: Phrase context
+  if (config.enable_phrase_context) {
+    phrase_embed_ = register_module(
+        "phrase_embed",
+        torch::nn::Embedding(config.phrase_buckets, config.phrase_embed_dim));
+    phrase_proj_ = register_module(
+        "phrase_proj",
+        torch::nn::Linear(torch::nn::LinearOptions(config.phrase_embed_dim, d_model).bias(false)));
+  }
+}
+
+void MultiResEmbeddingImpl::build_role_map() {
+  // Precompute: for each token ID, assign a syntactic role based on vocab range.
+  // This is a [vocab_size] int64 tensor registered as a buffer.
+  auto map = torch::full({vocab_size_}, static_cast<int64_t>(SyntacticRole::OTHER),
+                         torch::kLong);
+  auto map_acc = map.accessor<int64_t, 1>();
+
+  for (int64_t id = 0; id < vocab_size_; ++id) {
+    if (id < config_.bpe_end) {
+      // BPE range — will be refined by char analysis if vocab is available.
+      // Default to WORD for now; build_char_trigram_map refines these.
+      map_acc[id] = static_cast<int64_t>(SyntacticRole::WORD);
+    } else if (id >= config_.pattern_base && id < config_.pattern_end) {
+      map_acc[id] = static_cast<int64_t>(SyntacticRole::STRUCTURE);
+    } else if (id >= config_.ident_base && id < config_.ident_end) {
+      map_acc[id] = static_cast<int64_t>(SyntacticRole::IDENTIFIER);
+    } else if (id >= config_.numeric_base && id < config_.numeric_end) {
+      map_acc[id] = static_cast<int64_t>(SyntacticRole::NUMERIC);
+    } else if (id >= config_.domain_base && id < config_.domain_end) {
+      map_acc[id] = static_cast<int64_t>(SyntacticRole::DOMAIN_PATTERN);
+    }
+  }
+
+  role_map_ = register_buffer("role_map", map);
+}
+
+void MultiResEmbeddingImpl::build_char_trigram_map(const std::string& bpe_vocab_path) {
+  int64_t T = config_.max_trigrams_per_token;
+  auto tri_map = torch::zeros({vocab_size_, T}, torch::kLong);
+  auto tri_count = torch::zeros({vocab_size_}, torch::kFloat);
+  auto map_acc = tri_map.accessor<int64_t, 2>();
+  auto count_acc = tri_count.accessor<float, 1>();
+
+  // Also refine BPE role assignments if vocab is available
+  auto role_acc = role_map_.accessor<int64_t, 1>();
+
+  if (!bpe_vocab_path.empty()) {
+    // Load BPE vocabulary to get token strings.
+    // The load() function needs both vocab and merges paths.
+    // Infer merges path from vocab path: same directory, merges.txt
+    BPETokenizer bpe;
+    std::string merges_path;
+    {
+      auto slash = bpe_vocab_path.rfind('/');
+      if (slash != std::string::npos) {
+        merges_path = bpe_vocab_path.substr(0, slash + 1) + "merges.txt";
+      } else {
+        merges_path = "merges.txt";
+      }
+    }
+    bool loaded = bpe.load(bpe_vocab_path, merges_path);
+
+    if (loaded) {
+      int64_t bpe_vocab = std::min(vocab_size_, static_cast<int64_t>(bpe.vocab_size()));
+      for (int64_t id = 0; id < bpe_vocab; ++id) {
+        std::string tok_str = bpe.decode_token(static_cast<uint32_t>(id));
+        if (tok_str.empty()) continue;
+
+        // Refine syntactic role for BPE tokens
+        role_acc[id] = static_cast<int64_t>(classify_bpe_token(tok_str));
+
+        // Extract character trigrams
+        int64_t t = 0;
+        for (size_t i = 0; i + 2 < tok_str.size() && t < T; ++i) {
+          uint32_t h = djb2_trigram(tok_str[i], tok_str[i + 1], tok_str[i + 2]);
+          map_acc[id][t] = static_cast<int64_t>(h % config_.char_trigram_buckets);
+          t++;
+        }
+        // For short tokens (1-2 chars), use char-level hashes
+        if (t == 0) {
+          uint32_t h = 5381;
+          for (char c : tok_str) h = h * 33 + static_cast<uint8_t>(c);
+          map_acc[id][0] = static_cast<int64_t>(h % config_.char_trigram_buckets);
+          t = 1;
+        }
+        count_acc[id] = static_cast<float>(t);
+      }
+
+      std::cout << "MultiRes: loaded BPE vocab (" << bpe_vocab
+                << " tokens), computed char trigrams and syntactic roles\n";
+    } else {
+      throw std::runtime_error(
+          "MultiRes: failed to load BPE vocab from " + bpe_vocab_path +
+          " — check that vocab.json and merges.txt exist");
+    }
+  } else {
+    throw std::runtime_error(
+        "MultiRes: bpe_vocab_path is required when char trigrams are enabled");
+  }
+
+  char_trigram_map_ = register_buffer("char_trigram_map", tri_map);
+  char_trigram_count_ = register_buffer("char_trigram_count", tri_count);
+}
+
+torch::Tensor MultiResEmbeddingImpl::forward(torch::Tensor token_ids) {
+  // token_ids: [B, S] int64
+  auto B = token_ids.size(0);
+  auto S = token_ids.size(1);
+
+  // ── Stream 1: Semantic embedding ──
+  auto e = token_embed_->forward(token_ids);  // [B, S, d_model]
+
+  // ── Stream 2: Dual codebook — syntactic role ──
+  {
+    // role_map_ is [vocab_size] on same device as model (moves via buffer)
+    // Gather role IDs for each token: [B, S]
+    auto flat_ids = token_ids.reshape(-1);                    // [B*S]
+    auto role_ids = role_map_.index_select(0, flat_ids)
+                        .reshape({B, S});                     // [B, S]
+    auto e_role = role_embed_->forward(role_ids);             // [B, S, role_dim]
+    e = e + role_proj_->forward(e_role);                      // [B, S, d_model]
+  }
+
+  // ── Stream 3: Character trigrams (morphological) ──
+  if (config_.enable_char_trigrams && char_embed_) {
+    int64_t T = config_.max_trigrams_per_token;
+    auto flat_ids = token_ids.reshape(-1);                    // [B*S]
+
+    // Gather precomputed trigram indices: [B*S, T] → [B, S, T]
+    auto tri_ids = char_trigram_map_.index_select(0, flat_ids)
+                       .reshape({B, S, T});                   // [B, S, T]
+    // Gather counts: [B*S] → [B, S]
+    auto counts = char_trigram_count_.index_select(0, flat_ids)
+                      .reshape({B, S});                       // [B, S]
+
+    // Lookup char embeddings: [B, S, T, char_dim]
+    auto e_chars = char_embed_->forward(tri_ids);
+
+    // Build mask from counts: for each position, trigrams [0, count) are valid
+    // counts [B, S], expand to [B, S, T]
+    auto t_range = torch::arange(T, token_ids.options())
+                       .unsqueeze(0).unsqueeze(0);            // [1, 1, T]
+    auto mask = (t_range < counts.unsqueeze(-1))
+                    .to(e_chars.dtype()).unsqueeze(-1);        // [B, S, T, 1]
+
+    // Masked mean pooling: sum valid trigram embeddings / count
+    auto e_char = (e_chars * mask).sum(2);                    // [B, S, char_dim]
+    auto safe_count = counts.clamp_min(1.0f).unsqueeze(-1);   // [B, S, 1]
+    e_char = e_char / safe_count;
+
+    e = e + char_proj_->forward(e_char);                      // [B, S, d_model]
+  }
+
+  // ── Stream 4: Phrase context (local syntactic) ──
+  if (config_.enable_phrase_context && phrase_embed_) {
+    // Hash local context: (token[i-1] * P1 + token[i] * P2 + token[i+1] * P3) % phrase_buckets
+    // Using large primes for mixing (minimal collision, GPU-friendly arithmetic)
+    auto ids = token_ids.to(torch::kLong);
+    auto left = torch::roll(ids, 1, 1);                      // token[i-1]
+    auto right = torch::roll(ids, -1, 1);                    // token[i+1]
+
+    // Pure arithmetic — maps to a single CUDA kernel
+    auto phrase_hash = (left * 6291469 + ids * 12582917 + right * 25165843)
+                           % config_.phrase_buckets;
+    phrase_hash = phrase_hash.abs();                           // ensure non-negative
+
+    auto e_phrase = phrase_embed_->forward(phrase_hash);       // [B, S, phrase_dim]
+    e = e + phrase_proj_->forward(e_phrase);                   // [B, S, d_model]
+  }
+
+  return e;
+}
+
+}  // namespace olmo_cpp

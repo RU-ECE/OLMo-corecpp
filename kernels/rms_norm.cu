@@ -1,6 +1,6 @@
 // Fused RMSNorm CUDA kernel - optimized for H100 (sm_90)
 // Warp-level reductions, vectorized loads, float32/float16/bfloat16 support
-#include <torch/library.h>
+#include <torch/torch.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>

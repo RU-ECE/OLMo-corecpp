@@ -2,7 +2,7 @@
 // Eliminates intermediate tensor allocation between SiLU and multiply.
 // On H100: saves ~2x memory bandwidth (read gate, read up, write output vs
 // read gate, write silu_gate, read silu_gate, read up, write output).
-#include <torch/library.h>
+#include <torch/torch.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
 

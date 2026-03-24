@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <list>
 #include <queue>
+#include <climits>
 
 #ifdef HAS_NLOHMANN_JSON
 #include <nlohmann/json.hpp>

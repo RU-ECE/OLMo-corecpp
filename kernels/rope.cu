@@ -4,7 +4,7 @@
 //
 // On H100: RoPE is memory-bandwidth-bound. Fusing Q+K avoids 2 kernel launches
 // and keeps both tensors in L2 cache.
-#include <torch/library.h>
+#include <torch/torch.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
 

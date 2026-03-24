@@ -1,4 +1,7 @@
 #include "olmo_cpp/profiler.hpp"
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#endif
 
 namespace olmo_cpp {
 

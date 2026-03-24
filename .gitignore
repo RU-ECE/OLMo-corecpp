@@ -26,8 +26,9 @@ checkpoints/
 .DS_Store
 Thumbs.db
 
-# Third-party deps (fetched by CMake)
-third_party/
+# Third-party deps fetched by CMake (keep cnpy tracked)
+third_party/*/
+!third_party/cnpy/
 
 # Benchmark outputs
 benchmark_results.json

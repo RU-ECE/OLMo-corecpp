@@ -8,7 +8,18 @@ find_package(Torch REQUIRED)
 find_package(ZLIB REQUIRED)
 
 # cnpy for .npy token files
+# Save/restore output dirs: PyTorch's cmake config may override these globally,
+# which breaks the cnpy target's output path in the Makefile generator.
+set(_saved_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_ARCHIVE_OUTPUT_DIRECTORY}")
+set(_saved_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}")
+set(_saved_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
+unset(CMAKE_ARCHIVE_OUTPUT_DIRECTORY)
+unset(CMAKE_LIBRARY_OUTPUT_DIRECTORY)
+unset(CMAKE_RUNTIME_OUTPUT_DIRECTORY)
 add_subdirectory(third_party/cnpy)
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${_saved_ARCHIVE_OUTPUT_DIRECTORY}")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${_saved_LIBRARY_OUTPUT_DIRECTORY}")
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${_saved_RUNTIME_OUTPUT_DIRECTORY}")
 
 # Optional: nlohmann_json for config and prepare_data (BPE tokenizer)
 find_path(JSON_INCLUDE_DIR nlohmann/json.hpp

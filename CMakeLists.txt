@@ -7,20 +7,6 @@ set(CMAKE_CXX_STANDARD 17)
 find_package(Torch REQUIRED)
 find_package(ZLIB REQUIRED)
 
-# cnpy for .npy token files
-# Save/restore output dirs: PyTorch's cmake config may override these globally,
-# which breaks the cnpy target's output path in the Makefile generator.
-set(_saved_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_ARCHIVE_OUTPUT_DIRECTORY}")
-set(_saved_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}")
-set(_saved_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
-unset(CMAKE_ARCHIVE_OUTPUT_DIRECTORY)
-unset(CMAKE_LIBRARY_OUTPUT_DIRECTORY)
-unset(CMAKE_RUNTIME_OUTPUT_DIRECTORY)
-add_subdirectory(third_party/cnpy)
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${_saved_ARCHIVE_OUTPUT_DIRECTORY}")
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${_saved_LIBRARY_OUTPUT_DIRECTORY}")
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${_saved_RUNTIME_OUTPUT_DIRECTORY}")
-
 # Optional: nlohmann_json for config and prepare_data (BPE tokenizer)
 find_path(JSON_INCLUDE_DIR nlohmann/json.hpp
     HINTS /usr/include /usr/local/include /opt/homebrew/include
@@ -43,8 +29,11 @@ endif()
 find_path(GLOO_INCLUDE_DIR gloo/algorithm.h HINTS /usr/local/include /opt/homebrew/include)
 option(OLMO_USE_DDP "Build with DDP (requires Gloo)" OFF)
 
-# Main library
+# Main library — cnpy compiled directly into olmo_cpp to avoid
+# GNU ld static-library link-order issues on Linux.
 set(OLMO_SOURCES
+    # cnpy (vendored)
+    third_party/cnpy/cnpy.cpp
     # Config
     src/config.cpp
     # Data pipeline
@@ -112,10 +101,11 @@ if(OLMO_USE_DDP AND GLOO_INCLUDE_DIR)
 endif()
 target_include_directories(olmo_cpp PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cnpy
     ${TORCH_INCLUDE_DIRS}
     ${JSON_INCLUDE_DIR}
 )
-target_link_libraries(olmo_cpp PUBLIC ${TORCH_LIBRARIES} cnpy)
+target_link_libraries(olmo_cpp PUBLIC ${TORCH_LIBRARIES} ZLIB::ZLIB)
 target_compile_options(olmo_cpp PRIVATE -O3)
 
 # CUDA kernels (optional)
@@ -125,24 +115,19 @@ target_compile_options(olmo_cpp PRIVATE -O3)
 #     target_compile_definitions(olmo_cpp PRIVATE OLMO_HAS_CUDA_KERNELS=1)
 # endif()
 
-# Helper: on Linux, GNU ld is order-sensitive with static libraries.
-# Executables linking olmo_cpp need cnpy repeated after olmo_cpp so the
-# linker resolves cnpy symbols that olmo_cpp references.
-macro(olmo_add_executable target_name)
-    add_executable(${target_name} ${ARGN})
-    target_link_libraries(${target_name} PRIVATE olmo_cpp cnpy)
-endmacro()
-
 # Training executable
-olmo_add_executable(olmo_train src/main.cpp src/train.cpp)
+add_executable(olmo_train src/main.cpp src/train.cpp)
+target_link_libraries(olmo_train PRIVATE olmo_cpp)
 target_compile_options(olmo_train PRIVATE -O3)
 
 # Checkpoint converter tool
-olmo_add_executable(convert_checkpoint tools/convert_checkpoint.cpp)
+add_executable(convert_checkpoint tools/convert_checkpoint.cpp)
+target_link_libraries(convert_checkpoint PRIVATE olmo_cpp)
 target_compile_options(convert_checkpoint PRIVATE -O3)
 
 # Interactive chat CLI
-olmo_add_executable(chat tools/chat.cpp)
+add_executable(chat tools/chat.cpp)
+target_link_libraries(chat PRIVATE olmo_cpp)
 target_include_directories(chat PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${JSON_INCLUDE_DIR})
 target_compile_options(chat PRIVATE -O3)
 if(JSON_INCLUDE_DIR)
@@ -150,10 +135,12 @@ if(JSON_INCLUDE_DIR)
 endif()
 
 # Param dumper (debug utility)
-olmo_add_executable(dump_params tools/dump_params.cpp)
+add_executable(dump_params tools/dump_params.cpp)
+target_link_libraries(dump_params PRIVATE olmo_cpp)
 
 # HF checkpoint converter
-olmo_add_executable(convert_hf tools/convert_hf.cpp)
+add_executable(convert_hf tools/convert_hf.cpp)
+target_link_libraries(convert_hf PRIVATE olmo_cpp)
 target_compile_options(convert_hf PRIVATE -O3)
 if(JSON_INCLUDE_DIR)
   target_compile_definitions(convert_hf PRIVATE HAS_NLOHMANN_JSON=1)
@@ -164,12 +151,14 @@ add_executable(prepare_data
   tools/prepare_data.cpp
   src/data/simple_tokenizer.cpp
   src/data/bpe_tokenizer.cpp
+  third_party/cnpy/cnpy.cpp
 )
 target_include_directories(prepare_data PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cnpy
   ${JSON_INCLUDE_DIR}
 )
-target_link_libraries(prepare_data PRIVATE cnpy ZLIB::ZLIB)
+target_link_libraries(prepare_data PRIVATE ZLIB::ZLIB)
 target_compile_options(prepare_data PRIVATE -O3)
 if(JSON_INCLUDE_DIR)
   target_compile_definitions(prepare_data PRIVATE HAS_NLOHMANN_JSON=1)

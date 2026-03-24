@@ -51,8 +51,8 @@ endif()
 find_package(Torch REQUIRED)
 find_package(ZLIB REQUIRED)
 
-# cnpy for .npy token files
-add_subdirectory(third_party/cnpy)
+# cnpy for .npy token files (compiled directly into olmo_cpp to avoid GCC link-order issues)
+# add_subdirectory(third_party/cnpy)
 
 # Optional: nlohmann_json for config and prepare_data (BPE tokenizer)
 find_path(JSON_INCLUDE_DIR nlohmann/json.hpp
@@ -78,6 +78,8 @@ option(OLMO_USE_DDP "Build with DDP (requires Gloo)" OFF)
 
 # Main library: model components + data + training infrastructure
 set(OLMO_SOURCES
+    # cnpy (vendored .npy loader)
+    third_party/cnpy/cnpy.cpp
     # Config
     src/config.cpp
     # Data pipeline
@@ -169,10 +171,11 @@ if(OLMO_USE_DDP AND GLOO_INCLUDE_DIR)
 endif()
 target_include_directories(olmo_cpp PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cnpy
     ${TORCH_INCLUDE_DIRS}
     ${JSON_INCLUDE_DIR}
 )
-target_link_libraries(olmo_cpp PUBLIC ${TORCH_LIBRARIES} cnpy)
+target_link_libraries(olmo_cpp PUBLIC ${TORCH_LIBRARIES} ZLIB::ZLIB)
 target_compile_options(olmo_cpp PRIVATE -O3 -march=native)
 
 # CUDA kernels (auto-enabled when CUDA compiler is found)
@@ -189,7 +192,7 @@ add_executable(olmo_train
     src/main.cpp
     src/train.cpp
 )
-target_link_libraries(olmo_train PRIVATE olmo_cpp cnpy)
+target_link_libraries(olmo_train PRIVATE olmo_cpp)
 # if(CMAKE_CUDA_COMPILER AND OLMO_BUILD_KERNELS)
 #     target_link_libraries(olmo_train PRIVATE olmo_kernels)
 # endif()
@@ -227,12 +230,14 @@ add_executable(prepare_data
   src/data/simple_tokenizer.cpp
   src/data/bpe_tokenizer.cpp
   src/data/structural_tokenizer.cpp
+  third_party/cnpy/cnpy.cpp
 )
 target_include_directories(prepare_data PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cnpy
   ${JSON_INCLUDE_DIR}
 )
-target_link_libraries(prepare_data PRIVATE cnpy)
+target_link_libraries(prepare_data PRIVATE ZLIB::ZLIB)
 target_compile_options(prepare_data PRIVATE -O3 -march=native)
 if(JSON_INCLUDE_DIR)
   target_compile_definitions(prepare_data PRIVATE HAS_NLOHMANN_JSON=1)

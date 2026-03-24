@@ -189,7 +189,7 @@ add_executable(olmo_train
     src/main.cpp
     src/train.cpp
 )
-target_link_libraries(olmo_train PRIVATE olmo_cpp)
+target_link_libraries(olmo_train PRIVATE olmo_cpp cnpy)
 # if(CMAKE_CUDA_COMPILER AND OLMO_BUILD_KERNELS)
 #     target_link_libraries(olmo_train PRIVATE olmo_kernels)
 # endif()

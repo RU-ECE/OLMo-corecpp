@@ -69,9 +69,11 @@ void train_epoch(
 
     for (int64_t accum = 0; accum < grad_accum_steps; ++accum) {
       torch::Tensor input, labels;
+      //TODO : Fix the checking of the dataset for the training data outside of the training loop and dont just create a random dataset here.
       if (dataset) {
         auto [in, lab] = dataset->get_batch(batch_size, device);
         input = in; labels = lab;
+        
       } else {
         input = torch::randint(0, cfg.vocab_size, {batch_size, seq_len},
                                torch::TensorOptions().dtype(torch::kLong).device(device));

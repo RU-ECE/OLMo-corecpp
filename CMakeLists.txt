@@ -104,7 +104,15 @@ target_include_directories(olmo_cpp PUBLIC
     ${TORCH_INCLUDE_DIRS}
     ${JSON_INCLUDE_DIR}
 )
-target_link_libraries(olmo_cpp PUBLIC ${TORCH_LIBRARIES} cnpy)
+target_link_libraries(olmo_cpp PUBLIC ${TORCH_LIBRARIES})
+# On Linux, GNU ld is order-sensitive with static libraries.
+# Link cnpy with whole-archive so all symbols are available to dependents.
+if(UNIX AND NOT APPLE)
+    target_link_libraries(olmo_cpp PUBLIC
+        -Wl,--whole-archive cnpy -Wl,--no-whole-archive)
+else()
+    target_link_libraries(olmo_cpp PUBLIC cnpy)
+endif()
 target_compile_options(olmo_cpp PRIVATE -O3)
 
 # CUDA kernels (optional)

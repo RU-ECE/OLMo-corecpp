@@ -1,0 +1,446 @@
+{
+  "version": "1.0",
+  "description": "Hand-curated structural patterns for code and prose compression",
+  "patterns": [
+    {
+      "id": 50000,
+      "name": "C_FOR_INCR",
+      "pattern": "for ({TYPE} {VAR} = {EXPR}; {VAR} < {EXPR}; {VAR}++)",
+      "slots": ["TYPE", "VAR", "EXPR", "VAR", "EXPR", "VAR"],
+      "domain": "code",
+      "example": "for (int i = 0; i < n; i++)"
+    },
+    {
+      "id": 50001,
+      "name": "C_FOR_DECR",
+      "pattern": "for ({TYPE} {VAR} = {EXPR}; {VAR} >= {EXPR}; {VAR}--)",
+      "slots": ["TYPE", "VAR", "EXPR", "VAR", "EXPR", "VAR"],
+      "domain": "code",
+      "example": "for (int i = n; i >= 0; i--)"
+    },
+    {
+      "id": 50002,
+      "name": "C_FOR_EACH_AUTO",
+      "pattern": "for (auto& {VAR} : {EXPR})",
+      "slots": ["VAR", "EXPR"],
+      "domain": "code",
+      "example": "for (auto& item : items)"
+    },
+    {
+      "id": 50003,
+      "name": "C_FOR_CONST_AUTO",
+      "pattern": "for (const auto& {VAR} : {EXPR})",
+      "slots": ["VAR", "EXPR"],
+      "domain": "code",
+      "example": "for (const auto& p : model.parameters())"
+    },
+    {
+      "id": 50004,
+      "name": "PY_FOR_RANGE",
+      "pattern": "for {VAR} in range({EXPR}):",
+      "slots": ["VAR", "EXPR"],
+      "domain": "code",
+      "example": "for i in range(n):"
+    },
+    {
+      "id": 50005,
+      "name": "PY_FOR_RANGE2",
+      "pattern": "for {VAR} in range({EXPR}, {EXPR}):",
+      "slots": ["VAR", "EXPR", "EXPR"],
+      "domain": "code",
+      "example": "for i in range(0, n):"
+    },
+    {
+      "id": 50006,
+      "name": "PY_FOR_IN",
+      "pattern": "for {VAR} in {EXPR}:",
+      "slots": ["VAR", "EXPR"],
+      "domain": "code",
+      "example": "for item in items:"
+    },
+    {
+      "id": 50007,
+      "name": "PY_FOR_ENUM",
+      "pattern": "for {VAR}, {VAR} in enumerate({EXPR}):",
+      "slots": ["VAR", "VAR", "EXPR"],
+      "domain": "code",
+      "example": "for i, item in enumerate(items):"
+    },
+    {
+      "id": 50010,
+      "name": "C_IF",
+      "pattern": "if ({EXPR}) {",
+      "slots": ["EXPR"],
+      "domain": "code",
+      "example": "if (x > 0) {"
+    },
+    {
+      "id": 50011,
+      "name": "C_IF_ELSE",
+      "pattern": "} else {",
+      "slots": [],
+      "domain": "code",
+      "example": "} else {"
+    },
+    {
+      "id": 50012,
+      "name": "C_ELSE_IF",
+      "pattern": "} else if ({EXPR}) {",
+      "slots": ["EXPR"],
+      "domain": "code",
+      "example": "} else if (x < 0) {"
+    },
+    {
+      "id": 50013,
+      "name": "PY_IF",
+      "pattern": "if {EXPR}:",
+      "slots": ["EXPR"],
+      "domain": "code",
+      "example": "if x > 0:"
+    },
+    {
+      "id": 50014,
+      "name": "PY_ELIF",
+      "pattern": "elif {EXPR}:",
+      "slots": ["EXPR"],
+      "domain": "code",
+      "example": "elif x < 0:"
+    },
+    {
+      "id": 50015,
+      "name": "PY_ELSE",
+      "pattern": "else:",
+      "slots": [],
+      "domain": "code",
+      "example": "else:"
+    },
+    {
+      "id": 50020,
+      "name": "C_WHILE",
+      "pattern": "while ({EXPR}) {",
+      "slots": ["EXPR"],
+      "domain": "code",
+      "example": "while (running) {"
+    },
+    {
+      "id": 50021,
+      "name": "PY_WHILE",
+      "pattern": "while {EXPR}:",
+      "slots": ["EXPR"],
+      "domain": "code",
+      "example": "while running:"
+    },
+    {
+      "id": 50030,
+      "name": "C_FUNC_VOID",
+      "pattern": "void {IDENT}({PARAMS}) {",
+      "slots": ["IDENT", "PARAMS"],
+      "domain": "code",
+      "example": "void init(int n) {"
+    },
+    {
+      "id": 50031,
+      "name": "C_FUNC_RET",
+      "pattern": "{TYPE} {IDENT}({PARAMS}) {",
+      "slots": ["TYPE", "IDENT", "PARAMS"],
+      "domain": "code",
+      "example": "int compute(float x) {"
+    },
+    {
+      "id": 50032,
+      "name": "PY_DEF",
+      "pattern": "def {IDENT}({PARAMS}):",
+      "slots": ["IDENT", "PARAMS"],
+      "domain": "code",
+      "example": "def forward(self, x):"
+    },
+    {
+      "id": 50033,
+      "name": "PY_DEF_ARROW",
+      "pattern": "def {IDENT}({PARAMS}) -> {TYPE}:",
+      "slots": ["IDENT", "PARAMS", "TYPE"],
+      "domain": "code",
+      "example": "def forward(self, x) -> Tensor:"
+    },
+    {
+      "id": 50034,
+      "name": "JS_FUNC",
+      "pattern": "function {IDENT}({PARAMS}) {",
+      "slots": ["IDENT", "PARAMS"],
+      "domain": "code",
+      "example": "function compute(x) {"
+    },
+    {
+      "id": 50035,
+      "name": "JS_ARROW",
+      "pattern": "const {IDENT} = ({PARAMS}) => {",
+      "slots": ["IDENT", "PARAMS"],
+      "domain": "code",
+      "example": "const compute = (x) => {"
+    },
+    {
+      "id": 50040,
+      "name": "C_CLASS",
+      "pattern": "class {IDENT} {",
+      "slots": ["IDENT"],
+      "domain": "code",
+      "example": "class Transformer {"
+    },
+    {
+      "id": 50041,
+      "name": "C_CLASS_INHERIT",
+      "pattern": "class {IDENT} : public {IDENT} {",
+      "slots": ["IDENT", "IDENT"],
+      "domain": "code",
+      "example": "class Attention : public Module {"
+    },
+    {
+      "id": 50042,
+      "name": "PY_CLASS",
+      "pattern": "class {IDENT}:",
+      "slots": ["IDENT"],
+      "domain": "code",
+      "example": "class Model:"
+    },
+    {
+      "id": 50043,
+      "name": "PY_CLASS_INHERIT",
+      "pattern": "class {IDENT}({IDENT}):",
+      "slots": ["IDENT", "IDENT"],
+      "domain": "code",
+      "example": "class Model(nn.Module):"
+    },
+    {
+      "id": 50050,
+      "name": "C_RETURN",
+      "pattern": "return {EXPR};",
+      "slots": ["EXPR"],
+      "domain": "code",
+      "example": "return result;"
+    },
+    {
+      "id": 50051,
+      "name": "PY_RETURN",
+      "pattern": "return {EXPR}",
+      "slots": ["EXPR"],
+      "domain": "code",
+      "example": "return result"
+    },
+    {
+      "id": 50052,
+      "name": "C_INCLUDE",
+      "pattern": "#include \"{PATH}\"",
+      "slots": ["PATH"],
+      "domain": "code",
+      "example": "#include \"olmo_cpp/train.hpp\""
+    },
+    {
+      "id": 50053,
+      "name": "C_INCLUDE_SYS",
+      "pattern": "#include <{PATH}>",
+      "slots": ["PATH"],
+      "domain": "code",
+      "example": "#include <iostream>"
+    },
+    {
+      "id": 50054,
+      "name": "PY_IMPORT",
+      "pattern": "import {IDENT}",
+      "slots": ["IDENT"],
+      "domain": "code",
+      "example": "import torch"
+    },
+    {
+      "id": 50055,
+      "name": "PY_FROM_IMPORT",
+      "pattern": "from {IDENT} import {IDENT}",
+      "slots": ["IDENT", "IDENT"],
+      "domain": "code",
+      "example": "from torch import nn"
+    },
+    {
+      "id": 50060,
+      "name": "C_VAR_DECL",
+      "pattern": "{TYPE} {VAR} = {EXPR};",
+      "slots": ["TYPE", "VAR", "EXPR"],
+      "domain": "code",
+      "example": "int count = 0;"
+    },
+    {
+      "id": 50061,
+      "name": "C_AUTO_DECL",
+      "pattern": "auto {VAR} = {EXPR};",
+      "slots": ["VAR", "EXPR"],
+      "domain": "code",
+      "example": "auto result = compute(x);"
+    },
+    {
+      "id": 50062,
+      "name": "C_CONST_DECL",
+      "pattern": "const {TYPE} {VAR} = {EXPR};",
+      "slots": ["TYPE", "VAR", "EXPR"],
+      "domain": "code",
+      "example": "const int max = 100;"
+    },
+    {
+      "id": 50063,
+      "name": "PY_ASSIGN",
+      "pattern": "{VAR} = {EXPR}",
+      "slots": ["VAR", "EXPR"],
+      "domain": "code",
+      "example": "result = compute(x)"
+    },
+    {
+      "id": 50070,
+      "name": "C_STATIC_CAST",
+      "pattern": "static_cast<{TYPE}>({EXPR})",
+      "slots": ["TYPE", "EXPR"],
+      "domain": "code",
+      "example": "static_cast<float>(count)"
+    },
+    {
+      "id": 50071,
+      "name": "C_NULLPTR_CHECK",
+      "pattern": "if ({EXPR} == nullptr)",
+      "slots": ["EXPR"],
+      "domain": "code",
+      "example": "if (ptr == nullptr)"
+    },
+    {
+      "id": 50072,
+      "name": "C_NULLPTR_CHECK_NOT",
+      "pattern": "if ({EXPR} != nullptr)",
+      "slots": ["EXPR"],
+      "domain": "code",
+      "example": "if (ptr != nullptr)"
+    },
+    {
+      "id": 50073,
+      "name": "C_STDCOUT",
+      "pattern": "std::cout << {EXPR} << std::endl;",
+      "slots": ["EXPR"],
+      "domain": "code",
+      "example": "std::cout << \"done\" << std::endl;"
+    },
+    {
+      "id": 50074,
+      "name": "C_VECTOR_DECL",
+      "pattern": "std::vector<{TYPE}> {VAR}",
+      "slots": ["TYPE", "VAR"],
+      "domain": "code",
+      "example": "std::vector<int> nums"
+    },
+    {
+      "id": 50075,
+      "name": "C_STRING_DECL",
+      "pattern": "std::string {VAR}",
+      "slots": ["VAR"],
+      "domain": "code",
+      "example": "std::string name"
+    },
+    {
+      "id": 50080,
+      "name": "TORCH_TENSOR_DECL",
+      "pattern": "torch::Tensor {VAR}",
+      "slots": ["VAR"],
+      "domain": "code",
+      "example": "torch::Tensor output"
+    },
+    {
+      "id": 50081,
+      "name": "TORCH_TENSOR_OPTIONS",
+      "pattern": "torch::TensorOptions().dtype({EXPR}).device({EXPR})",
+      "slots": ["EXPR", "EXPR"],
+      "domain": "code",
+      "example": "torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU)"
+    },
+    {
+      "id": 50082,
+      "name": "TORCH_RANDINT",
+      "pattern": "torch::randint({EXPR}, {EXPR}, {EXPR})",
+      "slots": ["EXPR", "EXPR", "EXPR"],
+      "domain": "code",
+      "example": "torch::randint(0, vocab_size, {batch_size, seq_len})"
+    },
+    {
+      "id": 50100,
+      "name": "PROSE_THIS_IS",
+      "pattern": "This is {NOUN}",
+      "slots": ["NOUN"],
+      "domain": "prose",
+      "example": "This is a test"
+    },
+    {
+      "id": 50101,
+      "name": "PROSE_THERE_WAS",
+      "pattern": "there was {NOUN}",
+      "slots": ["NOUN"],
+      "domain": "prose",
+      "example": "there was a light"
+    },
+    {
+      "id": 50102,
+      "name": "PROSE_ONCE_UPON",
+      "pattern": "Once upon a time",
+      "slots": [],
+      "domain": "prose",
+      "example": "Once upon a time"
+    },
+    {
+      "id": 50103,
+      "name": "PROSE_IN_THE",
+      "pattern": "In the {NOUN}, {CLAUSE}",
+      "slots": ["NOUN", "CLAUSE"],
+      "domain": "prose",
+      "example": "In the beginning, there was light"
+    },
+    {
+      "id": 50104,
+      "name": "PROSE_HE_SHE_SAID",
+      "pattern": "{SUBJ} said, \"{QUOTE}\"",
+      "slots": ["SUBJ", "QUOTE"],
+      "domain": "prose",
+      "example": "He said, \"hello\""
+    },
+    {
+      "id": 50105,
+      "name": "PROSE_AND_THEN",
+      "pattern": "and then {CLAUSE}",
+      "slots": ["CLAUSE"],
+      "domain": "prose",
+      "example": "and then they went home"
+    },
+    {
+      "id": 50200,
+      "name": "JSON_KV_STR",
+      "pattern": "\"{KEY}\": \"{VALUE}\"",
+      "slots": ["KEY", "VALUE"],
+      "domain": "data",
+      "example": "\"name\": \"Alice\""
+    },
+    {
+      "id": 50201,
+      "name": "JSON_KV_NUM",
+      "pattern": "\"{KEY}\": {NUM}",
+      "slots": ["KEY", "NUM"],
+      "domain": "data",
+      "example": "\"age\": 30"
+    },
+    {
+      "id": 50202,
+      "name": "JSON_KV_BOOL",
+      "pattern": "\"{KEY}\": {BOOL}",
+      "slots": ["KEY", "BOOL"],
+      "domain": "data",
+      "example": "\"active\": true"
+    },
+    {
+      "id": 50203,
+      "name": "JSON_ARRAY_START",
+      "pattern": "\"{KEY}\": [",
+      "slots": ["KEY"],
+      "domain": "data",
+      "example": "\"items\": ["
+    }
+  ]
+}

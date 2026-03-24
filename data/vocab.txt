@@ -1,0 +1,13 @@
+<pad>
+<eos>
+<unk>
+another
+sentence
+for
+tokenization
+hello
+world
+this
+is
+a
+test

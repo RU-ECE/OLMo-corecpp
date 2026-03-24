@@ -104,15 +104,7 @@ target_include_directories(olmo_cpp PUBLIC
     ${TORCH_INCLUDE_DIRS}
     ${JSON_INCLUDE_DIR}
 )
-target_link_libraries(olmo_cpp PUBLIC ${TORCH_LIBRARIES})
-# On Linux, GNU ld is order-sensitive with static libraries.
-# Link cnpy with whole-archive so all symbols are available to dependents.
-if(UNIX AND NOT APPLE)
-    target_link_libraries(olmo_cpp PUBLIC
-        -Wl,--whole-archive cnpy -Wl,--no-whole-archive)
-else()
-    target_link_libraries(olmo_cpp PUBLIC cnpy)
-endif()
+target_link_libraries(olmo_cpp PUBLIC ${TORCH_LIBRARIES} cnpy)
 target_compile_options(olmo_cpp PRIVATE -O3)
 
 # CUDA kernels (optional)
@@ -122,22 +114,24 @@ target_compile_options(olmo_cpp PRIVATE -O3)
 #     target_compile_definitions(olmo_cpp PRIVATE OLMO_HAS_CUDA_KERNELS=1)
 # endif()
 
+# Helper: on Linux, GNU ld is order-sensitive with static libraries.
+# Executables linking olmo_cpp need cnpy repeated after olmo_cpp so the
+# linker resolves cnpy symbols that olmo_cpp references.
+macro(olmo_add_executable target_name)
+    add_executable(${target_name} ${ARGN})
+    target_link_libraries(${target_name} PRIVATE olmo_cpp cnpy)
+endmacro()
+
 # Training executable
-add_executable(olmo_train
-    src/main.cpp
-    src/train.cpp
-)
-target_link_libraries(olmo_train PRIVATE olmo_cpp)
+olmo_add_executable(olmo_train src/main.cpp src/train.cpp)
 target_compile_options(olmo_train PRIVATE -O3)
 
 # Checkpoint converter tool
-add_executable(convert_checkpoint tools/convert_checkpoint.cpp)
-target_link_libraries(convert_checkpoint PRIVATE olmo_cpp)
+olmo_add_executable(convert_checkpoint tools/convert_checkpoint.cpp)
 target_compile_options(convert_checkpoint PRIVATE -O3)
 
 # Interactive chat CLI
-add_executable(chat tools/chat.cpp)
-target_link_libraries(chat PRIVATE olmo_cpp)
+olmo_add_executable(chat tools/chat.cpp)
 target_include_directories(chat PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${JSON_INCLUDE_DIR})
 target_compile_options(chat PRIVATE -O3)
 if(JSON_INCLUDE_DIR)
@@ -145,12 +139,10 @@ if(JSON_INCLUDE_DIR)
 endif()
 
 # Param dumper (debug utility)
-add_executable(dump_params tools/dump_params.cpp)
-target_link_libraries(dump_params PRIVATE olmo_cpp)
+olmo_add_executable(dump_params tools/dump_params.cpp)
 
 # HF checkpoint converter
-add_executable(convert_hf tools/convert_hf.cpp)
-target_link_libraries(convert_hf PRIVATE olmo_cpp)
+olmo_add_executable(convert_hf tools/convert_hf.cpp)
 target_compile_options(convert_hf PRIVATE -O3)
 if(JSON_INCLUDE_DIR)
   target_compile_definitions(convert_hf PRIVATE HAS_NLOHMANN_JSON=1)
@@ -166,7 +158,7 @@ target_include_directories(prepare_data PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${JSON_INCLUDE_DIR}
 )
-target_link_libraries(prepare_data PRIVATE cnpy)
+target_link_libraries(prepare_data PRIVATE cnpy ZLIB::ZLIB)
 target_compile_options(prepare_data PRIVATE -O3)
 if(JSON_INCLUDE_DIR)
   target_compile_definitions(prepare_data PRIVATE HAS_NLOHMANN_JSON=1)

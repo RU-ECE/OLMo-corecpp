@@ -130,13 +130,13 @@ void train_epoch(
           ProfileScope fwd_scope("forward");
           if (use_amp && device.is_cuda()) {
             // BF16 mixed precision — 2× throughput on tensor cores
-            at::autocast::set_autocast_enabled(at::kCUDA, true);
-            at::autocast::set_autocast_dtype(at::kCUDA, at::kBFloat16);
+            at::autocast::set_enabled(true);
+            at::autocast::set_autocast_gpu_dtype(at::kBFloat16);
             at::autocast::increment_nesting();
             loss = model->forward(input, labels, -100) / static_cast<float>(grad_accum_steps);
             at::autocast::decrement_nesting();
             at::autocast::clear_cache();
-            at::autocast::set_autocast_enabled(at::kCUDA, false);
+            at::autocast::set_enabled(false);
           } else {
             loss = model->forward(input, labels, -100) / static_cast<float>(grad_accum_steps);
           }
@@ -323,13 +323,13 @@ void train(
       torch::Tensor loss;
       if (cfg.use_amp && device.is_cuda()) {
         // BF16 mixed precision — 2× throughput on H100 tensor cores
-        at::autocast::set_autocast_enabled(at::kCUDA, true);
-        at::autocast::set_autocast_dtype(at::kCUDA, at::kBFloat16);
+        at::autocast::set_enabled(true);
+        at::autocast::set_autocast_gpu_dtype(at::kBFloat16);
         at::autocast::increment_nesting();
         loss = model->forward(input, labels, -100) / static_cast<float>(cfg.grad_accum_steps);
         at::autocast::decrement_nesting();
         at::autocast::clear_cache();
-        at::autocast::set_autocast_enabled(at::kCUDA, false);
+        at::autocast::set_enabled(false);
       } else {
         loss = model->forward(input, labels, -100) / static_cast<float>(cfg.grad_accum_steps);
       }
@@ -499,13 +499,13 @@ void train(
 
       torch::Tensor loss;
       if (cfg.use_amp && device.is_cuda()) {
-        at::autocast::set_autocast_enabled(at::kCUDA, true);
-        at::autocast::set_autocast_dtype(at::kCUDA, at::kBFloat16);
+        at::autocast::set_enabled(true);
+        at::autocast::set_autocast_gpu_dtype(at::kBFloat16);
         at::autocast::increment_nesting();
         loss = model->forward(input, labels, -100) / static_cast<float>(cfg.grad_accum_steps);
         at::autocast::decrement_nesting();
         at::autocast::clear_cache();
-        at::autocast::set_autocast_enabled(at::kCUDA, false);
+        at::autocast::set_enabled(false);
       } else {
         loss = model->forward(input, labels, -100) / static_cast<float>(cfg.grad_accum_steps);
       }

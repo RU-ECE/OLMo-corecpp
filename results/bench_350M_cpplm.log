@@ -1,0 +1,19 @@
+Using CUDA GPU
+Using AdamW optimizer (lr=0.0003)
+Step 0/100  loss: 11.3799  lr: 3e-06  step_ms: 220  tok/s: 2318  ETA: 0m
+Step 10/100  loss: 11.3542  lr: 3.3e-05  step_ms: 23  tok/s: 12429  ETA: 0m
+Step 20/100  loss: 11.2489  lr: 6.3e-05  step_ms: 23  tok/s: 15603  ETA: 0m
+Step 30/100  loss: 10.9578  lr: 9.3e-05  step_ms: 23  tok/s: 17132  ETA: 0m
+Step 40/100  loss: 10.7421  lr: 0.000123  step_ms: 26  tok/s: 17996  ETA: 0m
+Step 50/100  loss: 10.5086  lr: 0.000153  step_ms: 23  tok/s: 18549  ETA: 0m
+Step 60/100  loss: 10.2864  lr: 0.000183  step_ms: 23  tok/s: 18964  ETA: 0m
+Step 70/100  loss: 9.86687  lr: 0.000213  step_ms: 23  tok/s: 19283  ETA: 0m
+Step 80/100  loss: 9.34849  lr: 0.000243  step_ms: 23  tok/s: 19513  ETA: 0m
+Step 90/100  loss: 8.78429  lr: 0.000273  step_ms: 23  tok/s: 19702  ETA: 0m
+
+=== Training Summary ===
+  Steps: 100
+  Total tokens: 51200
+  Wall time: 2s (0m 2s)
+  Throughput: 19836 tok/s
+========================

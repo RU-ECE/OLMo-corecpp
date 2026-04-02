@@ -1,0 +1,137 @@
+
+>>> Evaluating llm-cpp (Experimental) generation...
+  Prompt 1/10... Score: 3.0/10, 0.0 tok/s
+  Prompt 2/10... Score: 3.0/10, 0.0 tok/s
+  Prompt 3/10... Score: 3.0/10, 0.0 tok/s
+  Prompt 4/10... Score: 3.0/10, 0.0 tok/s
+  Prompt 5/10... Score: 3.0/10, 0.0 tok/s
+  Prompt 6/10... Score: 3.0/10, 0.0 tok/s
+  Prompt 7/10... Score: 3.0/10, 0.0 tok/s
+  Prompt 8/10... Score: 3.0/10, 0.0 tok/s
+  Prompt 9/10... Score: 3.0/10, 0.0 tok/s
+  Prompt 10/10... Score: 3.0/10, 0.0 tok/s
+
+>>> Evaluating cpp-llm (clean) generation...
+  Prompt 1/10... Score: 3.0/10, 0.0 tok/s
+  Prompt 2/10... Score: 3.0/10, 0.0 tok/s
+  Prompt 3/10... Score: 3.0/10, 0.0 tok/s
+  Prompt 4/10... Score: 3.0/10, 0.0 tok/s
+  Prompt 5/10... Score: 3.0/10, 0.0 tok/s
+  Prompt 6/10... Score: 3.0/10, 0.0 tok/s
+  Prompt 7/10... Score: 3.0/10, 0.0 tok/s
+  Prompt 8/10... Score: 3.0/10, 0.0 tok/s
+  Prompt 9/10... Score: 3.0/10, 0.0 tok/s
+  Prompt 10/10... Score: 3.0/10, 0.0 tok/s
+
+>>> Evaluating Python OLMo-core generation...
+  Prompt 1/10... Score: 5.8/10, 0.0 tok/s
+  Prompt 2/10... Score: 5.8/10, 0.0 tok/s
+  Prompt 3/10... Score: 5.8/10, 0.0 tok/s
+  Prompt 4/10... Score: 5.8/10, 0.0 tok/s
+  Prompt 5/10... Score: 5.8/10, 0.0 tok/s
+  Prompt 6/10... Score: 5.8/10, 0.0 tok/s
+  Prompt 7/10... Score: 5.8/10, 0.0 tok/s
+  Prompt 8/10... Score: 5.8/10, 0.0 tok/s
+  Prompt 9/10... Score: 5.8/10, 0.0 tok/s
+  Prompt 10/10... Score: 5.8/10, 0.0 tok/s
+
+================================================================================
+GENERATION QUALITY EVALUATION
+================================================================================
+
+--- Prompt 1: "Once upon a time there was a little cat who..."
+  [llm-cpp (Experimental)] Score: 3.0/10 | 0 tok @ 0.0 tok/s
+    "..."
+  [cpp-llm (clean)] Score: 3.0/10 | 0 tok @ 0.0 tok/s
+    "..."
+  [Python OLMo-core] Score: 5.8/10 | 0 tok @ 0.0 tok/s
+    "[STDERR:   File "<string>", line 26     if tok.startswith("\u00") and len(tok) == 6:                             ^ Synta..."
+
+--- Prompt 2: "The girl walked into the forest and found a..."
+  [llm-cpp (Experimental)] Score: 3.0/10 | 0 tok @ 0.0 tok/s
+    "..."
+  [cpp-llm (clean)] Score: 3.0/10 | 0 tok @ 0.0 tok/s
+    "..."
+  [Python OLMo-core] Score: 5.8/10 | 0 tok @ 0.0 tok/s
+    "[STDERR:   File "<string>", line 26     if tok.startswith("\u00") and len(tok) == 6:                             ^ Synta..."
+
+--- Prompt 3: "One day a boy named Tom went to the park and..."
+  [llm-cpp (Experimental)] Score: 3.0/10 | 0 tok @ 0.0 tok/s
+    "..."
+  [cpp-llm (clean)] Score: 3.0/10 | 0 tok @ 0.0 tok/s
+    "..."
+  [Python OLMo-core] Score: 5.8/10 | 0 tok @ 0.0 tok/s
+    "[STDERR:   File "<string>", line 26     if tok.startswith("\u00") and len(tok) == 6:                             ^ Synta..."
+
+--- Prompt 4: "There was a big red ball in the garden that..."
+  [llm-cpp (Experimental)] Score: 3.0/10 | 0 tok @ 0.0 tok/s
+    "..."
+  [cpp-llm (clean)] Score: 3.0/10 | 0 tok @ 0.0 tok/s
+    "..."
+  [Python OLMo-core] Score: 5.8/10 | 0 tok @ 0.0 tok/s
+    "[STDERR:   File "<string>", line 26     if tok.startswith("\u00") and len(tok) == 6:                             ^ Synta..."
+
+--- Prompt 5: "The little bird sang a beautiful song and then..."
+  [llm-cpp (Experimental)] Score: 3.0/10 | 0 tok @ 0.0 tok/s
+    "..."
+  [cpp-llm (clean)] Score: 3.0/10 | 0 tok @ 0.0 tok/s
+    "..."
+  [Python OLMo-core] Score: 5.8/10 | 0 tok @ 0.0 tok/s
+    "[STDERR:   File "<string>", line 26     if tok.startswith("\u00") and len(tok) == 6:                             ^ Synta..."
+
+--- Prompt 6: "Lily and her friend went to the beach to find..."
+  [llm-cpp (Experimental)] Score: 3.0/10 | 0 tok @ 0.0 tok/s
+    "..."
+  [cpp-llm (clean)] Score: 3.0/10 | 0 tok @ 0.0 tok/s
+    "..."
+  [Python OLMo-core] Score: 5.8/10 | 0 tok @ 0.0 tok/s
+    "[STDERR:   File "<string>", line 26     if tok.startswith("\u00") and len(tok) == 6:                             ^ Synta..."
+
+--- Prompt 7: "A tiny mouse lived in a small house near the..."
+  [llm-cpp (Experimental)] Score: 3.0/10 | 0 tok @ 0.0 tok/s
+    "..."
+  [cpp-llm (clean)] Score: 3.0/10 | 0 tok @ 0.0 tok/s
+    "..."
+  [Python OLMo-core] Score: 5.8/10 | 0 tok @ 0.0 tok/s
+    "[STDERR:   File "<string>", line 26     if tok.startswith("\u00") and len(tok) == 6:                             ^ Synta..."
+
+--- Prompt 8: "The sun was shining bright when Sam decided to..."
+  [llm-cpp (Experimental)] Score: 3.0/10 | 0 tok @ 0.0 tok/s
+    "..."
+  [cpp-llm (clean)] Score: 3.0/10 | 0 tok @ 0.0 tok/s
+    "..."
+  [Python OLMo-core] Score: 5.8/10 | 0 tok @ 0.0 tok/s
+    "[STDERR:   File "<string>", line 26     if tok.startswith("\u00") and len(tok) == 6:                             ^ Synta..."
+
+--- Prompt 9: "In a magical kingdom far away there lived a kind..."
+  [llm-cpp (Experimental)] Score: 3.0/10 | 0 tok @ 0.0 tok/s
+    "..."
+  [cpp-llm (clean)] Score: 3.0/10 | 0 tok @ 0.0 tok/s
+    "..."
+  [Python OLMo-core] Score: 5.8/10 | 0 tok @ 0.0 tok/s
+    "[STDERR:   File "<string>", line 26     if tok.startswith("\u00") and len(tok) == 6:                             ^ Synta..."
+
+--- Prompt 10: "The dog wagged his tail because he was so happy to..."
+  [llm-cpp (Experimental)] Score: 3.0/10 | 0 tok @ 0.0 tok/s
+    "..."
+  [cpp-llm (clean)] Score: 3.0/10 | 0 tok @ 0.0 tok/s
+    "..."
+  [Python OLMo-core] Score: 5.8/10 | 0 tok @ 0.0 tok/s
+    "[STDERR:   File "<string>", line 26     if tok.startswith("\u00") and len(tok) == 6:                             ^ Synta..."
+
+================================================================================
+SUMMARY
+================================================================================
+Framework                  Avg Score    Avg tok/s   Avg Time
+------------------------------------------------------------
+llm-cpp (Experimental)          3.00          0.0      0.742s
+cpp-llm (clean)                 3.00          0.0      0.814s
+Python OLMo-core                5.80          0.0      0.008s
+
+Framework                   Coher  Fluency   Relev   Compl  Length
+-----------------------------------------------------------------
+llm-cpp (Experimental)       3.00     0.00    0.00    0.00    0.00
+cpp-llm (clean)              3.00     0.00    0.00    0.00    0.00
+Python OLMo-core             3.00     2.00    0.00    0.00    0.80
+
+Report saved: /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/results/generation_eval.json

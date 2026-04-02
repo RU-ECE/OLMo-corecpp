@@ -1,0 +1,40 @@
+[
+  {
+    "framework": "OLMo-core (Python)",
+    "model_size": "100M",
+    "device": "cuda",
+    "seed": 42,
+    "seed_note": "deterministic",
+    "tok_per_s": 8158.4,
+    "step_ms_avg": 125.5,
+    "wall_time_s": 12.551,
+    "final_loss": 10.9696,
+    "total_tokens": 102400,
+    "peak_memory_mb": 2827.6,
+    "config": {
+      "batch_size": 4,
+      "seq_len": 256,
+      "steps": 100,
+      "seed": 42
+    }
+  },
+  {
+    "framework": "cpp-llm (C++)",
+    "model_size": "100M",
+    "device": "cuda",
+    "seed": null,
+    "seed_note": "non-deterministic (no --seed flag)",
+    "tok_per_s": 4432.0,
+    "step_ms_avg": 229.0,
+    "wall_time_s": 24.0,
+    "final_loss": 11.2965,
+    "total_tokens": 107520,
+    "peak_memory_mb": 0.0,
+    "config": {
+      "batch_size": 4,
+      "seq_len": 256,
+      "steps": 100,
+      "seed": 42
+    }
+  }
+]

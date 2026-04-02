@@ -1,0 +1,53 @@
+═══════════════════════════════════════════════════════════════
+  OLMo-corecpp Benchmark Report
+  3-Way Comparison: Python OLMo-core vs cpp-llm vs llm-cpp
+  Target: NVIDIA RTX 3060 (12GB VRAM)
+═══════════════════════════════════════════════════════════════
+
+Date: 2026-04-02 19:22:20 UTC
+Host: kzin
+GPU: NVIDIA GeForce RTX 3060
+GPU Memory: 12288 MiB
+CUDA: V13.1.115
+Driver: 580.82.07
+
+── Training Benchmark (30M) ──
+  Frameworks: OLMo-core (Python), llm-cpp (C++), llm-cpp fused (C++), llm-cpp fused+µP (C++), llm-cpp DC-MRE (C++), llm-cpp fused+µP+DC-MRE (C++), cpp-llm (C++)
+  Framework                           tok/s    step_ms  wall_time  memory_mb       loss
+  cpp-llm (C++) vs Python: 1.13x slower
+
+── Training Benchmark (125M) ──
+  Frameworks: OLMo-core (Python), llm-cpp (C++), llm-cpp fused (C++), llm-cpp fused+µP (C++), llm-cpp DC-MRE (C++), llm-cpp fused+µP+DC-MRE (C++), cpp-llm (C++)
+  Framework                           tok/s    step_ms  wall_time  memory_mb       loss
+  cpp-llm (C++) vs Python: 1.84x slower
+
+── Training Benchmark (350M) ──
+Backend: CUDA (fused kernels)
+Model: 508M params (d=1024, layers=24, heads=16, FUSED, µP, DC-MRE, mtp_heads=2)
+Step 0/100  loss: 11.875  lr: 0  step_ms: 606  tok/s: 844
+Step 10/100  loss: 11.875  lr: 0.000297954  step_ms: 1627  tok/s: 360
+Step 20/100  loss: 11.875  lr: 0.000281921  step_ms: 1626  tok/s: 336
+Step 30/100  loss: 11.875  lr: 0.000251592  step_ms: 1630  tok/s: 328
+Step 40/100  loss: 11.875  lr: 0.000210254  step_ms: 1631  tok/s: 325
+Step 50/100  loss: 11.875  lr: 0.000162387  step_ms: 1635  tok/s: 322
+Step 60/100  loss: 11.875  lr: 0.000113177  step_ms: 1636  tok/s: 321
+Step 70/100  loss: 11.875  lr: 6.79578e-05  step_ms: 1635  tok/s: 319
+Step 80/100  loss: 11.875  lr: 3.16289e-05  step_ms: 1634  tok/s: 319
+Step 90/100  loss: 11.875  lr: 8.12741e-06  step_ms: 1639  tok/s: 318
+  Throughput: 317 tok/s
+
+── Generation Quality ──
+SUMMARY
+================================================================================
+Framework                  Avg Score    Avg tok/s   Avg Time
+------------------------------------------------------------
+llm-cpp (Experimental)          3.00          0.0      0.742s
+cpp-llm (clean)                 3.00          0.0      0.814s
+Python OLMo-core                5.80          0.0      0.008s
+
+
+── Files ──
+Benchmark JSONs: /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/results/bench_*.json
+Generation eval: /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/results/generation_eval.json
+Training logs:   /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/results/train_*.log
+

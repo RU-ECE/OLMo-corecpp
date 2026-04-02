@@ -1,0 +1,93 @@
+
+==============================================================================================
+  OLMo 3-Way Benchmark: 30M model on cuda
+  Seed: 42 (cpp-llm: non-deterministic)
+  Frameworks: OLMo-core (Python), llm-cpp (C++), llm-cpp fused (C++), llm-cpp fused+µP (C++), llm-cpp DC-MRE (C++), llm-cpp fused+µP+DC-MRE (C++), cpp-llm (C++)
+  Steps: 100, Batch: 4, SeqLen: 256
+==============================================================================================
+
+[1/4] Setting up Python environment...
+  Venv already exists at /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/.bench_venv
+
+[2/4] Building llm-cpp...
+  llm-cpp build exists, rebuilding...
+  $ cmake --build /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/build
+
+[3/4] Building cpp-llm...
+  cpp-llm build exists, rebuilding...
+  $ cmake --build /home/dkruger/tmp/ru/OLMo-corecpp/build
+
+[4/4] Preparing benchmark data...
+  Data already exists at /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/data/bench_tokens.npy
+
+  Running Python benchmark (30M, cuda)...
+  $ /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/.bench_venv/bin/python /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/scripts/_bench_python_inner.py
+
+  Running cpp-llm benchmark (30M, cuda, seed=N/A)...
+  NOTE: cpp-llm has no --seed flag; run is non-deterministic
+  $ /home/dkruger/tmp/ru/OLMo-corecpp/build/olmo_train --train --config /home/dkruger/tmp/ru/OLMo-corecpp/configs/olmo2_30M_bench.json --device cuda --batch-size 4 --seq-len 256 --steps 105 --lr 1e-4 --warmup-steps 5 --data-path /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/data/bench_tokens.npy
+
+  Running llm-cpp (C++) benchmark (30M, cuda, seed=42)...
+  $ /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/build/olmo_train --train --config /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/configs/olmo2_30M_bench.json --device cuda --batch-size 4 --seq-len 256 --steps 105 --lr 1e-4 --warmup-steps 5 --optimizer adamw --seed 42 --data-path /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/data/bench_tokens.npy
+  STDERR: Usage: /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/build/olmo_train <conf_file>
+  e.g.: /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/build/olmo_train conf/olmo.conf
+
+  llm-cpp (C++) benchmark failed: Usage: /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/build/olmo_train <conf_file>
+  e.g.: /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/build/olmo_train conf/olmo.conf
+
+
+  Running llm-cpp fused (C++) benchmark (30M, cuda, seed=42)...
+  $ /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/build/olmo_train --train --config /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/configs/olmo2_30M_bench.json --device cuda --batch-size 4 --seq-len 256 --steps 105 --lr 1e-4 --warmup-steps 5 --optimizer adamw --seed 42 --fused --data-path /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/data/bench_tokens.npy
+  STDERR: Usage: /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/build/olmo_train <conf_file>
+  e.g.: /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/build/olmo_train conf/olmo.conf
+
+  llm-cpp fused (C++) benchmark failed: Usage: /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/build/olmo_train <conf_file>
+  e.g.: /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/build/olmo_train conf/olmo.conf
+
+
+  Running llm-cpp fused+µP (C++) benchmark (30M, cuda, seed=42)...
+  $ /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/build/olmo_train --train --config /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/configs/olmo2_30M_bench.json --device cuda --batch-size 4 --seq-len 256 --steps 105 --lr 1e-4 --warmup-steps 5 --optimizer adamw --seed 42 --fused --mup --data-path /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/data/bench_tokens.npy
+  STDERR: Usage: /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/build/olmo_train <conf_file>
+  e.g.: /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/build/olmo_train conf/olmo.conf
+
+  llm-cpp fused+µP (C++) benchmark failed: Usage: /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/build/olmo_train <conf_file>
+  e.g.: /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/build/olmo_train conf/olmo.conf
+
+
+  Running llm-cpp DC-MRE (C++) benchmark (30M, cuda, seed=42)...
+  $ /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/build/olmo_train --train --config /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/configs/olmo2_30M_bench.json --device cuda --batch-size 4 --seq-len 256 --steps 105 --lr 1e-4 --warmup-steps 5 --optimizer adamw --seed 42 --multi-res --bpe-vocab /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/data/gpt2/vocab.json --data-path /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/data/bench_tokens.npy
+  STDERR: Usage: /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/build/olmo_train <conf_file>
+  e.g.: /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/build/olmo_train conf/olmo.conf
+
+  llm-cpp DC-MRE (C++) benchmark failed: Usage: /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/build/olmo_train <conf_file>
+  e.g.: /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/build/olmo_train conf/olmo.conf
+
+
+  Running llm-cpp fused+µP+DC-MRE (C++) benchmark (30M, cuda, seed=42)...
+  $ /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/build/olmo_train --train --config /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/configs/olmo2_30M_bench.json --device cuda --batch-size 4 --seq-len 256 --steps 105 --lr 1e-4 --warmup-steps 5 --optimizer adamw --seed 42 --fused --mup --multi-res --bpe-vocab /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/data/gpt2/vocab.json --data-path /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/data/bench_tokens.npy
+  STDERR: Usage: /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/build/olmo_train <conf_file>
+  e.g.: /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/build/olmo_train conf/olmo.conf
+
+  llm-cpp fused+µP+DC-MRE (C++) benchmark failed: Usage: /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/build/olmo_train <conf_file>
+  e.g.: /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/build/olmo_train conf/olmo.conf
+
+
+==============================================================================================
+  BENCHMARK RESULTS
+==============================================================================================
+
+  Model: 30M
+  Config: batch_size=4, seq_len=256, steps=100, seed=42
+  ------------------------------------------------------------------------------------------
+  Framework                           tok/s    step_ms  wall_time  memory_mb       loss
+  ------------------------------------------------------------------------------------------
+  OLMo-core (Python)                  31038       33.0        3.3s     1305.7    11.0103 (29.2M params)
+  cpp-llm (C++)                       27476       34.0        3.0s        n/a    11.2359*
+  ------------------------------------------------------------------------------------------
+  cpp-llm (C++) vs Python: 1.13x slower
+
+  * = non-deterministic (no --seed support); loss not directly comparable
+
+==============================================================================================
+
+  Results saved to /home/dkruger/tmp/ru/olmo-xp/OLMo-corecpp/benchmark_results.json

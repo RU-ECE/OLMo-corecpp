@@ -1,0 +1,43 @@
+
+╔══════════════════════════════════════════════╗
+║  SEED: 42                                   ║
+║  Mode: explicit (--seed)                    ║
+╚══════════════════════════════════════════════╝
+
+Device: CUDA GPU
+Backend: CUDA (fused kernels)
+Config: /tmp/olmo_350M_bench.uGeqVp.conf
+MultiRes: loaded BPE vocab (50257 tokens), computed char trigrams and syntactic roles
+[µP] Initializing with base_width=256, target_width=1024, width_ratio=0.25
+[µP] Initialized 508762752 parameters
+Model: 508M params (d=1024, layers=24, heads=16, FUSED, µP, DC-MRE, mtp_heads=2)
+Using muon optimizer (lr=0.0003)
+Step 0/100  loss: 11.875  lr: 0  step_ms: 606  tok/s: 844
+Step 10/100  loss: 11.875  lr: 0.000297954  step_ms: 1627  tok/s: 360
+Step 20/100  loss: 11.875  lr: 0.000281921  step_ms: 1626  tok/s: 336
+Step 30/100  loss: 11.875  lr: 0.000251592  step_ms: 1630  tok/s: 328
+Step 40/100  loss: 11.875  lr: 0.000210254  step_ms: 1631  tok/s: 325
+Step 50/100  loss: 11.875  lr: 0.000162387  step_ms: 1635  tok/s: 322
+Step 60/100  loss: 11.875  lr: 0.000113177  step_ms: 1636  tok/s: 321
+Step 70/100  loss: 11.875  lr: 6.79578e-05  step_ms: 1635  tok/s: 319
+Step 80/100  loss: 11.875  lr: 3.16289e-05  step_ms: 1634  tok/s: 319
+Step 90/100  loss: 11.875  lr: 8.12741e-06  step_ms: 1639  tok/s: 318
+
+=== Training Summary ===
+  Steps: 100
+  Total tokens: 51200
+  Wall time: 161s
+  Throughput: 317 tok/s
+========================
+[Profiler] No data collected.
+
+[Memory] Device: cuda
+  Allocated: 9028.1 MB
+  Reserved:  11876.1 MB
+  Peak:      9028.1 MB
+
+[RNG] State summary:
+  Original seed: 42 (explicit)
+  torch generator seed: 42
+  torch CUDA devices: 1
+

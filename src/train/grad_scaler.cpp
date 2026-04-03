@@ -18,17 +18,27 @@ bool GradScaler::unscale_and_check(torch::optim::Optimizer& optimizer) {
   found_inf_ = false;
   float inv_scale = 1.0f / scale_;
 
+  // Unscale all gradients first
+  std::vector<torch::Tensor> grads;
   for (auto& group : optimizer.param_groups()) {
     for (auto& p : group.params()) {
       if (p.grad().defined()) {
         p.grad().mul_(inv_scale);
+        grads.push_back(p.grad());
+      }
+    }
+  }
 
-        // Check for inf/nan
-        if (!torch::isfinite(p.grad()).all().item<bool>()) {
-          found_inf_ = true;
-          // Zero out bad gradients
-          p.grad().zero_();
-        }
+  // Single batched inf/nan check — one CUDA sync instead of per-parameter
+  if (!grads.empty()) {
+    auto all_finite = torch::ones({1}, grads[0].options());
+    for (auto& g : grads) {
+      all_finite.mul_(torch::isfinite(g).all().to(all_finite.dtype()));
+    }
+    if (!all_finite.item<bool>()) {
+      found_inf_ = true;
+      for (auto& g : grads) {
+        g.zero_();
       }
     }
   }

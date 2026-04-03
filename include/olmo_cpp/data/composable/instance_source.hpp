@@ -33,6 +33,7 @@ class ConcatAndChunkInstanceSource : public InstanceSource {
   std::unique_ptr<TokenSource> source_;
   int64_t seq_len_;
   std::vector<int64_t> buffer_;
+  size_t buffer_offset_ = 0;  // index-based tracking instead of erase()
 };
 
 /// Packing instance source: packs multiple documents into seq_len with padding
@@ -47,6 +48,7 @@ class PackingInstanceSource : public InstanceSource {
   std::unique_ptr<DocumentSource> source_;
   int64_t seq_len_, pad_token_id_, eos_token_id_;
   std::vector<int64_t> buffer_;
+  size_t buffer_offset_ = 0;  // index-based tracking instead of erase()
 };
 
 /// Random instance source: generates random token sequences (for testing)

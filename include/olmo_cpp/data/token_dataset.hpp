@@ -38,6 +38,11 @@ class TokenDataset {
   bool shuffle_;
   std::vector<int64_t> chunk_indices_;
   size_t chunk_cursor_;
+
+  // Pre-allocated buffers to avoid per-batch heap allocation
+  int64_t buf_batch_size_ = 0;
+  std::vector<int64_t> input_buf_;
+  std::vector<int64_t> label_buf_;
 };
 
 }  // namespace olmo_cpp

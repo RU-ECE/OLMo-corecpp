@@ -25,7 +25,8 @@ class TransformerImpl : public torch::nn::Module {
 
   void init_weights(torch::optional<torch::Generator> gen = c10::nullopt);
 
-  std::vector<RoPEBuffers> get_rope_buffers(int64_t seq_len, torch::Device device);
+  std::vector<RoPEBuffers> get_rope_buffers(int64_t seq_len, torch::Device device,
+                                             torch::Dtype dtype = torch::kFloat32);
 
   int64_t n_layers() const { return config_.n_layers; }
 
@@ -37,8 +38,9 @@ class TransformerImpl : public torch::nn::Module {
   std::optional<double> embed_scale_;
   TransformerConfig config_;
 
-  // Cached RoPE — recomputed only when seq_len grows
+  // Cached RoPE — recomputed only when seq_len grows or dtype changes
   int64_t cached_rope_len_ = 0;
+  torch::Dtype cached_rope_dtype_ = torch::kFloat32;
   std::vector<RoPEBuffers> cached_rope_bufs_;
 };
 

@@ -26,3 +26,6 @@ Thumbs.db
 *.bin
 *.pt
 *.safetensors
+
+# Claude Code
+CLAUDE.md

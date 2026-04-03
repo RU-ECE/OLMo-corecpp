@@ -23,14 +23,16 @@ torch::Tensor RotaryEmbeddingImpl::apply_rotary(
   return t * cos + rotate_half(t) * sin;
 }
 
-RoPEBuffers RotaryEmbeddingImpl::get_buffers(int64_t seq_len, torch::Device device) {
+RoPEBuffers RotaryEmbeddingImpl::get_buffers(int64_t seq_len, torch::Device device,
+                                              torch::Dtype dtype) {
+  // Compute in float32 for precision, then cast once to target dtype
   auto inv_freq = compute_inv_freqs(device);
   auto seq = torch::arange(seq_len, torch::TensorOptions().dtype(torch::kFloat32).device(device));
   auto freqs = seq.unsqueeze(1) * inv_freq.unsqueeze(0);
   auto positions = torch::cat({freqs, freqs}, -1);
   RoPEBuffers bufs;
-  bufs.pos_sin = positions.sin();
-  bufs.pos_cos = positions.cos();
+  bufs.pos_sin = positions.sin().to(dtype);
+  bufs.pos_cos = positions.cos().to(dtype);
   return bufs;
 }
 
@@ -49,10 +51,7 @@ std::pair<torch::Tensor, torch::Tensor> RotaryEmbeddingImpl::apply(
   auto sin_k = bufs.pos_sin.slice(0, k_abs_start, k_abs_start + k_len).unsqueeze(0).unsqueeze(0);
   auto cos_k = bufs.pos_cos.slice(0, k_abs_start, k_abs_start + k_len).unsqueeze(0).unsqueeze(0);
 
-  sin_q = sin_q.to(q.device()).to(q.dtype());
-  cos_q = cos_q.to(q.device()).to(q.dtype());
-  sin_k = sin_k.to(k.device()).to(k.dtype());
-  cos_k = cos_k.to(k.device()).to(k.dtype());
+  // Buffers are already in target dtype and on target device (set in get_buffers)
 
   auto q_rot = apply_rotary(q, sin_q, cos_q);
   auto k_rot = apply_rotary(k, sin_k, cos_k);

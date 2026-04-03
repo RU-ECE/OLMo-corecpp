@@ -20,29 +20,36 @@ ConcatAndChunkInstanceSource::ConcatAndChunkInstanceSource(
 
 bool ConcatAndChunkInstanceSource::has_next() const {
   // We need seq_len + 1 tokens to produce one instance (input + 1 shifted label)
-  // Check buffer size plus whether source has more
-  return (static_cast<int64_t>(buffer_.size()) >= seq_len_ + 1) ||
-         source_->has_next();
+  int64_t available = static_cast<int64_t>(buffer_.size() - buffer_offset_);
+  return (available >= seq_len_ + 1) || source_->has_next();
 }
 
 Instance ConcatAndChunkInstanceSource::next() {
-  // Fill buffer until we have at least seq_len + 1 tokens
-  while (static_cast<int64_t>(buffer_.size()) < seq_len_ + 1 &&
+  // Fill buffer until we have at least seq_len + 1 tokens past offset
+  while (static_cast<int64_t>(buffer_.size() - buffer_offset_) < seq_len_ + 1 &&
          source_->has_next()) {
     buffer_.push_back(source_->next());
   }
 
-  if (static_cast<int64_t>(buffer_.size()) < seq_len_ + 1) {
+  int64_t available = static_cast<int64_t>(buffer_.size() - buffer_offset_);
+  if (available < seq_len_ + 1) {
     throw std::runtime_error(
         "ConcatAndChunkInstanceSource: not enough tokens for an instance");
   }
 
   Instance inst;
-  inst.input_ids.assign(buffer_.begin(), buffer_.begin() + seq_len_);
-  inst.labels.assign(buffer_.begin() + 1, buffer_.begin() + seq_len_ + 1);
+  auto start = buffer_.begin() + static_cast<ptrdiff_t>(buffer_offset_);
+  inst.input_ids.assign(start, start + seq_len_);
+  inst.labels.assign(start + 1, start + seq_len_ + 1);
 
-  // Remove the consumed tokens (keep the last token as overlap for next chunk)
-  buffer_.erase(buffer_.begin(), buffer_.begin() + seq_len_);
+  // Advance offset instead of erasing
+  buffer_offset_ += static_cast<size_t>(seq_len_);
+
+  // Compact when offset exceeds half the buffer to bound memory growth
+  if (buffer_offset_ > buffer_.size() / 2) {
+    buffer_.erase(buffer_.begin(), buffer_.begin() + static_cast<ptrdiff_t>(buffer_offset_));
+    buffer_offset_ = 0;
+  }
 
   return inst;
 }
@@ -50,6 +57,7 @@ Instance ConcatAndChunkInstanceSource::next() {
 void ConcatAndChunkInstanceSource::reset() {
   source_->reset();
   buffer_.clear();
+  buffer_offset_ = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -70,59 +78,58 @@ PackingInstanceSource::PackingInstanceSource(
 }
 
 bool PackingInstanceSource::has_next() const {
-  return !buffer_.empty() || source_->has_next();
+  return (buffer_.size() - buffer_offset_) > 0 || source_->has_next();
 }
 
 Instance PackingInstanceSource::next() {
-  // Pack documents into buffer until we have at least seq_len + 1 tokens
-  while (static_cast<int64_t>(buffer_.size()) < seq_len_ + 1 &&
+  // Pack documents into buffer until we have at least seq_len + 1 tokens past offset
+  while (static_cast<int64_t>(buffer_.size() - buffer_offset_) < seq_len_ + 1 &&
          source_->has_next()) {
     Document doc = source_->next();
     if (doc.tokens.empty()) continue;
 
-    // If buffer is non-empty and we have an eos_token_id, add separator
-    if (!buffer_.empty() && eos_token_id_ >= 0) {
+    // If buffer has content and we have an eos_token_id, add separator
+    if (buffer_.size() > buffer_offset_ && eos_token_id_ >= 0) {
       buffer_.push_back(eos_token_id_);
     }
 
     buffer_.insert(buffer_.end(), doc.tokens.begin(), doc.tokens.end());
   }
 
-  if (buffer_.empty()) {
+  int64_t available = static_cast<int64_t>(buffer_.size() - buffer_offset_);
+  if (available == 0) {
     throw std::runtime_error("PackingInstanceSource: no more instances");
   }
 
   Instance inst;
+  auto start = buffer_.begin() + static_cast<ptrdiff_t>(buffer_offset_);
 
-  if (static_cast<int64_t>(buffer_.size()) >= seq_len_ + 1) {
-    // Enough tokens: take seq_len + 1 tokens
-    inst.input_ids.assign(buffer_.begin(), buffer_.begin() + seq_len_);
-    inst.labels.assign(buffer_.begin() + 1, buffer_.begin() + seq_len_ + 1);
-    buffer_.erase(buffer_.begin(), buffer_.begin() + seq_len_);
+  if (available >= seq_len_ + 1) {
+    inst.input_ids.assign(start, start + seq_len_);
+    inst.labels.assign(start + 1, start + seq_len_ + 1);
+    buffer_offset_ += static_cast<size_t>(seq_len_);
   } else {
-    // Not enough tokens: pad the remainder
-    int64_t available = static_cast<int64_t>(buffer_.size());
-    // input_ids: available - 1 real tokens + padding
-    // labels: available - 1 real tokens (shifted) + -100 for padding
     int64_t real_len = available - 1;
     if (real_len <= 0) {
-      // Only 1 or 0 tokens, not enough for input/label pair; pad fully
       inst.input_ids.resize(seq_len_, pad_token_id_);
       inst.labels.resize(seq_len_, -100);
-      buffer_.clear();
-      return inst;
+      buffer_offset_ = buffer_.size();
+    } else {
+      inst.input_ids.assign(start, start + real_len);
+      inst.labels.assign(start + 1, start + real_len + 1);
+
+      while (static_cast<int64_t>(inst.input_ids.size()) < seq_len_) {
+        inst.input_ids.push_back(pad_token_id_);
+        inst.labels.push_back(-100);
+      }
+      buffer_offset_ = buffer_.size();
     }
+  }
 
-    inst.input_ids.assign(buffer_.begin(), buffer_.begin() + real_len);
-    inst.labels.assign(buffer_.begin() + 1, buffer_.begin() + real_len + 1);
-
-    // Pad to seq_len
-    while (static_cast<int64_t>(inst.input_ids.size()) < seq_len_) {
-      inst.input_ids.push_back(pad_token_id_);
-      inst.labels.push_back(-100);  // ignore index
-    }
-
-    buffer_.clear();
+  // Compact when offset exceeds half the buffer to bound memory growth
+  if (buffer_offset_ > buffer_.size() / 2) {
+    buffer_.erase(buffer_.begin(), buffer_.begin() + static_cast<ptrdiff_t>(buffer_offset_));
+    buffer_offset_ = 0;
   }
 
   return inst;
@@ -131,6 +138,7 @@ Instance PackingInstanceSource::next() {
 void PackingInstanceSource::reset() {
   source_->reset();
   buffer_.clear();
+  buffer_offset_ = 0;
 }
 
 // ---------------------------------------------------------------------------

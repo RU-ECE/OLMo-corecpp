@@ -18,7 +18,8 @@ class RotaryEmbeddingImpl : public torch::nn::Module {
  public:
   RotaryEmbeddingImpl(int64_t head_size, int64_t theta = 500000);
 
-  RoPEBuffers get_buffers(int64_t seq_len, torch::Device device);
+  RoPEBuffers get_buffers(int64_t seq_len, torch::Device device,
+                          torch::Dtype dtype = torch::kFloat32);
 
   std::pair<torch::Tensor, torch::Tensor> apply(
       torch::Tensor q,

@@ -1,6 +1,7 @@
 #include "olmo_cpp/data/token_dataset.hpp"
 #include <cnpy.h>
 #include <algorithm>
+#include <cstring>
 #include <random>
 #include <stdexcept>
 
@@ -61,8 +62,13 @@ void TokenDataset::reset_epoch() {
 std::tuple<torch::Tensor, torch::Tensor> TokenDataset::get_batch(
     int64_t batch_size,
     torch::Device device) {
-  auto input_buf = std::vector<int64_t>(static_cast<size_t>(batch_size * seq_len_));
-  auto label_buf = std::vector<int64_t>(static_cast<size_t>(batch_size * seq_len_));
+  // Resize persistent buffers only when batch size changes
+  size_t buf_size = static_cast<size_t>(batch_size * seq_len_);
+  if (batch_size != buf_batch_size_) {
+    input_buf_.resize(buf_size);
+    label_buf_.resize(buf_size);
+    buf_batch_size_ = batch_size;
+  }
 
   for (int64_t b = 0; b < batch_size; ++b) {
     if (chunk_cursor_ >= static_cast<size_t>(num_chunks_)) {
@@ -71,18 +77,20 @@ std::tuple<torch::Tensor, torch::Tensor> TokenDataset::get_batch(
     int64_t chunk_idx = chunk_indices_[chunk_cursor_++];
     int64_t offset = chunk_idx * seq_len_;
 
-    for (int64_t s = 0; s < seq_len_; ++s) {
-      size_t idx = static_cast<size_t>(b * seq_len_ + s);
-      input_buf[idx] = tokens_[static_cast<size_t>(offset + s)];
-      // Labels = next token (always valid since num_chunks guarantees room)
-      label_buf[idx] = tokens_[static_cast<size_t>(offset + s + 1)];
-    }
+    // memcpy contiguous chunk instead of element-by-element loop
+    size_t dst_offset = static_cast<size_t>(b * seq_len_);
+    std::memcpy(input_buf_.data() + dst_offset,
+                tokens_.data() + offset,
+                static_cast<size_t>(seq_len_) * sizeof(int64_t));
+    std::memcpy(label_buf_.data() + dst_offset,
+                tokens_.data() + offset + 1,
+                static_cast<size_t>(seq_len_) * sizeof(int64_t));
   }
 
-  // Create on CPU first, then move to device (more reliable on MPS)
+  // Create on CPU first, then move to device with non_blocking transfer
   auto cpu_opts = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
-  auto input = torch::from_blob(input_buf.data(), {batch_size, seq_len_}, cpu_opts).clone().to(device);
-  auto labels = torch::from_blob(label_buf.data(), {batch_size, seq_len_}, cpu_opts).clone().to(device);
+  auto input = torch::from_blob(input_buf_.data(), {batch_size, seq_len_}, cpu_opts).clone().to(device, /*non_blocking=*/true);
+  auto labels = torch::from_blob(label_buf_.data(), {batch_size, seq_len_}, cpu_opts).clone().to(device, /*non_blocking=*/true);
   return {std::move(input), std::move(labels)};
 }
 

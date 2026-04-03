@@ -50,6 +50,11 @@ class FusedAttentionImpl : public torch::nn::Module {
   int64_t kv_size_;  // n_kv_heads * head_dim
   bool use_head_qk_norm_;
   int64_t sliding_window_size_;
+
+  // Cached sliding window mask — reused when (S, full_S) unchanged
+  int64_t cached_mask_S_ = 0;
+  int64_t cached_mask_full_S_ = 0;
+  torch::Tensor cached_attn_mask_;
 };
 
 TORCH_MODULE(FusedAttention);

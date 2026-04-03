@@ -45,9 +45,10 @@ TransformerImpl::TransformerImpl(const TransformerConfig& cfg)
   }
 }
 
-std::vector<RoPEBuffers> TransformerImpl::get_rope_buffers(int64_t seq_len, torch::Device device) {
-  // Reuse cached buffers if they cover the needed sequence length
-  if (seq_len <= cached_rope_len_ && !cached_rope_bufs_.empty()) {
+std::vector<RoPEBuffers> TransformerImpl::get_rope_buffers(int64_t seq_len, torch::Device device,
+                                                           torch::Dtype dtype) {
+  // Reuse cached buffers if they cover the needed sequence length and dtype matches
+  if (seq_len <= cached_rope_len_ && !cached_rope_bufs_.empty() && dtype == cached_rope_dtype_) {
     return cached_rope_bufs_;
   }
 
@@ -56,9 +57,10 @@ std::vector<RoPEBuffers> TransformerImpl::get_rope_buffers(int64_t seq_len, torc
   RotaryEmbedding rope(config_.get_head_dim(), config_.rope_theta);
   cached_rope_bufs_.resize(static_cast<size_t>(config_.n_layers));
   for (int64_t i = 0; i < config_.n_layers; ++i) {
-    cached_rope_bufs_[i] = rope->get_buffers(alloc_len, device);
+    cached_rope_bufs_[i] = rope->get_buffers(alloc_len, device, dtype);
   }
   cached_rope_len_ = alloc_len;
+  cached_rope_dtype_ = dtype;
   return cached_rope_bufs_;
 }
 
@@ -117,7 +119,7 @@ torch::Tensor TransformerImpl::forward_backbone(
 
   int64_t cached_len = kv_cache ? kv_cache->seq_len() : 0;
   int64_t total_len = cached_len + new_seq_len;
-  auto rope_bufs = get_rope_buffers(total_len, device);
+  auto rope_bufs = get_rope_buffers(total_len, device, h.dtype().toScalarType());
 
   std::optional<int64_t> start_pos =
       kv_cache ? std::optional<int64_t>(cached_len) : std::nullopt;

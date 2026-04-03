@@ -1,4 +1,5 @@
 #include "olmo_cpp/data/composable/data_loader.hpp"
+#include <cstring>
 #include <stdexcept>
 
 namespace olmo_cpp {
@@ -42,19 +43,17 @@ std::tuple<torch::Tensor, torch::Tensor> ComposableDataLoader::next_batch() {
   auto labels = torch::full({actual_batch, seq_len}, static_cast<int64_t>(-100),
                             torch::TensorOptions().dtype(torch::kLong));
 
-  auto input_accessor = input_ids.accessor<int64_t, 2>();
-  auto label_accessor = labels.accessor<int64_t, 2>();
+  auto* input_ptr = input_ids.data_ptr<int64_t>();
+  auto* label_ptr = labels.data_ptr<int64_t>();
 
   for (int64_t b = 0; b < actual_batch; ++b) {
     const auto& inst = instances[b];
-    const int64_t len = static_cast<int64_t>(inst.input_ids.size());
-    for (int64_t s = 0; s < std::min(len, seq_len); ++s) {
-      input_accessor[b][s] = inst.input_ids[s];
-    }
-    const int64_t label_len = static_cast<int64_t>(inst.labels.size());
-    for (int64_t s = 0; s < std::min(label_len, seq_len); ++s) {
-      label_accessor[b][s] = inst.labels[s];
-    }
+    const int64_t len = std::min(static_cast<int64_t>(inst.input_ids.size()), seq_len);
+    std::memcpy(input_ptr + b * seq_len, inst.input_ids.data(),
+                static_cast<size_t>(len) * sizeof(int64_t));
+    const int64_t label_len = std::min(static_cast<int64_t>(inst.labels.size()), seq_len);
+    std::memcpy(label_ptr + b * seq_len, inst.labels.data(),
+                static_cast<size_t>(label_len) * sizeof(int64_t));
   }
 
   return {input_ids.to(device_), labels.to(device_)};

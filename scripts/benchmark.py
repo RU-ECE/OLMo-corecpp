@@ -58,11 +58,11 @@ MODEL_CONFIGS = {
     },
     "100M": {
         "python_factory": "olmo2_100M",
-        "cpp_config": "configs/olmo2_125M.json",
-        "cpp_llm_config": "configs/olmo2_125M.json",
-        "d_model": 768,
+        "cpp_config": "configs/olmo2_100M.json",
+        "cpp_llm_config": "configs/olmo2_100M.json",
+        "d_model": 512,
         "n_layers": 12,
-        "n_heads": 12,
+        "n_heads": 8,
     },
 }
 

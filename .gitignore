@@ -37,3 +37,4 @@ benchmark_results.json
 __pycache__/
 *.pyc
 .venv/
+CLAUDE.md

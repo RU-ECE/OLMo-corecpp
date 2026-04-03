@@ -18,7 +18,7 @@ torch::Tensor SIMDBackend::rms_norm(torch::Tensor x, torch::Tensor weight, doubl
   auto orig_sizes = x.sizes().vec();
   int64_t d = orig_sizes.back();
   int64_t n_rows = x.numel() / d;
-  auto x_flat = x.contiguous().view({n_rows, d});
+  auto x_flat = x.reshape({n_rows, d});
 
   auto out = torch::empty_like(x_flat);
 

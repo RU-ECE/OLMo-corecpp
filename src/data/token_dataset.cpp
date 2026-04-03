@@ -108,12 +108,12 @@ std::tuple<torch::Tensor, torch::Tensor> TokenDataset::get_batch(
     auto [input, labels] = prefetch_future_.get();
     has_prefetch_ = false;
     // Transfer to target device (may already be on the right device)
-    return {input.to(device), labels.to(device)};
+    return {input.to(device, /*non_blocking=*/true), labels.to(device, /*non_blocking=*/true)};
   }
 
   // No prefetch available — prepare synchronously
   auto [input, labels] = prepare_batch_cpu(batch_size);
-  return {input.to(device), labels.to(device)};
+  return {input.to(device, /*non_blocking=*/true), labels.to(device, /*non_blocking=*/true)};
 }
 
 void TokenDataset::prefetch_next(int64_t batch_size, torch::Device device) {

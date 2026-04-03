@@ -34,6 +34,11 @@ class AttentionImpl : public torch::nn::Module {
   int64_t n_heads_rep_;  // n_heads / n_kv_heads for GQA repeat
   bool use_head_qk_norm_;
   int64_t sliding_window_size_;  // -1 = no window (full attention)
+
+  // Cached sliding window mask — reused when (S, full_S) unchanged
+  int64_t cached_mask_S_ = 0;
+  int64_t cached_mask_full_S_ = 0;
+  torch::Tensor cached_attn_mask_;
 };
 
 TORCH_MODULE(Attention);

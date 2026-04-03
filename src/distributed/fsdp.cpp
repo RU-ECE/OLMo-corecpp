@@ -67,7 +67,7 @@ void FSDPContext::shard_params(std::vector<torch::Tensor>& params) {
 
     // Pad to be divisible by world_size
     int64_t padded = ((numel + world_size_ - 1) / world_size_) * world_size_;
-    auto flat = p.detach().contiguous().view({-1});
+    auto flat = p.detach().reshape({-1});
     if (padded > numel) {
       flat = torch::cat({flat, torch::zeros({padded - numel}, flat.options())});
     }
@@ -141,7 +141,7 @@ void FSDPContext::reduce_scatter_grads(std::vector<torch::Tensor>& grads) {
   for (size_t i = 0; i < grads.size(); ++i) {
     if (!grads[i].defined()) continue;
 
-    auto grad = grads[i].contiguous().view({-1});
+    auto grad = grads[i].reshape({-1});
     int64_t numel = grad.numel();
     int64_t padded = ((numel + world_size_ - 1) / world_size_) * world_size_;
 

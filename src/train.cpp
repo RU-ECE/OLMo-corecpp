@@ -86,6 +86,12 @@ void train_epoch(
     dataset->reset_epoch();
   }
 
+  // Pre-build DDP parameter list once (avoids per-step allocation)
+  std::vector<torch::Tensor> ddp_params;
+  if (ddp && ddp->is_distributed()) {
+    for (auto& p : model->parameters()) ddp_params.push_back(p);
+  }
+
   auto train_start = std::chrono::steady_clock::now();
   int64_t total_tokens = 0;
 
@@ -106,7 +112,8 @@ void train_epoch(
     {
       ProfileScope step_scope("step_total");
       optimizer.zero_grad();
-      float accum_loss = 0.0f;
+      // Accumulate loss on GPU to avoid CUDA sync every micro-step
+      torch::Tensor accum_loss_tensor = torch::zeros({}, torch::TensorOptions().device(device));
 
       for (int64_t accum = 0; accum < grad_accum_steps; ++accum) {
         torch::Tensor input, labels;
@@ -145,15 +152,13 @@ void train_epoch(
           ProfileScope bwd_scope("backward");
           loss.backward();
         }
-        accum_loss += loss.item<float>();
+        accum_loss_tensor += loss.detach();
       }
 
       {
         ProfileScope allreduce_scope("allreduce");
         if (ddp && ddp->is_distributed()) {
-          std::vector<torch::Tensor> params;
-          for (auto& p : model->parameters()) params.push_back(p);
-          ddp->allreduce_gradients(params);
+          ddp->allreduce_gradients(ddp_params);
         }
       }
 
@@ -166,6 +171,8 @@ void train_epoch(
       total_tokens += batch_size * seq_len * grad_accum_steps;
 
       if (step % 10 == 0 && (!ddp || ddp->rank() == 0)) {
+        // Only sync loss from GPU when we actually need to log
+        float accum_loss = accum_loss_tensor.item<float>();
         auto step_end = std::chrono::steady_clock::now();
         double step_ms = std::chrono::duration<double, std::milli>(step_end - step_start).count();
         double elapsed_s = std::chrono::duration<double>(step_end - train_start).count();
@@ -257,6 +264,12 @@ void train(
     dataset->reset_epoch();
   }
 
+  // Pre-build DDP parameter list once (avoids per-step allocation)
+  std::vector<torch::Tensor> ddp_params;
+  if (ddp && ddp->is_distributed()) {
+    for (auto& p : model->parameters()) ddp_params.push_back(p);
+  }
+
   // ---- Callback manager ----
   CallbackManager cb_mgr;
   for (auto& cb : callbacks) cb_mgr.add(cb);
@@ -305,7 +318,8 @@ void train(
     cb_mgr.on_step_start(state);
 
     optimizer->zero_grad();
-    float accum_loss = 0.0f;
+    // Accumulate loss on GPU to avoid CUDA sync every micro-step
+    torch::Tensor accum_loss_tensor = torch::zeros({}, torch::TensorOptions().device(device));
 
     for (int64_t accum = 0; accum < cfg.grad_accum_steps; ++accum) {
       torch::Tensor input, labels;
@@ -339,17 +353,17 @@ void train(
       } else {
         loss.backward();
       }
-      accum_loss += loss.item<float>();
+      accum_loss_tensor += loss.detach();
     }
 
+    // Sync loss from GPU only once per step (for callbacks/logging)
+    float accum_loss = accum_loss_tensor.item<float>();
     state.loss = accum_loss;
     cb_mgr.on_after_loss(state);
 
     // Gradient sync in distributed
     if (ddp && ddp->is_distributed()) {
-      std::vector<torch::Tensor> params;
-      for (auto& p : model->parameters()) params.push_back(p);
-      ddp->allreduce_gradients(params);
+      ddp->allreduce_gradients(ddp_params);
     }
 
     cb_mgr.on_after_backward(state);
@@ -473,6 +487,12 @@ void train(
     std::cout << "Using " << cfg.optimizer << " optimizer (lr=" << cfg.lr << ")" << std::endl;
   }
 
+  // Pre-build DDP parameter list once (avoids per-step allocation)
+  std::vector<torch::Tensor> ddp_params;
+  if (ddp && ddp->is_distributed()) {
+    for (auto& p : model->parameters()) ddp_params.push_back(p);
+  }
+
   auto train_start = std::chrono::steady_clock::now();
   int64_t total_tokens = 0;
 
@@ -482,7 +502,8 @@ void train(
     scheduler->apply(*optimizer, step, cfg.num_steps);
 
     optimizer->zero_grad();
-    float accum_loss = 0.0f;
+    // Accumulate loss on GPU to avoid CUDA sync every micro-step
+    torch::Tensor accum_loss_tensor = torch::zeros({}, torch::TensorOptions().device(device));
 
     for (int64_t accum = 0; accum < cfg.grad_accum_steps; ++accum) {
       torch::Tensor input, labels;
@@ -510,13 +531,11 @@ void train(
         loss = model->forward(input, labels, -100) / static_cast<float>(cfg.grad_accum_steps);
       }
       loss.backward();
-      accum_loss += loss.item<float>();
+      accum_loss_tensor += loss.detach();
     }
 
     if (ddp && ddp->is_distributed()) {
-      std::vector<torch::Tensor> params;
-      for (auto& p : model->parameters()) params.push_back(p);
-      ddp->allreduce_gradients(params);
+      ddp->allreduce_gradients(ddp_params);
     }
 
     torch::nn::utils::clip_grad_norm_(model->parameters(), cfg.max_grad_norm);
@@ -525,6 +544,8 @@ void train(
     total_tokens += cfg.batch_size * cfg.seq_len * cfg.grad_accum_steps;
 
     if (step % 10 == 0 && rank == 0) {
+      // Only sync loss from GPU when we actually need to log
+      float accum_loss = accum_loss_tensor.item<float>();
       auto step_end = std::chrono::steady_clock::now();
       double step_ms = std::chrono::duration<double, std::milli>(step_end - step_start).count();
       double elapsed_s = std::chrono::duration<double>(step_end - train_start).count();

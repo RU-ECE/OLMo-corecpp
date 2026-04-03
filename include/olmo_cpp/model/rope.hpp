@@ -18,7 +18,8 @@ class RotaryEmbeddingImpl : public torch::nn::Module {
  public:
   RotaryEmbeddingImpl(int64_t head_size, int64_t theta = 500000);
 
-  RoPEBuffers get_buffers(int64_t seq_len, torch::Device device);
+  RoPEBuffers get_buffers(int64_t seq_len, torch::Device device,
+                          torch::Dtype dtype = torch::kFloat32);
 
   std::pair<torch::Tensor, torch::Tensor> apply(
       torch::Tensor q,
@@ -32,6 +33,7 @@ class RotaryEmbeddingImpl : public torch::nn::Module {
   // Cached buffers — avoid recomputing sin/cos every forward pass
   int64_t cached_seq_len_ = 0;
   torch::Device cached_device_ = torch::kCPU;
+  torch::Dtype cached_dtype_ = torch::kFloat32;
   RoPEBuffers cached_bufs_;
 
   torch::Tensor compute_inv_freqs(torch::Device device);

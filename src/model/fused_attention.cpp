@@ -105,22 +105,27 @@ torch::Tensor FusedAttentionImpl::forward(
   torch::Tensor attn_out;
 
   if (sliding_window_size_ > 0 && S > 1) {
-    auto rows = torch::arange(S, x.options().dtype(torch::kLong)).unsqueeze(1);
-    auto cols = torch::arange(full_S, x.options().dtype(torch::kLong)).unsqueeze(0);
-    auto offset = full_S - S;
+    // Reuse cached mask when dimensions haven't changed
+    if (S != cached_mask_S_ || full_S != cached_mask_full_S_) {
+      auto rows = torch::arange(S, torch::TensorOptions().dtype(torch::kLong).device(x.device())).unsqueeze(1);
+      auto cols = torch::arange(full_S, torch::TensorOptions().dtype(torch::kLong).device(x.device())).unsqueeze(0);
+      auto offset = full_S - S;
 
-    auto mask = (cols >= (rows + offset - sliding_window_size_)) & (cols <= (rows + offset));
-    if (is_causal) {
-      mask = mask & (cols <= (rows + offset));
+      auto mask = (cols >= (rows + offset - sliding_window_size_)) & (cols <= (rows + offset));
+      if (is_causal) {
+        mask = mask & (cols <= (rows + offset));
+      }
+
+      cached_attn_mask_ = torch::where(
+          mask,
+          torch::zeros({S, full_S}, torch::TensorOptions().dtype(torch::kFloat).device(x.device())),
+          torch::full({S, full_S}, -std::numeric_limits<float>::infinity(),
+                      torch::TensorOptions().dtype(torch::kFloat).device(x.device())));
+      cached_mask_S_ = S;
+      cached_mask_full_S_ = full_S;
     }
 
-    auto attn_mask = torch::where(
-        mask,
-        torch::zeros({S, full_S}, x.options().dtype(torch::kFloat)),
-        torch::full({S, full_S}, -std::numeric_limits<float>::infinity(),
-                    x.options().dtype(torch::kFloat)));
-
-    attn_out = at::scaled_dot_product_attention(q, k, v, attn_mask, 0.0, false);
+    attn_out = at::scaled_dot_product_attention(q, k, v, cached_attn_mask_, 0.0, false);
   } else {
     // On CUDA this dispatches to FlashAttention2 automatically
     attn_out = at::scaled_dot_product_attention(q, k, v, c10::nullopt, 0.0, is_causal);

@@ -27,9 +27,9 @@ torch::Tensor LayerNormImpl::forward(torch::Tensor x) {
   auto var = x.var(-1, /*unbiased=*/false, /*keepdim=*/true);
   auto x_norm = (x - mean) / torch::sqrt(var + eps_);
   if (elementwise_affine_ && weight_.defined()) {
-    x_norm = x_norm * weight_.to(x.dtype());
+    x_norm = x_norm * weight_;
     if (has_bias_ && bias_.defined()) {
-      x_norm = x_norm + bias_.to(x.dtype());
+      x_norm = x_norm + bias_;
     }
   }
   return x_norm;
@@ -51,7 +51,7 @@ torch::Tensor L2NormImpl::forward(torch::Tensor x) {
   auto norm = torch::norm(x, 2, /*dim=*/-1, /*keepdim=*/true);
   auto x_norm = x / torch::clamp_min(norm, eps_);
   if (elementwise_affine_ && weight_.defined()) {
-    x_norm = x_norm * weight_.to(x.dtype());
+    x_norm = x_norm * weight_;
   }
   return x_norm;
 }
@@ -68,28 +68,26 @@ FusedRMSNormImpl::FusedRMSNormImpl(int64_t size, double eps, bool elementwise_af
 }
 
 torch::Tensor FusedRMSNormImpl::forward(torch::Tensor x) {
-  // Use torch::native_layer_norm when possible for a fused code path.
-  // native_layer_norm computes: (x - mean) / sqrt(var + eps) * weight + bias
-  // We repurpose it for RMSNorm by:
-  //   1. Squaring x, feeding through native_layer_norm with no affine to get
-  //      the centered-and-scaled square, then deriving rsqrt, OR
-  //   2. Simply using the fused path directly on the RMS computation.
-  //
-  // The cleanest fused approach: compute RMS manually but keep operations
-  // amenable to kernel fusion via contiguous memory access patterns.
+  // RMS normalization: x * rsqrt(mean(x^2) + eps)
+  // Only upcast to FP32 when input is a reduced-precision dtype
+  if (x.dtype() == torch::kFloat32) {
+    auto variance = x.pow(2).mean(-1, /*keepdim=*/true);
+    auto x_norm = x * torch::rsqrt(variance + eps_);
+    if (elementwise_affine_ && weight_.defined()) {
+      x_norm = x_norm * weight_;
+    }
+    return x_norm;
+  }
+
+  // Reduced precision path: compute in FP32 for numerical stability
   auto input_dtype = x.dtype();
   auto x_fp32 = x.to(torch::kFloat32);
-
-  // RMS normalization: x * rsqrt(mean(x^2) + eps)
   auto variance = x_fp32.pow(2).mean(-1, /*keepdim=*/true);
   auto x_norm = x_fp32 * torch::rsqrt(variance + eps_);
-
-  // Convert back to input dtype before applying weight (matches fused kernel
-  // behavior that keeps weight multiplication in the original precision).
   x_norm = x_norm.to(input_dtype);
 
   if (elementwise_affine_ && weight_.defined()) {
-    x_norm = x_norm * weight_.to(input_dtype);
+    x_norm = x_norm * weight_;
   }
   return x_norm;
 }

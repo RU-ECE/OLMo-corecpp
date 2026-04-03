@@ -24,9 +24,10 @@ torch::Tensor RotaryEmbeddingImpl::apply_rotary(
   return get_backend().apply_rope(t, sin, cos);
 }
 
-RoPEBuffers RotaryEmbeddingImpl::get_buffers(int64_t seq_len, torch::Device device) {
-  // Return cached buffers if seq_len and device match (or cached is longer)
-  if (cached_seq_len_ >= seq_len && cached_device_ == device) {
+RoPEBuffers RotaryEmbeddingImpl::get_buffers(int64_t seq_len, torch::Device device,
+                                              torch::Dtype dtype) {
+  // Return cached buffers if seq_len, device, and dtype match (or cached is longer)
+  if (cached_seq_len_ >= seq_len && cached_device_ == device && cached_dtype_ == dtype) {
     if (cached_seq_len_ == seq_len) return cached_bufs_;
     // Slice down to requested length
     RoPEBuffers bufs;
@@ -35,16 +36,17 @@ RoPEBuffers RotaryEmbeddingImpl::get_buffers(int64_t seq_len, torch::Device devi
     return bufs;
   }
 
-  // Compute and cache (allocate for 2x requested to reduce future recomputes)
+  // Compute in float32 for precision, then cast once to target dtype
   int64_t alloc_len = std::max(seq_len, static_cast<int64_t>(2048));
   auto inv_freq = compute_inv_freqs(device);
   auto seq = torch::arange(alloc_len, torch::TensorOptions().dtype(torch::kFloat32).device(device));
   auto freqs = seq.unsqueeze(1) * inv_freq.unsqueeze(0);
   auto positions = torch::cat({freqs, freqs}, -1);
-  cached_bufs_.pos_sin = positions.sin();
-  cached_bufs_.pos_cos = positions.cos();
+  cached_bufs_.pos_sin = positions.sin().to(dtype);
+  cached_bufs_.pos_cos = positions.cos().to(dtype);
   cached_seq_len_ = alloc_len;
   cached_device_ = device;
+  cached_dtype_ = dtype;
 
   // Return exact slice
   RoPEBuffers bufs;
@@ -69,14 +71,7 @@ std::pair<torch::Tensor, torch::Tensor> RotaryEmbeddingImpl::apply(
   auto sin_k = bufs.pos_sin.slice(0, k_abs_start, k_abs_start + k_len).unsqueeze(0).unsqueeze(0);
   auto cos_k = bufs.pos_cos.slice(0, k_abs_start, k_abs_start + k_len).unsqueeze(0).unsqueeze(0);
 
-  // Buffers are already on the correct device from get_buffers().
-  // Only cast dtype if needed (buffers are float32, q/k may differ).
-  if (sin_q.dtype() != q.dtype()) {
-    sin_q = sin_q.to(q.dtype());
-    cos_q = cos_q.to(q.dtype());
-    sin_k = sin_k.to(k.dtype());
-    cos_k = cos_k.to(k.dtype());
-  }
+  // Buffers are already in target dtype and on target device (set in get_buffers)
 
   auto q_rot = apply_rotary(q, sin_q, cos_q);
   auto k_rot = apply_rotary(k, sin_k, cos_k);

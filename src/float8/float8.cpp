@@ -123,7 +123,7 @@ torch::Tensor Float8LinearImpl::forward(torch::Tensor input) {
 // ---------------------------------------------------------------------------
 
 Float8Tensor quantize_mxfp8(const torch::Tensor& tensor, const MXFP8Config& config) {
-  auto flat = tensor.contiguous().view({-1});
+  auto flat = tensor.reshape({-1});
   int64_t numel = flat.numel();
   int64_t bs = config.block_size;
 

@@ -6,61 +6,16 @@
 #include <stdexcept>
 #include <iostream>
 
-#if defined(__APPLE__)
-#include <mach/mach.h>
-#include <mach/mach_host.h>
-#elif defined(__linux__)
-#include <sys/sysinfo.h>
-#elif defined(_WIN32)
-#include <windows.h>
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
 #endif
 
 namespace olmo_cpp {
-
-/// Query available system RAM in bytes (cross-platform).
-static size_t get_available_ram() {
-#if defined(__APPLE__)
-  mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
-  vm_statistics64_data_t vm;
-  if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
-                        reinterpret_cast<host_info64_t>(&vm), &count) == KERN_SUCCESS) {
-    return static_cast<size_t>(vm.free_count + vm.inactive_count) * vm_page_size;
-  }
-#elif defined(__linux__)
-  struct sysinfo si;
-  if (sysinfo(&si) == 0) {
-    return static_cast<size_t>(si.freeram) * si.mem_unit;
-  }
-#elif defined(_WIN32)
-  MEMORYSTATUSEX mem;
-  mem.dwLength = sizeof(mem);
-  if (GlobalMemoryStatusEx(&mem)) {
-    return static_cast<size_t>(mem.ullAvailPhys);
-  }
-#endif
-  return 0;  // unknown — skip capping
-}
 
 TokenDataset::TokenDataset(const std::string& path, int64_t seq_len, bool shuffle)
     : seq_len_(seq_len), shuffle_(shuffle), chunk_cursor_(0) {
   cnpy::NpyArray arr = cnpy::npy_load(path);
   size_t num_vals = arr.num_vals;
-
-  // Cap tokens to fit in available RAM (leave 2 GB headroom for model + overhead).
-  // Each token costs ~24 bytes: int64 vector + CPU tensor clone + GPU copy.
-  constexpr size_t headroom = 2ULL * 1024 * 1024 * 1024;
-  constexpr size_t bytes_per_token = 24;
-  size_t avail = get_available_ram();
-  if (avail > 0) {
-    size_t budget = (avail > headroom) ? avail - headroom : avail / 2;
-    size_t max_tokens = budget / bytes_per_token;
-    if (num_vals > max_tokens) {
-      std::cerr << "TokenDataset: capping from " << num_vals
-                << " to " << max_tokens
-                << " tokens (available RAM: " << (avail / (1024*1024)) << " MB)\n";
-      num_vals = max_tokens;
-    }
-  }
 
   // Support uint16, uint32, int32, int64
   if (arr.word_size == 2) {
@@ -204,22 +159,57 @@ void TokenDataset::to_device(torch::Device device) {
   if (!device.is_cuda()) return;  // Only CUDA gets GPU residency
 
   try {
+    torch::Tensor src_tensor = tokens_tensor_;
+    std::vector<int64_t> src_indices = chunk_indices_;
+
+#ifdef USE_CUDA
+    // Query free VRAM and cap tokens to what fits.
+    // Reserve headroom for model weights, activations, and gradients.
+    size_t vram_free = 0, vram_total = 0;
+    cudaMemGetInfo(&vram_free, &vram_total);
+
+    // Use at most 25% of free VRAM for data — rest is needed for model/activations/grads
+    size_t data_budget = vram_free / 4;
+    // Each token = 8 bytes (int64), plus chunk index overhead
+    size_t max_gpu_tokens = data_budget / sizeof(int64_t);
+    int64_t num_tokens = tokens_tensor_.size(0);
+
+    if (max_gpu_tokens > 0 && static_cast<size_t>(num_tokens) > max_gpu_tokens) {
+      int64_t capped = static_cast<int64_t>(max_gpu_tokens);
+      std::cerr << "TokenDataset: capping GPU-resident data from " << num_tokens
+                << " to " << capped << " tokens (free VRAM: "
+                << (vram_free / (1024*1024)) << " MB)\n";
+      src_tensor = tokens_tensor_.narrow(0, 0, capped);
+      // Recompute chunks for the capped range
+      int64_t capped_chunks = (capped - 1) / seq_len_;
+      src_indices.resize(static_cast<size_t>(capped_chunks));
+      for (int64_t i = 0; i < capped_chunks; ++i) {
+        src_indices[static_cast<size_t>(i)] = i;
+      }
+      num_chunks_ = capped_chunks;
+    }
+#endif
+
     // Pin memory for fast initial transfer, then copy to device
-    auto pinned = tokens_tensor_.pin_memory();
+    auto pinned = src_tensor.pin_memory();
     gpu_tokens_tensor_ = pinned.to(device);
 
     // Move chunk indices to GPU
     auto idx_tensor = torch::from_blob(
-        chunk_indices_.data(),
-        {static_cast<int64_t>(chunk_indices_.size())},
+        src_indices.data(),
+        {static_cast<int64_t>(src_indices.size())},
         torch::TensorOptions().dtype(torch::kInt64)).clone();
     gpu_chunk_indices_ = idx_tensor.to(device);
 
     gpu_resident_ = true;
     resident_device_ = device;
     gpu_cursor_ = 0;
+
+    std::cerr << "TokenDataset: GPU-resident with " << gpu_tokens_tensor_.size(0)
+              << " tokens on " << device << "\n";
   } catch (const c10::Error&) {
-    // Insufficient VRAM — silently fall back to CPU data path
+    // Insufficient VRAM — fall back to CPU data path
+    std::cerr << "TokenDataset: GPU residency failed, falling back to CPU\n";
     gpu_resident_ = false;
   }
 }

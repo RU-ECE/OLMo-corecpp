@@ -53,6 +53,11 @@ struct TrainConfig {
   int64_t seq_len_warmup_steps = 0;
   int64_t target_batch_size = -1;
   int64_t batch_size_ramp_steps = 0;
+
+  // Performance optimizations
+  bool use_foreach_optimizer = true;  // Use _foreach_ batched ops in AdamW
+  bool gpu_resident_data = true;      // Move dataset to GPU at init
+  int64_t log_interval = 10;         // Steps between loss D2H sync
 };
 
 /// Train for num_steps (legacy API, kept for backward compat)

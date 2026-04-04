@@ -153,6 +153,11 @@ int main(int argc, char** argv) {
     bool use_mup       = opt_ini.get_or<bool>("mup", false);
     bool use_multi_res = opt_ini.get_or<bool>("multi_res", false);
 
+    // ── Performance tuning ──
+    train_cfg.use_foreach_optimizer = opt_ini.get_or<bool>("foreach_optimizer", true);
+    train_cfg.gpu_resident_data     = opt_ini.get_or<bool>("gpu_data", true);
+    train_cfg.log_interval          = train_ini.get_or<int64_t>("log_interval", 10);
+
     // ── Device ──
     std::string device_pref = dev_ini.get_or<std::string>("device", "auto");
 

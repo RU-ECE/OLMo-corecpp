@@ -8,6 +8,8 @@
 #include "olmo_cpp/optim/lion.hpp"
 #include "olmo_cpp/optim/muon.hpp"
 #include "olmo_cpp/optim/dion.hpp"
+#include "olmo_cpp/optim/foreach_adamw.hpp"
+#include "olmo_cpp/optim/grad_clip.hpp"
 #include "olmo_cpp/optim/skip_step.hpp"
 #include "olmo_cpp/optim/scheduler.hpp"
 #include "olmo_cpp/train/callback.hpp"
@@ -68,9 +70,9 @@ void train_epoch(
     opt = std::make_unique<DION>(model->parameters(), DIONOptions(lr).weight_decay(0.01));
     std::cout << "Using DION optimizer (lr=" << lr << ")" << std::endl;
   } else {
-    opt = std::make_unique<torch::optim::AdamW>(
-        model->parameters(), torch::optim::AdamWOptions(lr).weight_decay(0.01));
-    std::cout << "Using AdamW optimizer (lr=" << lr << ")" << std::endl;
+    opt = std::make_unique<ForeachAdamW>(
+        model->parameters(), ForeachAdamWOptions(lr).weight_decay(0.01));
+    std::cout << "Using ForeachAdamW optimizer (lr=" << lr << ")" << std::endl;
   }
   auto& optimizer = *opt;
 
@@ -84,6 +86,7 @@ void train_epoch(
   if (data_path && !data_path->empty()) {
     dataset.emplace(*data_path, seq_len, true);
     dataset->reset_epoch();
+    dataset->to_device(device);  // GPU-resident data: one bulk H2D, zero per-step copies
   }
 
   // Pre-build DDP parameter list once (avoids per-step allocation)
@@ -106,7 +109,7 @@ void train_epoch(
     } else if (optimizer_name == "dion") {
       static_cast<DIONOptions&>(optimizer.param_groups()[0].options()).lr(step_lr);
     } else {
-      static_cast<torch::optim::AdamWOptions&>(optimizer.param_groups()[0].options()).lr(step_lr);
+      static_cast<ForeachAdamWOptions&>(optimizer.param_groups()[0].options()).lr(step_lr);
     }
 
     {
@@ -164,7 +167,7 @@ void train_epoch(
 
       {
         ProfileScope optim_scope("optimizer_step");
-        torch::nn::utils::clip_grad_norm_(model->parameters(), 1.0);
+        clip_grad_norm_gpu(model->parameters(), 1.0);
         optimizer.step();
       }
 
@@ -236,6 +239,9 @@ void train(
   } else if (cfg.optimizer == "dion") {
     optimizer = std::make_unique<DION>(
         model->parameters(), DIONOptions(cfg.lr).weight_decay(cfg.weight_decay));
+  } else if (cfg.use_foreach_optimizer) {
+    optimizer = std::make_unique<ForeachAdamW>(
+        model->parameters(), ForeachAdamWOptions(cfg.lr).weight_decay(cfg.weight_decay));
   } else {
     optimizer = std::make_unique<torch::optim::AdamW>(
         model->parameters(),
@@ -262,6 +268,9 @@ void train(
   if (cfg.data_path && !cfg.data_path->empty()) {
     dataset.emplace(*cfg.data_path, cfg.seq_len, true);
     dataset->reset_epoch();
+    if (cfg.gpu_resident_data) {
+      dataset->to_device(device);
+    }
   }
 
   // Pre-build DDP parameter list once (avoids per-step allocation)
@@ -356,8 +365,15 @@ void train(
       accum_loss_tensor += loss.detach();
     }
 
-    // Sync loss from GPU only once per step (for callbacks/logging)
-    float accum_loss = accum_loss_tensor.item<float>();
+    // Defer loss D2H sync: only pull from GPU when needed for logging/callbacks/checkpointing
+    bool need_loss_sync = !callbacks.empty() ||
+                          (step % cfg.log_interval == 0 && rank == 0) ||
+                          (evaluator && cfg.eval_interval > 0 && (step + 1) % cfg.eval_interval == 0) ||
+                          (ckpt_mgr && cfg.checkpoint_interval > 0 && (step + 1) % cfg.checkpoint_interval == 0);
+    float accum_loss = 0.0f;
+    if (need_loss_sync) {
+      accum_loss = accum_loss_tensor.item<float>();
+    }
     state.loss = accum_loss;
     cb_mgr.on_after_loss(state);
 
@@ -372,12 +388,12 @@ void train(
     if (grad_scaler) {
       bool finite = grad_scaler->unscale_and_check(*optimizer);
       if (finite) {
-        torch::nn::utils::clip_grad_norm_(model->parameters(), cfg.max_grad_norm);
+        clip_grad_norm_gpu(model->parameters(), cfg.max_grad_norm);
         grad_scaler->step(*optimizer);
       }
       grad_scaler->update();
     } else {
-      torch::nn::utils::clip_grad_norm_(model->parameters(), cfg.max_grad_norm);
+      clip_grad_norm_gpu(model->parameters(), cfg.max_grad_norm);
       optimizer->step();
     }
 
@@ -395,7 +411,7 @@ void train(
     cb_mgr.on_step_end(state);
 
     // Logging
-    if (step % 10 == 0 && rank == 0) {
+    if (step % cfg.log_interval == 0 && rank == 0) {
       std::cout << "Step " << step
                 << " loss: " << accum_loss
                 << " lr: " << cur_lr
@@ -469,6 +485,9 @@ void train(
   } else if (cfg.optimizer == "dion") {
     optimizer = std::make_unique<DION>(
         model->parameters(), DIONOptions(cfg.lr).weight_decay(cfg.weight_decay));
+  } else if (cfg.use_foreach_optimizer) {
+    optimizer = std::make_unique<ForeachAdamW>(
+        model->parameters(), ForeachAdamWOptions(cfg.lr).weight_decay(cfg.weight_decay));
   } else {
     optimizer = std::make_unique<torch::optim::AdamW>(
         model->parameters(),
@@ -481,6 +500,9 @@ void train(
   if (cfg.data_path && !cfg.data_path->empty()) {
     dataset.emplace(*cfg.data_path, cfg.seq_len, true);
     dataset->reset_epoch();
+    if (cfg.gpu_resident_data) {
+      dataset->to_device(device);
+    }
   }
 
   if (rank == 0) {
@@ -538,12 +560,12 @@ void train(
       ddp->allreduce_gradients(ddp_params);
     }
 
-    torch::nn::utils::clip_grad_norm_(model->parameters(), cfg.max_grad_norm);
+    clip_grad_norm_gpu(model->parameters(), cfg.max_grad_norm);
     optimizer->step();
 
     total_tokens += cfg.batch_size * cfg.seq_len * cfg.grad_accum_steps;
 
-    if (step % 10 == 0 && rank == 0) {
+    if (step % cfg.log_interval == 0 && rank == 0) {
       // Only sync loss from GPU when we actually need to log
       float accum_loss = accum_loss_tensor.item<float>();
       auto step_end = std::chrono::steady_clock::now();

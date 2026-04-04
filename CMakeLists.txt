@@ -121,6 +121,8 @@ set(OLMO_SOURCES
     src/optim/lion.cpp
     src/optim/muon.cpp
     src/optim/dion.cpp
+    src/optim/foreach_adamw.cpp
+    src/optim/grad_clip.cpp
     src/optim/skip_step.cpp
     src/optim/scheduler.cpp
     # Evaluation

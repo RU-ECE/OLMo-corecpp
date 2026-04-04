@@ -103,6 +103,11 @@ std::tuple<torch::Tensor, torch::Tensor> TokenDataset::prepare_batch_cpu(int64_t
 std::tuple<torch::Tensor, torch::Tensor> TokenDataset::get_batch(
     int64_t batch_size,
     torch::Device device) {
+  // GPU-resident fast path: pure device-side pointer math, zero H2D
+  if (gpu_resident_ && device == resident_device_) {
+    return get_batch_gpu(batch_size);
+  }
+
   // If we have a prefetched batch, use it
   if (has_prefetch_ && prefetch_future_.valid()) {
     auto [input, labels] = prefetch_future_.get();
@@ -116,7 +121,63 @@ std::tuple<torch::Tensor, torch::Tensor> TokenDataset::get_batch(
   return {input.to(device, /*non_blocking=*/true), labels.to(device, /*non_blocking=*/true)};
 }
 
+std::tuple<torch::Tensor, torch::Tensor> TokenDataset::get_batch_gpu(int64_t batch_size) {
+  // Reshuffle on GPU if we've exhausted all chunks
+  if (gpu_cursor_ + batch_size > num_chunks_) {
+    if (shuffle_) {
+      auto perm = torch::randperm(num_chunks_,
+          torch::TensorOptions().dtype(torch::kInt64).device(resident_device_));
+      gpu_chunk_indices_ = gpu_chunk_indices_.index_select(0, perm);
+    }
+    gpu_cursor_ = 0;
+  }
+
+  // Grab batch_size chunk offsets (all on GPU)
+  auto offsets = gpu_chunk_indices_.narrow(0, gpu_cursor_, batch_size) * seq_len_;
+  gpu_cursor_ += batch_size;
+
+  // Build gather indices entirely on GPU
+  auto range = torch::arange(seq_len_,
+      torch::TensorOptions().dtype(torch::kInt64).device(resident_device_));
+  auto input_indices = offsets.unsqueeze(1) + range.unsqueeze(0);   // [B, seq_len]
+  auto label_indices = input_indices + 1;
+
+  auto input = gpu_tokens_tensor_.index_select(0, input_indices.reshape(-1))
+                                  .reshape({batch_size, seq_len_});
+  auto labels = gpu_tokens_tensor_.index_select(0, label_indices.reshape(-1))
+                                   .reshape({batch_size, seq_len_});
+
+  return {input, labels};
+}
+
+void TokenDataset::to_device(torch::Device device) {
+  if (!device.is_cuda()) return;  // Only CUDA gets GPU residency
+
+  try {
+    // Pin memory for fast initial transfer, then copy to device
+    auto pinned = tokens_tensor_.pin_memory();
+    gpu_tokens_tensor_ = pinned.to(device);
+
+    // Move chunk indices to GPU
+    auto idx_tensor = torch::from_blob(
+        chunk_indices_.data(),
+        {static_cast<int64_t>(chunk_indices_.size())},
+        torch::TensorOptions().dtype(torch::kInt64)).clone();
+    gpu_chunk_indices_ = idx_tensor.to(device);
+
+    gpu_resident_ = true;
+    resident_device_ = device;
+    gpu_cursor_ = 0;
+  } catch (const c10::Error&) {
+    // Insufficient VRAM — silently fall back to CPU data path
+    gpu_resident_ = false;
+  }
+}
+
 void TokenDataset::prefetch_next(int64_t batch_size, torch::Device device) {
+  // No-op when GPU-resident (data is already on device)
+  if (gpu_resident_ && device == resident_device_) return;
+
   // Launch async batch preparation on a background thread
   prefetch_device_ = device;
   prefetch_future_ = std::async(std::launch::async, [this, batch_size]() {

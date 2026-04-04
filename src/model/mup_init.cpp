@@ -34,55 +34,43 @@ void apply_mup_init(
 
     if (!p.defined() || p.numel() == 0) continue;
 
-    if (name.find("embeddings") != std::string::npos) {
-      // Embedding: init with std=1.0 (not width-dependent in µP)
+    // --- Norm weights must be checked FIRST (they appear inside lm_head, blocks, etc.) ---
+    if (name.find("norm") != std::string::npos && p.dim() == 1) {
+      p.fill_(1.0);
+
+    // --- Embeddings: std=1.0 in µP (match both plain and multi-res names) ---
+    } else if (name.find("embeddings") != std::string::npos ||
+               name.find("token_embed") != std::string::npos ||
+               name.find("role_embed") != std::string::npos ||
+               name.find("char_embed") != std::string::npos ||
+               name.find("phrase_embed") != std::string::npos) {
       double std_val = 1.0;
       trunc_normal_(p, 0.0, std_val, -3 * std_val, 3 * std_val, g);
 
-    } else if (name.find("lm_head") != std::string::npos ||
+    // --- LM head output weight: zero-init in µP ---
+    } else if (mup_cfg.zero_init_lm_head &&
+               name.find("lm_head") != std::string::npos &&
                name.find("w_out") != std::string::npos) {
-      if (mup_cfg.zero_init_lm_head &&
-          name.find("lm_head") != std::string::npos &&
-          name.find("norm") == std::string::npos) {
-        // LM head output: zero-init in µP
-        p.zero_();
-      } else {
-        // Output projections: scale by 1/d_model
-        double std_val = 1.0 / target_width;
-        trunc_normal_(p, 0.0, std_val, -3 * std_val, 3 * std_val, g);
-      }
+      p.zero_();
 
-    } else if (name.find("norm") != std::string::npos) {
-      // Normalization weights: init to 1.0 (standard)
-      if (p.dim() == 1) {
-        p.fill_(1.0);
-      }
+    // --- Output projections (attention w_out, FFN w2): scale by width_ratio ---
+    } else if (name.find("w_out") != std::string::npos ||
+               name.find("w2") != std::string::npos) {
+      double fan_in = p.dim() >= 2 ? static_cast<double>(p.size(1)) : static_cast<double>(p.size(0));
+      double std_val = width_ratio / std::sqrt(fan_in);
+      trunc_normal_(p, 0.0, std_val, -3 * std_val, 3 * std_val, g);
 
-    } else {
-      // Hidden layers: init with std = 1/sqrt(fan_in)
-      // In µP, this is scaled by width_ratio for the hidden-to-hidden params
+    // --- Projection layers (role_proj, char_proj, phrase_proj): 1/sqrt(fan_in) ---
+    } else if (name.find("_proj") != std::string::npos) {
       double fan_in = p.dim() >= 2 ? static_cast<double>(p.size(1)) : static_cast<double>(p.size(0));
       double std_val = 1.0 / std::sqrt(fan_in);
+      trunc_normal_(p, 0.0, std_val, -3 * std_val, 3 * std_val, g);
 
-      // Apply µP width scaling for hidden-to-hidden matrices
-      if (name.find("w_q") != std::string::npos ||
-          name.find("w_k") != std::string::npos ||
-          name.find("w_v") != std::string::npos ||
-          name.find("w_qkv") != std::string::npos ||
-          name.find("w1") != std::string::npos ||
-          name.find("w3") != std::string::npos ||
-          name.find("w_gate_up") != std::string::npos) {
-        // Input matrices: standard 1/sqrt(fan_in)
-        trunc_normal_(p, 0.0, std_val, -3 * std_val, 3 * std_val, g);
-
-      } else if (name.find("w2") != std::string::npos) {
-        // Output matrices in FFN: scale by width_ratio
-        std_val *= width_ratio;
-        trunc_normal_(p, 0.0, std_val, -3 * std_val, 3 * std_val, g);
-
-      } else {
-        trunc_normal_(p, 0.0, std_val, -3 * std_val, 3 * std_val, g);
-      }
+    // --- Input matrices (QKV, gate_up, w1, w3): standard 1/sqrt(fan_in) ---
+    } else {
+      double fan_in = p.dim() >= 2 ? static_cast<double>(p.size(1)) : static_cast<double>(p.size(0));
+      double std_val = 1.0 / std::sqrt(fan_in);
+      trunc_normal_(p, 0.0, std_val, -3 * std_val, 3 * std_val, g);
     }
   }
 

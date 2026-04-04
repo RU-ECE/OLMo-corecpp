@@ -34,10 +34,10 @@ namespace {
 struct AutocastGuard {
   explicit AutocastGuard(bool enabled, torch::Device device) : enabled_(enabled && device.is_cuda()) {
     if (enabled_) {
-      prev_enabled_ = at::autocast::is_enabled();
-      prev_dtype_ = at::autocast::get_autocast_gpu_dtype();
-      at::autocast::set_enabled(true);
-      at::autocast::set_autocast_gpu_dtype(at::kBFloat16);
+      prev_enabled_ = at::autocast::is_autocast_enabled(at::kCUDA);
+      prev_dtype_ = at::autocast::get_autocast_dtype(at::kCUDA);
+      at::autocast::set_autocast_enabled(at::kCUDA, true);
+      at::autocast::set_autocast_dtype(at::kCUDA, at::kBFloat16);
       at::autocast::increment_nesting();
     }
   }
@@ -45,8 +45,8 @@ struct AutocastGuard {
     if (enabled_) {
       at::autocast::decrement_nesting();
       at::autocast::clear_cache();
-      at::autocast::set_enabled(prev_enabled_);
-      at::autocast::set_autocast_gpu_dtype(prev_dtype_);
+      at::autocast::set_autocast_enabled(at::kCUDA, prev_enabled_);
+      at::autocast::set_autocast_dtype(at::kCUDA, prev_dtype_);
     }
   }
   AutocastGuard(const AutocastGuard&) = delete;

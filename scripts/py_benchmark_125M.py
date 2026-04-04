@@ -18,7 +18,12 @@ import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
+
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +160,8 @@ class Transformer(nn.Module):
 
 class NumpyTokenDataset:
     def __init__(self, path, seq_len, device):
+        if not HAS_NUMPY:
+            raise RuntimeError("numpy is required for --data-path. Install with: pip install numpy")
         arr = np.load(path)
         self.tokens = torch.from_numpy(arr.astype(np.int64)).to(device)
         self.seq_len = seq_len

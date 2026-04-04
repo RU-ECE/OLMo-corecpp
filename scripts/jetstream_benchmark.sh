@@ -59,11 +59,23 @@ TORCH_VER=$(python3 -c "import torch; print(torch.__version__)" 2>/dev/null || e
 
 ok "CUDA $CUDA_VER | GPU: $GPU_NAME | PyTorch $TORCH_VER"
 
+# Ensure numpy is installed (needed by Python benchmark)
+if ! python3 -c "import numpy" 2>/dev/null; then
+    info "Installing numpy..."
+    pip install numpy --quiet
+    ok "numpy installed"
+fi
+
 # Check nsys
 if command -v nsys >/dev/null 2>&1; then
     HAVE_NSYS=1
     NSYS_VER=$(nsys --version 2>&1 | head -1 || echo "unknown")
     ok "nsys found: $NSYS_VER"
+    # Older nsys (< 2023) doesn't support --cuda-memory-usage or --stats
+    NSYS_EXTRA=""
+    if nsys profile --help 2>&1 | grep -q "cuda-memory-usage"; then
+        NSYS_EXTRA="--cuda-memory-usage=true --stats=true"
+    fi
 else
     HAVE_NSYS=0
     warn "nsys not found — skipping profiling. Install NVIDIA Nsight Systems for GPU profiles."
@@ -130,11 +142,10 @@ if [ "$HAVE_NSYS" -eq 1 ]; then
         --output "$CPP_NSYS" \
         --force-overwrite true \
         --trace cuda,nvtx,osrt \
-        --cuda-memory-usage=true \
-        --stats=true \
+        $NSYS_EXTRA \
         "${REPO_DIR}/build/olmo_train" "$BENCH_CONF" \
         2>&1 | tee "$CPP_LOG"
-    ok "C++ nsys profile saved: ${CPP_NSYS}.nsys-rep"
+    ok "C++ nsys profile saved to ${RESULTS_DIR}/"
 else
     info "Running without profiling..."
     "${REPO_DIR}/build/olmo_train" "$BENCH_CONF" 2>&1 | tee "$CPP_LOG"
@@ -153,15 +164,14 @@ if [ "$HAVE_NSYS" -eq 1 ]; then
         --output "$PY_NSYS" \
         --force-overwrite true \
         --trace cuda,nvtx,osrt \
-        --cuda-memory-usage=true \
-        --stats=true \
+        $NSYS_EXTRA \
         python3 "${REPO_DIR}/scripts/py_benchmark_125M.py" \
             --data-path "$TOKEN_FILE" \
             --steps "$STEPS" \
             --batch-size "$BATCH_SIZE" \
             --seq-len "$SEQ_LEN" \
         2>&1 | tee "$PY_LOG"
-    ok "Python nsys profile saved: ${PY_NSYS}.nsys-rep"
+    ok "Python nsys profile saved to ${RESULTS_DIR}/"
 else
     info "Running without profiling..."
     python3 "${REPO_DIR}/scripts/py_benchmark_125M.py" \
@@ -195,15 +205,12 @@ mkdir -p "$PICKUP_DIR"
 cp "$CPP_LOG" "$PICKUP_DIR/"
 cp "$PY_LOG" "$PICKUP_DIR/"
 if [ "$HAVE_NSYS" -eq 1 ]; then
-    cp "${CPP_NSYS}.nsys-rep" "$PICKUP_DIR/" 2>/dev/null || true
-    cp "${PY_NSYS}.nsys-rep"  "$PICKUP_DIR/" 2>/dev/null || true
-    # Also export sqlite for offline analysis
-    if [ -f "${CPP_NSYS}.sqlite" ]; then
-        cp "${CPP_NSYS}.sqlite" "$PICKUP_DIR/" 2>/dev/null || true
-    fi
-    if [ -f "${PY_NSYS}.sqlite" ]; then
-        cp "${PY_NSYS}.sqlite" "$PICKUP_DIR/" 2>/dev/null || true
-    fi
+    # Copy all profile formats (nsys-rep, qdstrm, sqlite) — older nsys versions
+    # produce .qdstrm instead of .nsys-rep
+    for ext in nsys-rep qdstrm sqlite; do
+        cp "${CPP_NSYS}.${ext}" "$PICKUP_DIR/" 2>/dev/null || true
+        cp "${PY_NSYS}.${ext}"  "$PICKUP_DIR/" 2>/dev/null || true
+    done
 fi
 
 echo "All results in: ${PICKUP_DIR}/"

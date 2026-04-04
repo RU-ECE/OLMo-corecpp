@@ -1,7 +1,17 @@
 cmake_minimum_required(VERSION 3.18)
 project(olmo_cpp LANGUAGES CXX)
 
+# Default: optimized + debug symbols (Ninja/Make; multi-config IDEs ignore CMAKE_BUILD_TYPE)
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
+  set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS Debug Release RelWithDebInfo MinSizeRel)
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
+
+
+
+
 
 # Link-time optimization for better inlining across translation units
 # Disabled on Linux/GCC due to cross-library LTO linker issues with vendored deps

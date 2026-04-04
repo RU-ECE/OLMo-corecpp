@@ -20,16 +20,38 @@
 #include "olmo_cpp/io/filesystem.hpp"
 #include <torch/nn/init.h>
 #include <iostream>
+#include <iomanip>
 #include <cmath>
 #include <chrono>
 
 namespace olmo_cpp {
 
 // ---------------------------------------------------------------------------
-// Legacy train_epoch (backward compatible)
+// RAII autocast guard — uses the non-deprecated PyTorch 2.6+ API
 // ---------------------------------------------------------------------------
-
 namespace {
+
+struct AutocastGuard {
+  explicit AutocastGuard(bool enabled, torch::Device device) : enabled_(enabled && device.is_cuda()) {
+    if (enabled_) {
+      at::autocast::set_autocast_enabled(at::kCUDA, true);
+      at::autocast::set_autocast_dtype(at::kCUDA, at::kBFloat16);
+      at::autocast::increment_nesting();
+    }
+  }
+  ~AutocastGuard() {
+    if (enabled_) {
+      at::autocast::decrement_nesting();
+      at::autocast::clear_cache();
+      at::autocast::set_autocast_enabled(at::kCUDA, false);
+    }
+  }
+  AutocastGuard(const AutocastGuard&) = delete;
+  AutocastGuard& operator=(const AutocastGuard&) = delete;
+ private:
+  bool enabled_;
+};
+
 double cosine_warmup_lr(int64_t step, int64_t warmup_steps, double base_lr, int64_t total_steps) {
   if (step < warmup_steps) {
     return base_lr * static_cast<double>(step + 1) / static_cast<double>(warmup_steps);
@@ -37,7 +59,37 @@ double cosine_warmup_lr(int64_t step, int64_t warmup_steps, double base_lr, int6
   double progress = static_cast<double>(step - warmup_steps) / static_cast<double>(total_steps - warmup_steps);
   return 0.5 * base_lr * (1.0 + std::cos(M_PI * progress));
 }
+
+std::string optimizer_display_name(const std::string& name, bool use_foreach) {
+  if (name == "adamw" && use_foreach) return "ForeachAdamW (batched _foreach_* ops)";
+  if (name == "adamw") return "AdamW (standard per-param)";
+  return name;
+}
+
+void print_optimization_banner(const std::string& optimizer_name, bool use_foreach,
+                               bool gpu_data, bool gpu_data_active,
+                               bool use_amp, bool fused_grad_clip) {
+  std::cout << "\n";
+  std::cout << "╔══════════════════════════════════════════════════════════╗\n";
+  std::cout << "║  OPTIMIZATION STATUS                                    ║\n";
+  std::cout << "╠══════════════════════════════════════════════════════════╣\n";
+  std::cout << "║  Optimizer:       " << std::left << std::setw(39)
+            << optimizer_display_name(optimizer_name, use_foreach) << "║\n";
+  std::cout << "║  Grad clipping:   " << std::left << std::setw(39)
+            << "GPU-resident (foreach_norm, no D2H)" << "║\n";
+  std::cout << "║  Data loading:    " << std::left << std::setw(39)
+            << (gpu_data_active ? "GPU-resident (zero per-step H2D)" : "CPU + async prefetch") << "║\n";
+  std::cout << "║  Mixed precision: " << std::left << std::setw(39)
+            << (use_amp ? "BF16 autocast" : "FP32") << "║\n";
+  std::cout << "╚══════════════════════════════════════════════════════════╝\n";
+  std::cout << "\n";
+}
+
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// Legacy train_epoch (backward compatible)
+// ---------------------------------------------------------------------------
 
 void train_epoch(
     Transformer& model,
@@ -54,25 +106,17 @@ void train_epoch(
     const std::string& optimizer_name) {
   model->train();
 
-  if (use_amp) {
-    std::cout << "Mixed precision (BF16) " << (device.is_cuda() ? "enabled" : "requested but requires CUDA") << std::endl;
-  }
-
   // Create optimizer based on selection
   std::unique_ptr<torch::optim::Optimizer> opt;
   if (optimizer_name == "muon") {
     opt = std::make_unique<Muon>(model->parameters(), MuonOptions(lr));
-    std::cout << "Using Muon optimizer (lr=" << lr << ")" << std::endl;
   } else if (optimizer_name == "lion") {
     opt = std::make_unique<Lion>(model->parameters(), LionOptions(lr).weight_decay(0.01));
-    std::cout << "Using Lion optimizer (lr=" << lr << ")" << std::endl;
   } else if (optimizer_name == "dion") {
     opt = std::make_unique<DION>(model->parameters(), DIONOptions(lr).weight_decay(0.01));
-    std::cout << "Using DION optimizer (lr=" << lr << ")" << std::endl;
   } else {
     opt = std::make_unique<ForeachAdamW>(
         model->parameters(), ForeachAdamWOptions(lr).weight_decay(0.01));
-    std::cout << "Using ForeachAdamW optimizer (lr=" << lr << ")" << std::endl;
   }
   auto& optimizer = *opt;
 
@@ -83,10 +127,16 @@ void train_epoch(
   }
 
   std::optional<TokenDataset> dataset;
+  bool gpu_data_active = false;
   if (data_path && !data_path->empty()) {
     dataset.emplace(*data_path, seq_len, true);
     dataset->reset_epoch();
-    dataset->to_device(device);  // GPU-resident data: one bulk H2D, zero per-step copies
+    dataset->to_device(device);
+    gpu_data_active = dataset->is_gpu_resident();
+  }
+
+  if (!ddp || ddp->rank() == 0) {
+    print_optimization_banner(optimizer_name, true, true, gpu_data_active, use_amp, true);
   }
 
   // Pre-build DDP parameter list once (avoids per-step allocation)
@@ -95,13 +145,22 @@ void train_epoch(
     for (auto& p : model->parameters()) ddp_params.push_back(p);
   }
 
+  // Epoch tracking
+  int64_t tokens_per_step = batch_size * seq_len * grad_accum_steps;
+  int64_t dataset_tokens = dataset ? dataset->size() * seq_len : 0;
+  int64_t steps_per_epoch = (dataset && dataset_tokens > 0)
+      ? std::max(int64_t(1), dataset_tokens / tokens_per_step) : num_steps;
+  int64_t current_epoch = 0;
+
   auto train_start = std::chrono::steady_clock::now();
   int64_t total_tokens = 0;
+  double epoch_loss_sum = 0.0;
+  int64_t epoch_loss_count = 0;
 
   for (int64_t step = 0; step < num_steps; ++step) {
     auto step_start = std::chrono::steady_clock::now();
     double step_lr = cosine_warmup_lr(step, warmup_steps, lr, num_steps);
-    // Set LR on the optimizer's param group (works for any optimizer type)
+    // Set LR on the optimizer's param group
     if (optimizer_name == "muon") {
       static_cast<MuonOptions&>(optimizer.param_groups()[0].options()).lr(step_lr);
     } else if (optimizer_name == "lion") {
@@ -112,10 +171,20 @@ void train_epoch(
       static_cast<ForeachAdamWOptions&>(optimizer.param_groups()[0].options()).lr(step_lr);
     }
 
+    // Epoch boundary detection
+    int64_t new_epoch = dataset ? (step / steps_per_epoch) : 0;
+    if (new_epoch > current_epoch && (!ddp || ddp->rank() == 0)) {
+      double avg_epoch_loss = epoch_loss_count > 0 ? epoch_loss_sum / epoch_loss_count : 0.0;
+      std::cout << "--- Epoch " << current_epoch << " complete | avg_loss: "
+                << std::fixed << std::setprecision(4) << avg_epoch_loss << " ---" << std::endl;
+      epoch_loss_sum = 0.0;
+      epoch_loss_count = 0;
+      current_epoch = new_epoch;
+    }
+
     {
       ProfileScope step_scope("step_total");
       optimizer.zero_grad();
-      // Accumulate loss on GPU to avoid CUDA sync every micro-step
       torch::Tensor accum_loss_tensor = torch::zeros({}, torch::TensorOptions().device(device));
 
       for (int64_t accum = 0; accum < grad_accum_steps; ++accum) {
@@ -125,7 +194,6 @@ void train_epoch(
           if (dataset) {
             auto [in, lab] = dataset->get_batch(batch_size, device);
             input = in; labels = lab;
-            // Start prefetching next batch while GPU runs forward/backward
             dataset->prefetch_next(batch_size, device);
           } else {
             input = torch::randint(0, cfg.vocab_size, {batch_size, seq_len},
@@ -138,18 +206,8 @@ void train_epoch(
         torch::Tensor loss;
         {
           ProfileScope fwd_scope("forward");
-          if (use_amp && device.is_cuda()) {
-            // BF16 mixed precision — 2× throughput on tensor cores
-            at::autocast::set_enabled(true);
-            at::autocast::set_autocast_gpu_dtype(at::kBFloat16);
-            at::autocast::increment_nesting();
-            loss = model->forward(input, labels, -100) / static_cast<float>(grad_accum_steps);
-            at::autocast::decrement_nesting();
-            at::autocast::clear_cache();
-            at::autocast::set_enabled(false);
-          } else {
-            loss = model->forward(input, labels, -100) / static_cast<float>(grad_accum_steps);
-          }
+          AutocastGuard ac(use_amp, device);
+          loss = model->forward(input, labels, -100) / static_cast<float>(grad_accum_steps);
         }
         {
           ProfileScope bwd_scope("backward");
@@ -171,20 +229,22 @@ void train_epoch(
         optimizer.step();
       }
 
-      total_tokens += batch_size * seq_len * grad_accum_steps;
+      total_tokens += tokens_per_step;
 
       if (step % 10 == 0 && (!ddp || ddp->rank() == 0)) {
-        // Only sync loss from GPU when we actually need to log
         float accum_loss = accum_loss_tensor.item<float>();
+        epoch_loss_sum += accum_loss;
+        epoch_loss_count++;
         auto step_end = std::chrono::steady_clock::now();
         double step_ms = std::chrono::duration<double, std::milli>(step_end - step_start).count();
         double elapsed_s = std::chrono::duration<double>(step_end - train_start).count();
         double tok_per_s = total_tokens / (elapsed_s > 0 ? elapsed_s : 1);
         double eta_s = (num_steps - step) * (elapsed_s / (step > 0 ? step : 1));
 
-        std::cout << "Step " << step << "/" << num_steps
-                  << "  loss: " << accum_loss
-                  << "  lr: " << step_lr
+        std::cout << "Epoch " << current_epoch
+                  << " | Step " << step << "/" << num_steps
+                  << "  loss: " << std::fixed << std::setprecision(4) << accum_loss
+                  << "  lr: " << std::scientific << std::setprecision(2) << step_lr
                   << "  step_ms: " << static_cast<int>(step_ms)
                   << "  tok/s: " << static_cast<int>(tok_per_s)
                   << "  ETA: " << static_cast<int>(eta_s / 60) << "m"
@@ -196,11 +256,12 @@ void train_epoch(
   if (!ddp || ddp->rank() == 0) {
     auto end = std::chrono::steady_clock::now();
     double total_s = std::chrono::duration<double>(end - train_start).count();
+    double avg_step_ms = total_s / num_steps * 1000.0;
     std::cout << "\n=== Training Summary ===" << std::endl;
-    std::cout << "  Steps: " << num_steps << std::endl;
+    std::cout << "  Steps: " << num_steps << " (" << current_epoch + 1 << " epochs)" << std::endl;
     std::cout << "  Total tokens: " << total_tokens << std::endl;
-    std::cout << "  Wall time: " << static_cast<int>(total_s) << "s ("
-              << static_cast<int>(total_s / 60) << "m " << static_cast<int>(total_s) % 60 << "s)" << std::endl;
+    std::cout << "  Wall time: " << std::fixed << std::setprecision(2) << total_s << "s" << std::endl;
+    std::cout << "  Avg step: " << std::fixed << std::setprecision(1) << avg_step_ms << "ms" << std::endl;
     std::cout << "  Throughput: " << static_cast<int>(total_tokens / total_s) << " tok/s" << std::endl;
     std::cout << "========================" << std::endl;
   }
@@ -230,22 +291,28 @@ void train(
 
   // ---- Create optimizer ----
   std::unique_ptr<torch::optim::Optimizer> optimizer;
+  std::string optim_display;
   if (cfg.optimizer == "lion") {
     optimizer = std::make_unique<Lion>(
         model->parameters(), LionOptions(cfg.lr).weight_decay(cfg.weight_decay));
+    optim_display = "Lion";
   } else if (cfg.optimizer == "muon") {
     optimizer = std::make_unique<Muon>(
         model->parameters(), MuonOptions(cfg.lr));
+    optim_display = "Muon";
   } else if (cfg.optimizer == "dion") {
     optimizer = std::make_unique<DION>(
         model->parameters(), DIONOptions(cfg.lr).weight_decay(cfg.weight_decay));
+    optim_display = "DION";
   } else if (cfg.use_foreach_optimizer) {
     optimizer = std::make_unique<ForeachAdamW>(
         model->parameters(), ForeachAdamWOptions(cfg.lr).weight_decay(cfg.weight_decay));
+    optim_display = "ForeachAdamW";
   } else {
     optimizer = std::make_unique<torch::optim::AdamW>(
         model->parameters(),
         torch::optim::AdamWOptions(cfg.lr).weight_decay(cfg.weight_decay));
+    optim_display = "AdamW (standard)";
   }
 
   // ---- Create LR scheduler ----
@@ -265,12 +332,20 @@ void train(
 
   // ---- Dataset ----
   std::optional<TokenDataset> dataset;
+  bool gpu_data_active = false;
   if (cfg.data_path && !cfg.data_path->empty()) {
     dataset.emplace(*cfg.data_path, cfg.seq_len, true);
     dataset->reset_epoch();
     if (cfg.gpu_resident_data) {
       dataset->to_device(device);
+      gpu_data_active = dataset->is_gpu_resident();
     }
+  }
+
+  if (rank == 0) {
+    print_optimization_banner(cfg.optimizer, cfg.use_foreach_optimizer,
+                              cfg.gpu_resident_data, gpu_data_active,
+                              cfg.use_amp, true);
   }
 
   // Pre-build DDP parameter list once (avoids per-step allocation)
@@ -283,10 +358,21 @@ void train(
   CallbackManager cb_mgr;
   for (auto& cb : callbacks) cb_mgr.add(cb);
 
+  // ---- Epoch tracking ----
+  int64_t tokens_per_step = cfg.batch_size * cfg.seq_len * cfg.grad_accum_steps;
+  int64_t dataset_tokens = dataset ? dataset->size() * cfg.seq_len : 0;
+  int64_t steps_per_epoch = (dataset && dataset_tokens > 0)
+      ? std::max(int64_t(1), dataset_tokens / tokens_per_step) : cfg.num_steps;
+  int64_t current_epoch = 0;
+  double epoch_loss_sum = 0.0;
+  int64_t epoch_loss_count = 0;
+
   // ---- TrainState ----
   TrainState state;
   state.train_start = std::chrono::steady_clock::now();
   cb_mgr.on_train_start(state);
+
+  int64_t total_tokens = 0;
 
   // ---- Training loop ----
   for (int64_t step = 0; step < cfg.num_steps; ++step) {
@@ -319,6 +405,17 @@ void train(
     }
     state.batch_size = cur_batch_size;
 
+    // Epoch boundary detection
+    int64_t new_epoch = dataset ? (step / steps_per_epoch) : 0;
+    if (new_epoch > current_epoch && rank == 0) {
+      double avg_epoch_loss = epoch_loss_count > 0 ? epoch_loss_sum / epoch_loss_count : 0.0;
+      std::cout << "--- Epoch " << current_epoch << " complete | avg_loss: "
+                << std::fixed << std::setprecision(4) << avg_epoch_loss << " ---" << std::endl;
+      epoch_loss_sum = 0.0;
+      epoch_loss_count = 0;
+      current_epoch = new_epoch;
+    }
+
     // LR schedule
     double cur_lr = scheduler->get_lr(step, cfg.num_steps);
     scheduler->apply(*optimizer, step, cfg.num_steps);
@@ -327,7 +424,6 @@ void train(
     cb_mgr.on_step_start(state);
 
     optimizer->zero_grad();
-    // Accumulate loss on GPU to avoid CUDA sync every micro-step
     torch::Tensor accum_loss_tensor = torch::zeros({}, torch::TensorOptions().device(device));
 
     for (int64_t accum = 0; accum < cfg.grad_accum_steps; ++accum) {
@@ -344,16 +440,8 @@ void train(
       }
 
       torch::Tensor loss;
-      if (cfg.use_amp && device.is_cuda()) {
-        // BF16 mixed precision — 2× throughput on H100 tensor cores
-        at::autocast::set_enabled(true);
-        at::autocast::set_autocast_gpu_dtype(at::kBFloat16);
-        at::autocast::increment_nesting();
-        loss = model->forward(input, labels, -100) / static_cast<float>(cfg.grad_accum_steps);
-        at::autocast::decrement_nesting();
-        at::autocast::clear_cache();
-        at::autocast::set_enabled(false);
-      } else {
+      {
+        AutocastGuard ac(cfg.use_amp, device);
         loss = model->forward(input, labels, -100) / static_cast<float>(cfg.grad_accum_steps);
       }
 
@@ -365,7 +453,7 @@ void train(
       accum_loss_tensor += loss.detach();
     }
 
-    // Defer loss D2H sync: only pull from GPU when needed for logging/callbacks/checkpointing
+    // Defer loss D2H sync: only pull from GPU when needed
     bool need_loss_sync = !callbacks.empty() ||
                           (step % cfg.log_interval == 0 && rank == 0) ||
                           (evaluator && cfg.eval_interval > 0 && (step + 1) % cfg.eval_interval == 0) ||
@@ -373,6 +461,8 @@ void train(
     float accum_loss = 0.0f;
     if (need_loss_sync) {
       accum_loss = accum_loss_tensor.item<float>();
+      epoch_loss_sum += accum_loss;
+      epoch_loss_count++;
     }
     state.loss = accum_loss;
     cb_mgr.on_after_loss(state);
@@ -399,6 +489,8 @@ void train(
 
     cb_mgr.on_after_optimizer_step(state);
 
+    total_tokens += cur_batch_size * cur_seq_len * cfg.grad_accum_steps;
+
     // Update metrics
     state.metrics["loss"] = accum_loss;
     state.metrics["lr"] = static_cast<float>(cur_lr);
@@ -412,11 +504,18 @@ void train(
 
     // Logging
     if (step % cfg.log_interval == 0 && rank == 0) {
-      std::cout << "Step " << step
-                << " loss: " << accum_loss
-                << " lr: " << cur_lr
-                << " seq_len: " << cur_seq_len;
-      if (grad_scaler) std::cout << " scale: " << grad_scaler->current_scale();
+      auto now = std::chrono::steady_clock::now();
+      double step_ms = std::chrono::duration<double, std::milli>(now - state.step_start).count();
+      double elapsed_s = std::chrono::duration<double>(now - state.train_start).count();
+      double tok_per_s = total_tokens / (elapsed_s > 0 ? elapsed_s : 1);
+
+      std::cout << "Epoch " << current_epoch
+                << " | Step " << step << "/" << cfg.num_steps
+                << "  loss: " << std::fixed << std::setprecision(4) << accum_loss
+                << "  lr: " << std::scientific << std::setprecision(2) << cur_lr
+                << "  step_ms: " << static_cast<int>(step_ms)
+                << "  tok/s: " << static_cast<int>(tok_per_s);
+      if (grad_scaler) std::cout << "  scale: " << grad_scaler->current_scale();
       std::cout << std::endl;
     }
 
@@ -450,7 +549,16 @@ void train(
   cb_mgr.on_train_end(state);
 
   if (rank == 0) {
-    std::cout << "Training complete." << std::endl;
+    auto end = std::chrono::steady_clock::now();
+    double total_s = std::chrono::duration<double>(end - state.train_start).count();
+    double avg_step_ms = total_s / cfg.num_steps * 1000.0;
+    std::cout << "\n=== Training Summary ===" << std::endl;
+    std::cout << "  Steps: " << cfg.num_steps << " (" << current_epoch + 1 << " epochs)" << std::endl;
+    std::cout << "  Total tokens: " << total_tokens << std::endl;
+    std::cout << "  Wall time: " << std::fixed << std::setprecision(2) << total_s << "s" << std::endl;
+    std::cout << "  Avg step: " << std::fixed << std::setprecision(1) << avg_step_ms << "ms" << std::endl;
+    std::cout << "  Throughput: " << static_cast<int>(total_tokens / total_s) << " tok/s" << std::endl;
+    std::cout << "========================" << std::endl;
   }
 }
 
@@ -497,16 +605,20 @@ void train(
   auto scheduler = create_scheduler(cfg.scheduler, cfg.lr, cfg.warmup_steps);
 
   std::optional<TokenDataset> dataset;
+  bool gpu_data_active = false;
   if (cfg.data_path && !cfg.data_path->empty()) {
     dataset.emplace(*cfg.data_path, cfg.seq_len, true);
     dataset->reset_epoch();
     if (cfg.gpu_resident_data) {
       dataset->to_device(device);
+      gpu_data_active = dataset->is_gpu_resident();
     }
   }
 
   if (rank == 0) {
-    std::cout << "Using " << cfg.optimizer << " optimizer (lr=" << cfg.lr << ")" << std::endl;
+    print_optimization_banner(cfg.optimizer, cfg.use_foreach_optimizer,
+                              cfg.gpu_resident_data, gpu_data_active,
+                              cfg.use_amp, true);
   }
 
   // Pre-build DDP parameter list once (avoids per-step allocation)
@@ -514,6 +626,15 @@ void train(
   if (ddp && ddp->is_distributed()) {
     for (auto& p : model->parameters()) ddp_params.push_back(p);
   }
+
+  // Epoch tracking
+  int64_t tokens_per_step = cfg.batch_size * cfg.seq_len * cfg.grad_accum_steps;
+  int64_t dataset_tokens = dataset ? dataset->size() * cfg.seq_len : 0;
+  int64_t steps_per_epoch = (dataset && dataset_tokens > 0)
+      ? std::max(int64_t(1), dataset_tokens / tokens_per_step) : cfg.num_steps;
+  int64_t current_epoch = 0;
+  double epoch_loss_sum = 0.0;
+  int64_t epoch_loss_count = 0;
 
   auto train_start = std::chrono::steady_clock::now();
   int64_t total_tokens = 0;
@@ -523,8 +644,18 @@ void train(
     double cur_lr = scheduler->get_lr(step, cfg.num_steps);
     scheduler->apply(*optimizer, step, cfg.num_steps);
 
+    // Epoch boundary detection
+    int64_t new_epoch = dataset ? (step / steps_per_epoch) : 0;
+    if (new_epoch > current_epoch && rank == 0) {
+      double avg_epoch_loss = epoch_loss_count > 0 ? epoch_loss_sum / epoch_loss_count : 0.0;
+      std::cout << "--- Epoch " << current_epoch << " complete | avg_loss: "
+                << std::fixed << std::setprecision(4) << avg_epoch_loss << " ---" << std::endl;
+      epoch_loss_sum = 0.0;
+      epoch_loss_count = 0;
+      current_epoch = new_epoch;
+    }
+
     optimizer->zero_grad();
-    // Accumulate loss on GPU to avoid CUDA sync every micro-step
     torch::Tensor accum_loss_tensor = torch::zeros({}, torch::TensorOptions().device(device));
 
     for (int64_t accum = 0; accum < cfg.grad_accum_steps; ++accum) {
@@ -541,15 +672,8 @@ void train(
       }
 
       torch::Tensor loss;
-      if (cfg.use_amp && device.is_cuda()) {
-        at::autocast::set_enabled(true);
-        at::autocast::set_autocast_gpu_dtype(at::kBFloat16);
-        at::autocast::increment_nesting();
-        loss = model->forward(input, labels, -100) / static_cast<float>(cfg.grad_accum_steps);
-        at::autocast::decrement_nesting();
-        at::autocast::clear_cache();
-        at::autocast::set_enabled(false);
-      } else {
+      {
+        AutocastGuard ac(cfg.use_amp, device);
         loss = model->forward(input, labels, -100) / static_cast<float>(cfg.grad_accum_steps);
       }
       loss.backward();
@@ -563,19 +687,21 @@ void train(
     clip_grad_norm_gpu(model->parameters(), cfg.max_grad_norm);
     optimizer->step();
 
-    total_tokens += cfg.batch_size * cfg.seq_len * cfg.grad_accum_steps;
+    total_tokens += tokens_per_step;
 
     if (step % cfg.log_interval == 0 && rank == 0) {
-      // Only sync loss from GPU when we actually need to log
       float accum_loss = accum_loss_tensor.item<float>();
+      epoch_loss_sum += accum_loss;
+      epoch_loss_count++;
       auto step_end = std::chrono::steady_clock::now();
       double step_ms = std::chrono::duration<double, std::milli>(step_end - step_start).count();
       double elapsed_s = std::chrono::duration<double>(step_end - train_start).count();
       double tok_per_s = total_tokens / (elapsed_s > 0 ? elapsed_s : 1);
 
-      std::cout << "Step " << step << "/" << cfg.num_steps
-                << "  loss: " << accum_loss
-                << "  lr: " << cur_lr
+      std::cout << "Epoch " << current_epoch
+                << " | Step " << step << "/" << cfg.num_steps
+                << "  loss: " << std::fixed << std::setprecision(4) << accum_loss
+                << "  lr: " << std::scientific << std::setprecision(2) << cur_lr
                 << "  step_ms: " << static_cast<int>(step_ms)
                 << "  tok/s: " << static_cast<int>(tok_per_s)
                 << std::endl;
@@ -585,10 +711,12 @@ void train(
   if (rank == 0) {
     auto end = std::chrono::steady_clock::now();
     double total_s = std::chrono::duration<double>(end - train_start).count();
+    double avg_step_ms = total_s / cfg.num_steps * 1000.0;
     std::cout << "\n=== Training Summary ===" << std::endl;
-    std::cout << "  Steps: " << cfg.num_steps << std::endl;
+    std::cout << "  Steps: " << cfg.num_steps << " (" << current_epoch + 1 << " epochs)" << std::endl;
     std::cout << "  Total tokens: " << total_tokens << std::endl;
-    std::cout << "  Wall time: " << static_cast<int>(total_s) << "s" << std::endl;
+    std::cout << "  Wall time: " << std::fixed << std::setprecision(2) << total_s << "s" << std::endl;
+    std::cout << "  Avg step: " << std::fixed << std::setprecision(1) << avg_step_ms << "ms" << std::endl;
     std::cout << "  Throughput: " << static_cast<int>(total_tokens / total_s) << " tok/s" << std::endl;
     std::cout << "========================" << std::endl;
   }

@@ -4,7 +4,6 @@
 #include <ATen/ops/_foreach_addcmul.h>
 #include <ATen/ops/_foreach_addcdiv.h>
 #include <ATen/ops/_foreach_sqrt.h>
-#include <ATen/ops/_foreach_div.h>
 #include <cmath>
 
 namespace olmo_cpp {
@@ -92,10 +91,14 @@ torch::Tensor ForeachAdamW::step(LossClosure closure) {
     // Bias correction factors
     double bc1 = 1.0 - std::pow(beta1, step_count_);
     double bc2 = 1.0 - std::pow(beta2, step_count_);
-    double step_size = -lr / bc1;
-    double bias_correction2_sqrt = std::sqrt(bc2);
+    double bc2_sqrt = std::sqrt(bc2);
+    // Fold bc2_sqrt into step_size and eps to eliminate one kernel launch:
+    //   p -= (lr/bc1) * m / (sqrt(v)/bc2_sqrt + eps)
+    // = p -= (lr*bc2_sqrt/bc1) * m / (sqrt(v) + eps*bc2_sqrt)
+    double step_size = -lr * bc2_sqrt / bc1;
+    double eps_scaled = eps * bc2_sqrt;
 
-    // === Fused operations: ~7 kernel launches total ===
+    // === Fused operations: 7 kernel launches (6 without weight decay) ===
 
     // 1. Decoupled weight decay: p *= (1 - lr * weight_decay)
     if (weight_decay != 0.0) {
@@ -110,13 +113,12 @@ torch::Tensor ForeachAdamW::step(LossClosure closure) {
     at::_foreach_mul_(exp_avg_sq_vec, beta2);
     at::_foreach_addcmul_(exp_avg_sq_vec, grads_vec, grads_vec, 1.0 - beta2);
 
-    // 6. Compute denominator: denom = sqrt(v) / sqrt(1 - beta2^t) + eps
+    // 6. Compute denominator: denom = sqrt(v) + eps * bc2_sqrt
+    //    (bc2_sqrt is folded into step_size, eliminating the division kernel)
     auto denom = at::_foreach_sqrt(exp_avg_sq_vec);
-    at::_foreach_div_(denom, bias_correction2_sqrt);
-    at::_foreach_add_(denom, eps);
+    at::_foreach_add_(denom, eps_scaled);
 
     // 7. Apply update: p += step_size * m / denom
-    //    step_size = -lr / (1 - beta1^t), so this is p -= lr * m_hat / (sqrt(v_hat) + eps)
     at::_foreach_addcdiv_(params_vec, exp_avg_vec, denom, step_size);
   }
 

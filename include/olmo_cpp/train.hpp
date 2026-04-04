@@ -56,7 +56,10 @@ struct TrainConfig {
 
   // Performance optimizations
   bool use_foreach_optimizer = true;  // Use _foreach_ batched ops in AdamW
-  bool gpu_resident_data = true;      // Move dataset to GPU at init
+  bool gpu_resident_data = true;      // If false: pinned host + H2D streaming (no full corpus on GPU)
+  /// 0 = auto VRAM budget for full GPU residency; >0 = max token count allowed on GPU;
+  /// -1 = never put full corpus on GPU (streaming only).
+  int64_t max_gpu_data_tokens = 0;
   int64_t log_interval = 10;         // Steps between loss D2H sync
 };
 

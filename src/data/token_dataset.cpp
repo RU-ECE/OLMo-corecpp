@@ -60,6 +60,24 @@ TokenDataset::TokenDataset(const std::string& path, int64_t seq_len, bool shuffl
       torch::TensorOptions().dtype(torch::kInt64)).clone();
 }
 
+void TokenDataset::drain_stream_prefetch() {
+  if (stream_prefetch_inflight_ && stream_prefetch_future_.valid()) {
+    stream_prefetch_future_.wait();
+  }
+  stream_prefetch_inflight_ = false;
+}
+
+void TokenDataset::ensure_stream_buf_capacity(int64_t batch_size) {
+  if (stream_cap_b_ >= batch_size) return;
+  drain_stream_prefetch();
+  auto opts = torch::TensorOptions().dtype(torch::kInt64).pinned_memory(true);
+  for (int i = 0; i < 2; ++i) {
+    stream_pin_in_[i] = torch::empty({batch_size, seq_len_}, opts);
+    stream_pin_la_[i] = torch::empty({batch_size, seq_len_}, opts);
+  }
+  stream_cap_b_ = batch_size;
+}
+
 void TokenDataset::reset_epoch() {
   chunk_cursor_ = 0;
   if (shuffle_) {
@@ -74,6 +92,15 @@ void TokenDataset::reset_epoch() {
       std::mt19937 g(rd());
       std::shuffle(chunk_indices_.begin(), chunk_indices_.end(), g);
     }
+  }
+  if (gpu_resident_) {
+    // Re-upload shuffled indices to GPU (full corpus path)
+    auto idx_tensor = torch::from_blob(
+        chunk_indices_.data(),
+        {static_cast<int64_t>(chunk_indices_.size())},
+        torch::TensorOptions().dtype(torch::kInt64)).clone();
+    gpu_chunk_indices_ = idx_tensor.to(resident_device_);
+    gpu_cursor_ = 0;
   }
 }
 
@@ -108,20 +135,30 @@ std::tuple<torch::Tensor, torch::Tensor> TokenDataset::prepare_batch_cpu(int64_t
 std::tuple<torch::Tensor, torch::Tensor> TokenDataset::get_batch(
     int64_t batch_size,
     torch::Device device) {
-  // GPU-resident fast path: pure device-side pointer math, zero H2D
   if (gpu_resident_ && device == resident_device_) {
     return get_batch_gpu(batch_size);
   }
 
-  // If we have a prefetched batch, use it
+  // Pinned double-buffer: overlap CPU gather with previous GPU step
+  if (streaming_mode_ && device.is_cuda()) {
+    ensure_stream_buf_capacity(batch_size);
+    if (stream_prefetch_inflight_) {
+      stream_prefetch_future_.wait();
+      stream_prefetch_inflight_ = false;
+      auto in = stream_pin_in_[stream_last_filled_slot_].to(device, /*non_blocking=*/true);
+      auto lab = stream_pin_la_[stream_last_filled_slot_].to(device, /*non_blocking=*/true);
+      return {in, lab};
+    }
+    auto [a, b] = prepare_batch_cpu(batch_size);
+    return {a.to(device, /*non_blocking=*/true), b.to(device, /*non_blocking=*/true)};
+  }
+
   if (has_prefetch_ && prefetch_future_.valid()) {
     auto [input, labels] = prefetch_future_.get();
     has_prefetch_ = false;
-    // Transfer to target device (may already be on the right device)
     return {input.to(device, /*non_blocking=*/true), labels.to(device, /*non_blocking=*/true)};
   }
 
-  // No prefetch available — prepare synchronously
   auto [input, labels] = prepare_batch_cpu(batch_size);
   return {input.to(device, /*non_blocking=*/true), labels.to(device, /*non_blocking=*/true)};
 }
@@ -155,49 +192,56 @@ std::tuple<torch::Tensor, torch::Tensor> TokenDataset::get_batch_gpu(int64_t bat
   return {input, labels};
 }
 
-void TokenDataset::to_device(torch::Device device) {
-  if (!device.is_cuda()) return;  // Only CUDA gets GPU residency
+void TokenDataset::to_device(torch::Device device, int64_t max_gpu_tokens) {
+  if (!device.is_cuda()) {
+    resident_device_ = device;
+    return;
+  }
 
-  try {
-    torch::Tensor src_tensor = tokens_tensor_;
-    std::vector<int64_t> src_indices = chunk_indices_;
+  streaming_mode_ = false;
+  gpu_resident_ = false;
 
 #ifdef USE_CUDA
-    // Query free VRAM and cap tokens to what fits.
-    // Reserve headroom for model weights, activations, and gradients.
-    size_t vram_free = 0, vram_total = 0;
-    cudaMemGetInfo(&vram_free, &vram_total);
+  const int64_t num_tokens = tokens_tensor_.size(0);
+  const size_t bytes_tokens = static_cast<size_t>(num_tokens) * sizeof(int64_t);
+  const size_t bytes_indices = static_cast<size_t>(num_chunks_) * sizeof(int64_t);
+  const size_t bytes_needed = bytes_tokens + bytes_indices + (4 << 20);  // +4 MiB slack
 
-    // Use at most 25% of free VRAM for data — rest is needed for model/activations/grads
-    size_t data_budget = vram_free / 4;
-    // Each token = 8 bytes (int64), plus chunk index overhead
-    size_t max_gpu_tokens = data_budget / sizeof(int64_t);
-    int64_t num_tokens = tokens_tensor_.size(0);
+  size_t vram_free = 0, vram_total = 0;
+  cudaMemGetInfo(&vram_free, &vram_total);
+  const size_t budget_default = vram_free / 4;
+  size_t budget = budget_default;
+  if (max_gpu_tokens > 0) {
+    const size_t cap_bytes = static_cast<size_t>(max_gpu_tokens) * sizeof(int64_t) + bytes_indices + (4 << 20);
+    budget = std::min(budget_default, cap_bytes);
+  }
 
-    if (max_gpu_tokens > 0 && static_cast<size_t>(num_tokens) > max_gpu_tokens) {
-      int64_t capped = static_cast<int64_t>(max_gpu_tokens);
-      std::cerr << "TokenDataset: capping GPU-resident data from " << num_tokens
-                << " to " << capped << " tokens (free VRAM: "
-                << (vram_free / (1024*1024)) << " MB)\n";
-      src_tensor = tokens_tensor_.narrow(0, 0, capped);
-      // Recompute chunks for the capped range
-      int64_t capped_chunks = (capped - 1) / seq_len_;
-      src_indices.resize(static_cast<size_t>(capped_chunks));
-      for (int64_t i = 0; i < capped_chunks; ++i) {
-        src_indices[static_cast<size_t>(i)] = i;
-      }
-      num_chunks_ = capped_chunks;
+  const bool force_stream = (max_gpu_tokens == -1);
+  const bool over_user_cap = (max_gpu_tokens > 0 && num_tokens > max_gpu_tokens);
+  const bool fits_budget = (bytes_needed <= budget * 9 / 10);
+  const bool try_full_gpu = !force_stream && !over_user_cap && fits_budget;
+
+  if (!try_full_gpu) {
+    try {
+      tokens_tensor_ = tokens_tensor_.contiguous().pin_memory();
+    } catch (const c10::Error&) {
+      // stay unpinned; H2D still works
     }
-#endif
+    streaming_mode_ = true;
+    resident_device_ = device;
+    std::cerr << "TokenDataset: streaming mode (pinned host + async prefetch), "
+              << num_tokens << " tokens; full GPU residency needs ~"
+              << (bytes_needed / (1024 * 1024)) << " MiB data + indices\n";
+    return;
+  }
 
-    // Pin memory for fast initial transfer, then copy to device
-    auto pinned = src_tensor.pin_memory();
+  try {
+    auto pinned = tokens_tensor_.pin_memory();
     gpu_tokens_tensor_ = pinned.to(device);
 
-    // Move chunk indices to GPU
     auto idx_tensor = torch::from_blob(
-        src_indices.data(),
-        {static_cast<int64_t>(src_indices.size())},
+        chunk_indices_.data(),
+        {static_cast<int64_t>(chunk_indices_.size())},
         torch::TensorOptions().dtype(torch::kInt64)).clone();
     gpu_chunk_indices_ = idx_tensor.to(device);
 
@@ -208,22 +252,50 @@ void TokenDataset::to_device(torch::Device device) {
     std::cerr << "TokenDataset: GPU-resident with " << gpu_tokens_tensor_.size(0)
               << " tokens on " << device << "\n";
   } catch (const c10::Error&) {
-    // Insufficient VRAM — fall back to CPU data path
-    std::cerr << "TokenDataset: GPU residency failed, falling back to CPU\n";
-    gpu_resident_ = false;
+    std::cerr << "TokenDataset: GPU residency allocation failed; using streaming mode\n";
+    try {
+      tokens_tensor_ = tokens_tensor_.contiguous().pin_memory();
+    } catch (const c10::Error&) {
+    }
+    streaming_mode_ = true;
+    resident_device_ = device;
   }
+#else
+  (void)max_gpu_tokens;
+  resident_device_ = device;
+#endif
 }
 
 void TokenDataset::prefetch_next(int64_t batch_size, torch::Device device) {
-  // No-op when GPU-resident (data is already on device)
   if (gpu_resident_ && device == resident_device_) return;
 
-  // Launch async batch preparation on a background thread
+  if (streaming_mode_ && device.is_cuda()) {
+    ensure_stream_buf_capacity(batch_size);
+    stream_last_filled_slot_ = stream_write_slot_;
+    stream_write_slot_ = 1 - stream_write_slot_;
+    const int slot = stream_last_filled_slot_;
+    stream_prefetch_future_ = std::async(std::launch::async, [this, batch_size, slot]() {
+      auto [a, b] = prepare_batch_cpu(batch_size);
+      stream_pin_in_[slot].copy_(a, /*non_blocking=*/false);
+      stream_pin_la_[slot].copy_(b, /*non_blocking=*/false);
+    });
+    stream_prefetch_inflight_ = true;
+    return;
+  }
+
   prefetch_device_ = device;
   prefetch_future_ = std::async(std::launch::async, [this, batch_size]() {
     return prepare_batch_cpu(batch_size);
   });
   has_prefetch_ = true;
+}
+
+TokenDataset::~TokenDataset() {
+  drain_stream_prefetch();
+  if (has_prefetch_ && prefetch_future_.valid()) {
+    prefetch_future_.wait();
+    has_prefetch_ = false;
+  }
 }
 
 }  // namespace olmo_cpp

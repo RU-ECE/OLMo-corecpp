@@ -34,8 +34,10 @@ namespace {
 struct AutocastGuard {
   explicit AutocastGuard(bool enabled, torch::Device device) : enabled_(enabled && device.is_cuda()) {
     if (enabled_) {
-      at::autocast::set_autocast_enabled(at::kCUDA, true);
-      at::autocast::set_autocast_dtype(at::kCUDA, at::kBFloat16);
+      prev_enabled_ = at::autocast::is_enabled();
+      prev_dtype_ = at::autocast::get_autocast_gpu_dtype();
+      at::autocast::set_enabled(true);
+      at::autocast::set_autocast_gpu_dtype(at::kBFloat16);
       at::autocast::increment_nesting();
     }
   }
@@ -43,13 +45,16 @@ struct AutocastGuard {
     if (enabled_) {
       at::autocast::decrement_nesting();
       at::autocast::clear_cache();
-      at::autocast::set_autocast_enabled(at::kCUDA, false);
+      at::autocast::set_enabled(prev_enabled_);
+      at::autocast::set_autocast_gpu_dtype(prev_dtype_);
     }
   }
   AutocastGuard(const AutocastGuard&) = delete;
   AutocastGuard& operator=(const AutocastGuard&) = delete;
  private:
   bool enabled_;
+  bool prev_enabled_{false};
+  at::ScalarType prev_dtype_{at::kFloat};
 };
 
 double cosine_warmup_lr(int64_t step, int64_t warmup_steps, double base_lr, int64_t total_steps) {
@@ -131,7 +136,7 @@ void train_epoch(
   if (data_path && !data_path->empty()) {
     dataset.emplace(*data_path, seq_len, true);
     dataset->reset_epoch();
-    dataset->to_device(device);
+    dataset->to_device(device, 0);
     gpu_data_active = dataset->is_gpu_resident();
   }
 
@@ -213,7 +218,7 @@ void train_epoch(
           ProfileScope bwd_scope("backward");
           loss.backward();
         }
-        accum_loss_tensor += loss.detach();
+        accum_loss_tensor.add_(loss.detach().sum());
       }
 
       {
@@ -336,8 +341,12 @@ void train(
   if (cfg.data_path && !cfg.data_path->empty()) {
     dataset.emplace(*cfg.data_path, cfg.seq_len, true);
     dataset->reset_epoch();
-    if (cfg.gpu_resident_data) {
-      dataset->to_device(device);
+    if (device.is_cuda()) {
+      const int64_t cap = cfg.gpu_resident_data ? cfg.max_gpu_data_tokens : -1;
+      dataset->to_device(device, cap);
+      gpu_data_active = dataset->is_gpu_resident();
+    } else if (cfg.gpu_resident_data) {
+      dataset->to_device(device, 0);
       gpu_data_active = dataset->is_gpu_resident();
     }
   }
@@ -450,7 +459,7 @@ void train(
       } else {
         loss.backward();
       }
-      accum_loss_tensor += loss.detach();
+      accum_loss_tensor.add_(loss.detach().sum());
     }
 
     // Defer loss D2H sync: only pull from GPU when needed
@@ -609,8 +618,12 @@ void train(
   if (cfg.data_path && !cfg.data_path->empty()) {
     dataset.emplace(*cfg.data_path, cfg.seq_len, true);
     dataset->reset_epoch();
-    if (cfg.gpu_resident_data) {
-      dataset->to_device(device);
+    if (device.is_cuda()) {
+      const int64_t cap = cfg.gpu_resident_data ? cfg.max_gpu_data_tokens : -1;
+      dataset->to_device(device, cap);
+      gpu_data_active = dataset->is_gpu_resident();
+    } else if (cfg.gpu_resident_data) {
+      dataset->to_device(device, 0);
       gpu_data_active = dataset->is_gpu_resident();
     }
   }
@@ -677,7 +690,7 @@ void train(
         loss = model->forward(input, labels, -100) / static_cast<float>(cfg.grad_accum_steps);
       }
       loss.backward();
-      accum_loss_tensor += loss.detach();
+      accum_loss_tensor.add_(loss.detach().sum());
     }
 
     if (ddp && ddp->is_distributed()) {

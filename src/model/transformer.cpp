@@ -151,7 +151,7 @@ torch::Tensor TransformerImpl::forward(
 
     // MTP auxiliary losses
     if (config_.num_mtp_heads > 0) {
-      auto mtp_loss_sum = torch::zeros({1}, logits.options());
+      auto mtp_loss_sum = torch::zeros({}, logits.options());
       int64_t valid_heads = 0;
 
       for (int64_t k = 0; k < config_.num_mtp_heads; ++k) {

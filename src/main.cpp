@@ -156,6 +156,7 @@ int main(int argc, char** argv) {
     // ── Performance tuning ──
     train_cfg.use_foreach_optimizer = opt_ini.get_or<bool>("foreach_optimizer", true);
     train_cfg.gpu_resident_data     = opt_ini.get_or<bool>("gpu_data", true);
+    train_cfg.max_gpu_data_tokens   = opt_ini.get_or<int64_t>("gpu_data_max_tokens", 0);
     train_cfg.log_interval          = train_ini.get_or<int64_t>("log_interval", 10);
 
     // ── Device ──

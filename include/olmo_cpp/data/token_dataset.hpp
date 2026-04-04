@@ -17,6 +17,7 @@ class TokenDataset {
  public:
   /// Load token array from .npy file. Expects 1D array of token IDs.
   TokenDataset(const std::string& path, int64_t seq_len, bool shuffle = true);
+  ~TokenDataset();
 
   /// Number of chunks (sequences) in the dataset
   int64_t size() const { return num_chunks_; }
@@ -34,11 +35,14 @@ class TokenDataset {
   /// Reset shuffle indices for next epoch
   void reset_epoch();
 
-  /// Move the entire token tensor to the given device (VRAM).
-  /// After this call, get_batch() does pure GPU pointer arithmetic
-  /// with zero CPU involvement and zero H2D copies per step.
-  /// No-op for non-CUDA devices. Falls back to CPU on VRAM allocation failure.
-  void to_device(torch::Device device);
+  /// Prepare for training on `device`.
+  /// - CUDA + enough budget: full token array + chunk indices on GPU (fast path).
+  /// - CUDA + not enough / max_gpu_tokens==-1: pinned CPU + double-buffered H2D (bounded memory).
+  /// - max_gpu_tokens==0: auto (use ~25% of free VRAM as budget).
+  /// - max_gpu_tokens>0: refuse full GPU residency if token count exceeds this cap.
+  /// - max_gpu_tokens==-1: never upload the full corpus to GPU.
+  /// No-op for non-CUDA devices (CPU training uses unpinned host tensors).
+  void to_device(torch::Device device, int64_t max_gpu_tokens = 0);
 
   /// Check if the dataset is GPU-resident
   bool is_gpu_resident() const { return gpu_resident_; }
@@ -50,19 +54,32 @@ class TokenDataset {
   /// Prepare a batch entirely on GPU (zero CPU involvement)
   std::tuple<torch::Tensor, torch::Tensor> get_batch_gpu(int64_t batch_size);
 
+  void drain_stream_prefetch();
+  void ensure_stream_buf_capacity(int64_t batch_size);
+
   std::vector<int64_t> tokens_;
-  torch::Tensor tokens_tensor_;  // Pre-built CPU tensor for fast gather
+  torch::Tensor tokens_tensor_;  // Pre-built CPU tensor for fast gather (pinned after to_device streaming)
   int64_t seq_len_;
   int64_t num_chunks_;
   bool shuffle_;
   std::vector<int64_t> chunk_indices_;
   size_t chunk_cursor_;
 
-  // Async prefetch state
+  // Async prefetch state (CPU tensors path when not streaming_mode_)
   std::future<std::tuple<torch::Tensor, torch::Tensor>> prefetch_future_;
   torch::Device prefetch_device_{torch::kCPU};
   bool has_prefetch_ = false;
   std::mutex cursor_mutex_;
+
+  // Pinned double-buffer path (CUDA, !gpu_resident_)
+  bool streaming_mode_ = false;
+  std::array<torch::Tensor, 2> stream_pin_in_{};
+  std::array<torch::Tensor, 2> stream_pin_la_{};
+  int64_t stream_cap_b_ = 0;
+  std::future<void> stream_prefetch_future_{};
+  bool stream_prefetch_inflight_ = false;
+  int stream_write_slot_ = 0;       // next slot for background prefetch
+  int stream_last_filled_slot_ = 0; // slot to read after wait (set when prefetch is queued)
 
   // GPU-resident data state
   torch::Tensor gpu_tokens_tensor_;   // Full token array on CUDA

@@ -117,14 +117,104 @@ int main(int argc, char** argv) {
     model_ini.get("vocab_size", cfg.vocab_size);
     model_ini.get("n_layers", cfg.n_layers);
     model_ini.get("n_heads", cfg.n_heads);
-    cfg.n_kv_heads    = model_ini.get_or<int64_t>("n_kv_heads", -1);
-    cfg.head_dim      = model_ini.get_or<int64_t>("head_dim", -1);
-    cfg.rope_theta    = model_ini.get_or<int64_t>("rope_theta", 500000);
-    cfg.layer_norm_eps = model_ini.get_or<double>("layer_norm_eps", 1e-6);
-    cfg.init_std      = model_ini.get_or<double>("init_std", 0.02);
-    cfg.use_qk_norm   = model_ini.get_or<bool>("use_qk_norm", true);
-    cfg.num_mtp_heads = model_ini.get_or<int64_t>("num_mtp_heads", 0);
-    cfg.mtp_loss_weight = model_ini.get_or<double>("mtp_loss_weight", 0.1);
+    cfg.n_kv_heads          = model_ini.get_or<int64_t>("n_kv_heads", -1);
+    cfg.head_dim            = model_ini.get_or<int64_t>("head_dim", -1);
+    cfg.rope_theta          = model_ini.get_or<int64_t>("rope_theta", 500000);
+    cfg.layer_norm_eps      = model_ini.get_or<double>("layer_norm_eps", 1e-6);
+    cfg.init_std            = model_ini.get_or<double>("init_std", 0.02);
+    cfg.use_qk_norm         = model_ini.get_or<bool>("use_qk_norm", true);
+    cfg.use_head_qk_norm    = model_ini.get_or<bool>("use_head_qk_norm", false);
+    cfg.hidden_size_multiple_of = model_ini.get_or<int64_t>("hidden_size_multiple_of", 256);
+    cfg.hidden_size_multiplier  = model_ini.get_or<double>("hidden_size_multiplier", 1.5);
+    cfg.num_mtp_heads       = model_ini.get_or<int64_t>("num_mtp_heads", 0);
+    cfg.mtp_loss_weight     = model_ini.get_or<double>("mtp_loss_weight", 0.1);
+
+    // Sliding window attention
+    cfg.sliding_window_size = model_ini.get_or<int64_t>("sliding_window_size", -1);
+
+    // Convolution
+    cfg.use_conv            = model_ini.get_or<bool>("use_conv", false);
+    cfg.conv_kernel_size    = model_ini.get_or<int64_t>("conv_kernel_size", 4);
+
+    // Float8
+    cfg.use_float8          = model_ini.get_or<bool>("use_float8", false);
+
+    // Block type: reordered_norm, peri_norm, normalized_ngpt, layer_norm_scaled,
+    //             moe_reordered_norm, moe_hybrid_reordered_norm
+    {
+      auto s = model_ini.get_or<std::string>("block_type", "reordered_norm");
+      if (s == "peri_norm")                    cfg.block_type = olmo_cpp::TransformerConfig::BlockType::PeriNorm;
+      else if (s == "normalized_ngpt")         cfg.block_type = olmo_cpp::TransformerConfig::BlockType::NormalizedNGPT;
+      else if (s == "layer_norm_scaled")       cfg.block_type = olmo_cpp::TransformerConfig::BlockType::LayerNormScaled;
+      else if (s == "moe_reordered_norm")      cfg.block_type = olmo_cpp::TransformerConfig::BlockType::MoEReorderedNorm;
+      else if (s == "moe_hybrid_reordered_norm") cfg.block_type = olmo_cpp::TransformerConfig::BlockType::MoEHybridReorderedNorm;
+      else                                     cfg.block_type = olmo_cpp::TransformerConfig::BlockType::ReorderedNorm;
+    }
+
+    // Attention backend: sdpa, flash2, flash3, transformer_engine
+    {
+      auto s = model_ini.get_or<std::string>("attention_backend", "sdpa");
+      if (s == "flash2")                cfg.attention_backend = olmo_cpp::TransformerConfig::AttentionBackend::FlashAttention2;
+      else if (s == "flash3")           cfg.attention_backend = olmo_cpp::TransformerConfig::AttentionBackend::FlashAttention3;
+      else if (s == "transformer_engine") cfg.attention_backend = olmo_cpp::TransformerConfig::AttentionBackend::TransformerEngine;
+      else                              cfg.attention_backend = olmo_cpp::TransformerConfig::AttentionBackend::SDPA;
+    }
+
+    // Gated attention: none, headwise, elementwise
+    {
+      auto s = model_ini.get_or<std::string>("gated_attention", "none");
+      if (s == "headwise")         cfg.gated_attention = olmo_cpp::TransformerConfig::GatedAttentionType::Headwise;
+      else if (s == "elementwise") cfg.gated_attention = olmo_cpp::TransformerConfig::GatedAttentionType::Elementwise;
+      else                         cfg.gated_attention = olmo_cpp::TransformerConfig::GatedAttentionType::None;
+    }
+
+    // RoPE scaling: none, abf, position_interpolation, stepwise, yarn
+    {
+      auto s = model_ini.get_or<std::string>("rope_scaling_type", "none");
+      if (s == "abf")                        cfg.rope_scaling_type = olmo_cpp::TransformerConfig::RoPEScalingType::ABF;
+      else if (s == "position_interpolation") cfg.rope_scaling_type = olmo_cpp::TransformerConfig::RoPEScalingType::PositionInterpolation;
+      else if (s == "stepwise")              cfg.rope_scaling_type = olmo_cpp::TransformerConfig::RoPEScalingType::Stepwise;
+      else if (s == "yarn")                  cfg.rope_scaling_type = olmo_cpp::TransformerConfig::RoPEScalingType::YaRN;
+      else                                   cfg.rope_scaling_type = olmo_cpp::TransformerConfig::RoPEScalingType::None;
+    }
+    cfg.rope_scaling_factor   = model_ini.get_or<double>("rope_scaling_factor", 1.0);
+    cfg.rope_yarn_beta_fast   = model_ini.get_or<double>("rope_yarn_beta_fast", 32.0);
+    cfg.rope_yarn_beta_slow   = model_ini.get_or<double>("rope_yarn_beta_slow", 1.0);
+
+    // Layer norm type: rms_norm, layer_norm, l2_norm, fused_rms_norm
+    {
+      auto s = model_ini.get_or<std::string>("layer_norm_type", "rms_norm");
+      if (s == "layer_norm")          cfg.layer_norm_type = olmo_cpp::TransformerConfig::LayerNormType::LayerNorm;
+      else if (s == "l2_norm")        cfg.layer_norm_type = olmo_cpp::TransformerConfig::LayerNormType::L2Norm;
+      else if (s == "fused_rms_norm") cfg.layer_norm_type = olmo_cpp::TransformerConfig::LayerNormType::FusedRMSNorm;
+      else                            cfg.layer_norm_type = olmo_cpp::TransformerConfig::LayerNormType::RMSNorm;
+    }
+
+    // Activation checkpointing mode: none, full, selected_blocks
+    {
+      auto s = model_ini.get_or<std::string>("activation_checkpoint_mode", "none");
+      if (s == "full")                   cfg.activation_checkpoint_mode = olmo_cpp::TransformerConfig::ActivationCheckpointMode::Full;
+      else if (s == "selected_blocks")   cfg.activation_checkpoint_mode = olmo_cpp::TransformerConfig::ActivationCheckpointMode::SelectedBlocks;
+      else                               cfg.activation_checkpoint_mode = olmo_cpp::TransformerConfig::ActivationCheckpointMode::None;
+    }
+    cfg.activation_checkpoint_interval = model_ini.get_or<int64_t>("activation_checkpoint_interval", 1);
+
+    // MoE config
+    cfg.use_moe              = model_ini.get_or<bool>("use_moe", false);
+    cfg.moe_num_experts      = model_ini.get_or<int64_t>("moe_num_experts", 8);
+    cfg.moe_top_k            = model_ini.get_or<int64_t>("moe_top_k", 2);
+    cfg.moe_hidden_size      = model_ini.get_or<int64_t>("moe_hidden_size", -1);
+    cfg.moe_capacity_factor  = model_ini.get_or<double>("moe_capacity_factor", 1.25);
+    cfg.moe_dropless         = model_ini.get_or<bool>("moe_dropless", true);
+    cfg.moe_zloss_weight     = model_ini.get_or<double>("moe_zloss_weight", 1e-3);
+    cfg.moe_lb_loss_weight   = model_ini.get_or<double>("moe_lb_loss_weight", 1e-2);
+    cfg.moe_hybrid           = model_ini.get_or<bool>("moe_hybrid", false);
+    cfg.moe_hybrid_interval  = model_ini.get_or<int64_t>("moe_hybrid_interval", 2);
+
+    // Multi-res DC-MRE
+    cfg.multi_res_char_buckets   = model_ini.get_or<int64_t>("multi_res_char_buckets", 4096);
+    cfg.multi_res_phrase_buckets = model_ini.get_or<int64_t>("multi_res_phrase_buckets", 8192);
+    cfg.multi_res_inner_dim      = model_ini.get_or<int64_t>("multi_res_inner_dim", 64);
 
     // ── Training config ──
     olmo_cpp::TrainConfig train_cfg;
@@ -136,6 +226,28 @@ int main(int argc, char** argv) {
     train_cfg.grad_accum_steps = train_ini.get_or<int64_t>("grad_accum", 1);
     train_cfg.optimizer        = train_ini.get_or<std::string>("optimizer", "adamw");
     train_cfg.use_amp          = train_ini.get_or<bool>("amp", false);
+    train_cfg.use_grad_scaler  = train_ini.get_or<bool>("grad_scaler", false);
+    train_cfg.max_grad_norm    = train_ini.get_or<double>("max_grad_norm", 1.0);
+    train_cfg.weight_decay     = train_ini.get_or<double>("weight_decay", 0.01);
+    train_cfg.scheduler        = train_ini.get_or<std::string>("scheduler", "cosine");
+    train_cfg.activation_checkpoint_interval = train_ini.get_or<int64_t>("activation_checkpoint_interval", 0);
+
+    // Evaluation
+    train_cfg.eval_data_path   = train_ini.get_or<std::string>("eval_data_path", "");
+    if (train_cfg.eval_data_path && train_cfg.eval_data_path->empty())
+      train_cfg.eval_data_path = std::nullopt;
+    train_cfg.eval_interval    = train_ini.get_or<int64_t>("eval_interval", 500);
+
+    // Checkpointing
+    train_cfg.checkpoint_dir      = train_ini.get_or<std::string>("checkpoint_dir", "");
+    train_cfg.checkpoint_interval = train_ini.get_or<int64_t>("checkpoint_interval", 1000);
+    train_cfg.keep_checkpoints    = train_ini.get_or<int>("keep_checkpoints", 3);
+
+    // Sequence/batch curriculum scheduling
+    train_cfg.target_seq_len       = train_ini.get_or<int64_t>("target_seq_len", -1);
+    train_cfg.seq_len_warmup_steps = train_ini.get_or<int64_t>("seq_len_warmup_steps", 0);
+    train_cfg.target_batch_size    = train_ini.get_or<int64_t>("target_batch_size", -1);
+    train_cfg.batch_size_ramp_steps = train_ini.get_or<int64_t>("batch_size_ramp_steps", 0);
 
     int64_t seed_val       = train_ini.get_or<int64_t>("seed", 42);
     bool enable_profile    = train_ini.get_or<bool>("profile", false);

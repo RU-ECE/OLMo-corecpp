@@ -4,13 +4,63 @@
 #include <algorithm>
 #include <random>
 #include <stdexcept>
+#include <iostream>
+
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_host.h>
+#elif defined(__linux__)
+#include <sys/sysinfo.h>
+#elif defined(_WIN32)
+#include <windows.h>
+#endif
 
 namespace olmo_cpp {
+
+/// Query available system RAM in bytes (cross-platform).
+static size_t get_available_ram() {
+#if defined(__APPLE__)
+  mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+  vm_statistics64_data_t vm;
+  if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                        reinterpret_cast<host_info64_t>(&vm), &count) == KERN_SUCCESS) {
+    return static_cast<size_t>(vm.free_count + vm.inactive_count) * vm_page_size;
+  }
+#elif defined(__linux__)
+  struct sysinfo si;
+  if (sysinfo(&si) == 0) {
+    return static_cast<size_t>(si.freeram) * si.mem_unit;
+  }
+#elif defined(_WIN32)
+  MEMORYSTATUSEX mem;
+  mem.dwLength = sizeof(mem);
+  if (GlobalMemoryStatusEx(&mem)) {
+    return static_cast<size_t>(mem.ullAvailPhys);
+  }
+#endif
+  return 0;  // unknown — skip capping
+}
 
 TokenDataset::TokenDataset(const std::string& path, int64_t seq_len, bool shuffle)
     : seq_len_(seq_len), shuffle_(shuffle), chunk_cursor_(0) {
   cnpy::NpyArray arr = cnpy::npy_load(path);
   size_t num_vals = arr.num_vals;
+
+  // Cap tokens to fit in available RAM (leave 2 GB headroom for model + overhead).
+  // Each token costs ~24 bytes: int64 vector + CPU tensor clone + GPU copy.
+  constexpr size_t headroom = 2ULL * 1024 * 1024 * 1024;
+  constexpr size_t bytes_per_token = 24;
+  size_t avail = get_available_ram();
+  if (avail > 0) {
+    size_t budget = (avail > headroom) ? avail - headroom : avail / 2;
+    size_t max_tokens = budget / bytes_per_token;
+    if (num_vals > max_tokens) {
+      std::cerr << "TokenDataset: capping from " << num_vals
+                << " to " << max_tokens
+                << " tokens (available RAM: " << (avail / (1024*1024)) << " MB)\n";
+      num_vals = max_tokens;
+    }
+  }
 
   // Support uint16, uint32, int32, int64
   if (arr.word_size == 2) {

@@ -60,10 +60,25 @@ TORCH_VER=$(python3 -c "import torch; print(torch.__version__)" 2>/dev/null || e
 ok "CUDA $CUDA_VER | GPU: $GPU_NAME | PyTorch $TORCH_VER"
 
 # Ensure numpy is installed (needed by Python benchmark)
+# On externally-managed environments (PEP 668), use a venv
 if ! python3 -c "import numpy" 2>/dev/null; then
     info "Installing numpy..."
-    pip install numpy --quiet
-    ok "numpy installed"
+    if pip install numpy --quiet 2>/dev/null; then
+        ok "numpy installed"
+    else
+        info "System pip blocked (PEP 668), creating venv..."
+        VENV_DIR="${REPO_DIR}/.venv"
+        if [ ! -d "$VENV_DIR" ]; then
+            python3 -m venv "$VENV_DIR" --system-site-packages
+        fi
+        source "$VENV_DIR/bin/activate"
+        pip install numpy --quiet
+        ok "numpy installed in venv"
+    fi
+elif [ -d "${REPO_DIR}/.venv" ]; then
+    # Reuse existing venv if it exists (keeps numpy + torch visible)
+    source "${REPO_DIR}/.venv/bin/activate"
+    ok "Using existing venv"
 fi
 
 # Check nsys

@@ -7,6 +7,7 @@
 #ifdef USE_CUDA
 #include <ATen/cuda/CUDAGraph.h>
 #include <c10/cuda/CUDAStream.h>
+#include <ATen/cuda/CUDAContext.h>
 #endif
 #include "olmo_cpp/distributed/ddp.hpp"
 #include "olmo_cpp/optim/lion.hpp"
@@ -690,6 +691,9 @@ void train(
 #ifdef USE_CUDA
   at::cuda::CUDAGraph train_graph;
   torch::Tensor graph_input, graph_labels, graph_loss;
+  // Capture stream — CUDA graphs require a non-default stream for capture.
+  // After capture, replay happens on whatever stream is current (default is fine).
+  at::cuda::CUDAStream capture_stream = at::cuda::getStreamFromPool(/*isHighPriority=*/false, device.index());
 
   bool want_graph = cfg.use_cuda_graph && device.is_cuda()
                     && (!ddp || !ddp->is_distributed());
@@ -698,31 +702,36 @@ void train(
     graph_input  = torch::empty({cfg.batch_size, cfg.seq_len}, int_opts);
     graph_labels = torch::empty({cfg.batch_size, cfg.seq_len}, int_opts);
 
-    // ---- Warmup: populate caching allocator + cuDNN/cuBLAS benchmarks ----
+    // ---- Warmup on capture stream ----
+    // Must warm up on the SAME stream we'll capture on, so the caching
+    // allocator records allocations on that stream's memory pool.
     if (rank == 0) std::cout << "CUDA Graph: warming up (3 steps)...\n";
-    for (int w = 0; w < 3; ++w) {
-      if (dataset) {
-        auto [in, lab] = dataset->get_batch(cfg.batch_size, device);
-        graph_input.copy_(in);
-        graph_labels.copy_(lab);
-      } else {
-        graph_input.copy_(torch::randint(0, model_cfg.vocab_size,
-            {cfg.batch_size, cfg.seq_len}, int_opts));
-        graph_labels.copy_(torch::randint(0, model_cfg.vocab_size,
-            {cfg.batch_size, cfg.seq_len}, int_opts));
+    {
+      at::cuda::CUDAStreamGuard stream_guard(capture_stream);
+      for (int w = 0; w < 3; ++w) {
+        if (dataset) {
+          auto [in, lab] = dataset->get_batch(cfg.batch_size, device);
+          graph_input.copy_(in);
+          graph_labels.copy_(lab);
+        } else {
+          graph_input.copy_(torch::randint(0, model_cfg.vocab_size,
+              {cfg.batch_size, cfg.seq_len}, int_opts));
+          graph_labels.copy_(torch::randint(0, model_cfg.vocab_size,
+              {cfg.batch_size, cfg.seq_len}, int_opts));
+        }
+        optimizer->zero_grad();
+        {
+          AutocastGuard ac(cfg.use_amp, device);
+          graph_loss = model->forward(graph_input, graph_labels, -100)
+                       / static_cast<float>(cfg.grad_accum_steps);
+        }
+        graph_loss.backward();
+        clip_grad_norm_gpu(model_params, cfg.max_grad_norm);
+        optimizer->step();
       }
-      optimizer->zero_grad();
-      {
-        AutocastGuard ac(cfg.use_amp, device);
-        graph_loss = model->forward(graph_input, graph_labels, -100)
-                     / static_cast<float>(cfg.grad_accum_steps);
-      }
-      graph_loss.backward();
-      clip_grad_norm_gpu(model_params, cfg.max_grad_norm);
-      optimizer->step();
     }
 
-    // ---- Capture: single micro-step (forward + backward) ----
+    // ---- Capture on non-default stream ----
     // The graph captures one forward+backward pass on a single micro-batch.
     // For grad_accum > 1, we replay the graph N times per optimizer step —
     // gradients accumulate naturally across replays since we only zero_grad
@@ -732,18 +741,22 @@ void train(
                 << " (will replay " << cfg.grad_accum_steps << "x per step)...\n";
     }
 
-    // Must use memset zero_grad (not set_to_none) — graph references
-    // specific gradient tensor addresses that must remain valid.
-    optimizer->zero_grad();
-
-    train_graph.capture_begin();
     {
-      AutocastGuard ac(cfg.use_amp, device);
-      graph_loss = model->forward(graph_input, graph_labels, -100)
-                   / static_cast<float>(cfg.grad_accum_steps);
+      at::cuda::CUDAStreamGuard stream_guard(capture_stream);
+
+      // Must use memset zero_grad (not set_to_none) — graph references
+      // specific gradient tensor addresses that must remain valid.
+      optimizer->zero_grad();
+
+      train_graph.capture_begin();
+      {
+        AutocastGuard ac(cfg.use_amp, device);
+        graph_loss = model->forward(graph_input, graph_labels, -100)
+                     / static_cast<float>(cfg.grad_accum_steps);
+      }
+      graph_loss.backward();
+      train_graph.capture_end();
     }
-    graph_loss.backward();
-    train_graph.capture_end();
 
     graph_active = true;
     if (rank == 0) std::cout << "CUDA Graph: captured successfully\n";

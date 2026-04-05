@@ -61,6 +61,7 @@ struct TrainConfig {
   /// -1 = never put full corpus on GPU (streaming only).
   int64_t max_gpu_data_tokens = 0;
   int64_t log_interval = 10;         // Steps between loss D2H sync
+  bool use_cuda_graph = false;       // Capture forward+backward as CUDA graph (requires fixed shapes)
 };
 
 /// Train for num_steps (legacy API, kept for backward compat)

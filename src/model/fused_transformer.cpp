@@ -6,6 +6,13 @@ void trunc_normal_(torch::Tensor& t, double mean, double std, double a, double b
   t.normal_(mean, std, gen);
   t.clamp_(a, b);
 }
+
+// Chunk size for cross-entropy computation along the sequence dimension.
+// Prevents materializing full [B, S, V] logits (which can be >3 GB for
+// B=32, S=1024, V=50257). Each chunk only allocates [B, chunk, V].
+// The caching allocator reuses the same block across chunks.
+constexpr int64_t kCEChunkSize = 128;
+
 }  // namespace
 
 namespace olmo_cpp {
@@ -126,6 +133,64 @@ torch::Tensor FusedTransformerImpl::forward_backbone(
   return h;
 }
 
+// ---------------------------------------------------------------------------
+// Chunked cross-entropy: compute CE loss without materializing full logits.
+//
+// Standard approach: lm_head(h) → [B, S, V] → cross_entropy → loss
+//   Peak memory: B×S×V elements (e.g. 32×1024×50257 = 1.65 billion = 3.3 GB in BF16)
+//
+// Chunked approach: for each chunk of 128 tokens:
+//   lm_head(h_chunk) → [B, 128, V] → cross_entropy → accumulate
+//   Peak memory: B×128×V elements (206M = 412 MB in BF16)
+//
+// The caching allocator reuses the same block across chunks, giving ~8×
+// reduction in peak logits memory. Gradients flow correctly because each
+// chunk's h_chunk is a view of h (narrow is zero-copy).
+// ---------------------------------------------------------------------------
+static torch::Tensor chunked_ce_loss(
+    LMHead& lm_head,
+    torch::Tensor h,
+    torch::Tensor labels,
+    int64_t vocab_size,
+    int64_t ignore_index,
+    int64_t chunk_size) {
+
+  int64_t S = h.size(1);
+
+  // Fast path: if sequence fits in one chunk, avoid overhead
+  if (S <= chunk_size) {
+    auto logits = lm_head(h);
+    return torch::nn::functional::cross_entropy(
+        logits.reshape({-1, vocab_size}),
+        labels.reshape(-1),
+        torch::nn::functional::CrossEntropyFuncOptions()
+            .ignore_index(ignore_index).reduction(torch::kMean));
+  }
+
+  // Accumulate loss in FP32 for numerical stability
+  auto loss_opts = torch::TensorOptions().dtype(torch::kFloat32).device(h.device());
+  auto total_loss = torch::zeros({}, loss_opts);
+
+  for (int64_t i = 0; i < S; i += chunk_size) {
+    int64_t len = std::min(chunk_size, S - i);
+    auto h_chunk = h.narrow(1, i, len);
+    auto lab_chunk = labels.narrow(1, i, len);
+
+    auto logits_chunk = lm_head(h_chunk);
+    auto chunk_loss = torch::nn::functional::cross_entropy(
+        logits_chunk.reshape({-1, vocab_size}),
+        lab_chunk.reshape(-1),
+        torch::nn::functional::CrossEntropyFuncOptions()
+            .ignore_index(ignore_index).reduction(torch::kSum));
+
+    total_loss = total_loss + chunk_loss.to(torch::kFloat32);
+  }
+
+  // Divide by total valid tokens (handles ignore_index correctly)
+  auto valid_count = (labels.reshape(-1) != ignore_index).sum().to(torch::kFloat32);
+  return total_loss / valid_count;
+}
+
 torch::Tensor FusedTransformerImpl::forward(
     torch::Tensor input_ids,
     c10::optional<torch::Tensor> labels,
@@ -133,60 +198,48 @@ torch::Tensor FusedTransformerImpl::forward(
     KVCache* kv_cache) {
 
   auto h = forward_backbone(input_ids, kv_cache);
-  auto logits = lm_head_(h);
 
-  if (labels.has_value()) {
-    auto main_loss = torch::nn::functional::cross_entropy(
-        logits.view({-1, config_.vocab_size}),
-        labels->view(-1),
-        torch::nn::functional::CrossEntropyFuncOptions().ignore_index(ignore_index).reduction(torch::kMean));
+  if (!labels.has_value()) {
+    // Inference: return full logits
+    return lm_head_(h);
+  }
 
-    if (config_.num_mtp_heads > 0) {
-      // Batch all MTP heads into a single LM head GEMM instead of calling
-      // lm_head_ separately for each head. This is the biggest GEMM in the
-      // model (768→50257) so batching 2 heads saves ~40% of total forward FLOP.
+  // Training: chunked cross-entropy (avoids full [B, S, V] logits allocation)
+  auto main_loss = chunked_ce_loss(
+      lm_head_, h, *labels, config_.vocab_size, ignore_index, kCEChunkSize);
+
+  if (config_.num_mtp_heads > 0) {
+    auto mtp_loss_sum = torch::zeros({},
+        torch::TensorOptions().dtype(torch::kFloat32).device(h.device()));
+    int64_t valid_heads = 0;
+
+    for (int64_t k = 0; k < config_.num_mtp_heads; ++k) {
+      int64_t shift = k + 1;
       int64_t seq_len = labels->size(1);
-      int64_t min_shift = config_.num_mtp_heads;  // largest shift we need
-      if (min_shift < seq_len) {
-        int64_t trimmed_len = seq_len - min_shift;
 
-        // Run all MTP head projections and concatenate
-        std::vector<torch::Tensor> mtp_hidden;
-        mtp_hidden.reserve(static_cast<size_t>(config_.num_mtp_heads));
-        for (int64_t k = 0; k < config_.num_mtp_heads; ++k) {
-          int64_t shift = k + 1;
-          // Trim to common length (shortest) so we can batch the LM head
-          auto h_trimmed = h.narrow(1, 0, trimmed_len);
-          auto head = mtp_heads_->ptr<MTPHeadImpl>(k);
-          mtp_hidden.push_back(head->forward(h_trimmed));
-        }
+      if (shift >= seq_len) continue;
 
-        // Single batched LM head call: [num_heads * B, trimmed_len, d] → [num_heads * B, trimmed_len, vocab]
-        auto mtp_h_cat = torch::cat(mtp_hidden, /*dim=*/0);  // [num_heads*B, trimmed_len, d_model]
-        auto mtp_logits_cat = lm_head_(mtp_h_cat);            // single GEMM!
-        auto mtp_logits_flat = mtp_logits_cat.reshape({-1, config_.vocab_size});
+      auto h_trimmed = h.narrow(1, 0, seq_len - shift);
+      auto labels_shifted = labels->narrow(1, shift, seq_len - shift);
 
-        // Build concatenated labels for all heads at once
-        std::vector<torch::Tensor> mtp_labels;
-        mtp_labels.reserve(static_cast<size_t>(config_.num_mtp_heads));
-        for (int64_t k = 0; k < config_.num_mtp_heads; ++k) {
-          int64_t shift = k + 1;
-          mtp_labels.push_back(labels->narrow(1, shift, trimmed_len).reshape(-1));
-        }
-        auto mtp_labels_cat = torch::cat(mtp_labels, /*dim=*/0);
+      auto head = mtp_heads_->ptr<MTPHeadImpl>(k);
+      auto mtp_h = head->forward(h_trimmed);
 
-        // Single cross-entropy for all MTP heads
-        auto mtp_loss = torch::nn::functional::cross_entropy(
-            mtp_logits_flat, mtp_labels_cat,
-            torch::nn::functional::CrossEntropyFuncOptions().ignore_index(ignore_index).reduction(torch::kMean));
+      // Chunked CE for MTP heads too
+      auto mtp_loss = chunked_ce_loss(
+          lm_head_, mtp_h, labels_shifted, config_.vocab_size,
+          ignore_index, kCEChunkSize);
 
-        main_loss = main_loss + config_.mtp_loss_weight * mtp_loss;
-      }
+      mtp_loss_sum = mtp_loss_sum + mtp_loss;
+      ++valid_heads;
     }
 
-    return main_loss;
+    if (valid_heads > 0) {
+      main_loss = main_loss + config_.mtp_loss_weight * mtp_loss_sum / static_cast<double>(valid_heads);
+    }
   }
-  return logits;
+
+  return main_loss;
 }
 
 std::vector<torch::Tensor> FusedTransformerImpl::forward_mtp_draft(torch::Tensor hidden_state) {

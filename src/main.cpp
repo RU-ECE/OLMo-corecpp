@@ -270,6 +270,7 @@ int main(int argc, char** argv) {
     train_cfg.gpu_resident_data     = opt_ini.get_or<bool>("gpu_data", true);
     train_cfg.max_gpu_data_tokens   = opt_ini.get_or<int64_t>("gpu_data_max_tokens", 0);
     train_cfg.log_interval          = train_ini.get_or<int64_t>("log_interval", 10);
+    train_cfg.use_cuda_graph        = opt_ini.get_or<bool>("cuda_graph", false);
 
     // ── Device ──
     std::string device_pref = dev_ini.get_or<std::string>("device", "auto");
@@ -296,14 +297,17 @@ int main(int argc, char** argv) {
 
     auto device = select_device(device_pref);
 
-    // Select backend + CUDA perf flags
+    // Select backend
     if (device.is_cuda()) {
       olmo_cpp::use_cuda_backend();
-      // Enable cuDNN autotuner: finds fastest kernel for each conv/matmul shape
+      // cuDNN benchmark: auto-select fastest convolution/GEMM algorithm
       at::globalContext().setBenchmarkCuDNN(true);
-      // Disable debug sync: avoids implicit cuda synchronize on errors
+      // TF32 for any FP32 matmuls — 2x faster, negligible accuracy loss
+      at::globalContext().setAllowTF32CuBLAS(true);
+      at::globalContext().setAllowTF32CuDNN(true);
+      // Disable deterministic mode for best performance
       at::globalContext().setDeterministicAlgorithms(false, false);
-      std::cout << "Backend: CUDA (fused kernels)\n";
+      std::cout << "Backend: CUDA (fused kernels, cuDNN benchmark, TF32)\n";
     } else if (device.is_cpu()) {
       olmo_cpp::use_simd_backend();
       std::cout << "Backend: SIMD (fused kernels + arena allocator)\n";

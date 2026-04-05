@@ -4,6 +4,10 @@
 #include "olmo_cpp/data/token_dataset.hpp"
 #include "olmo_cpp/profiler.hpp"
 #include <ATen/autocast_mode.h>
+#ifdef USE_CUDA
+#include <ATen/cuda/CUDAGraph.h>
+#include <c10/cuda/CUDAStream.h>
+#endif
 #include "olmo_cpp/distributed/ddp.hpp"
 #include "olmo_cpp/optim/lion.hpp"
 #include "olmo_cpp/optim/muon.hpp"
@@ -73,7 +77,8 @@ std::string optimizer_display_name(const std::string& name, bool use_foreach) {
 
 void print_optimization_banner(const std::string& optimizer_name, bool use_foreach,
                                bool gpu_data, bool gpu_data_active,
-                               bool use_amp, bool fused_grad_clip) {
+                               bool use_amp, bool fused_grad_clip,
+                               bool cuda_graph = false) {
   std::cout << "\n";
   std::cout << "╔══════════════════════════════════════════════════════════╗\n";
   std::cout << "║  OPTIMIZATION STATUS                                    ║\n";
@@ -86,6 +91,8 @@ void print_optimization_banner(const std::string& optimizer_name, bool use_forea
             << (gpu_data_active ? "GPU-resident (zero per-step H2D)" : "CPU + async prefetch") << "║\n";
   std::cout << "║  Mixed precision: " << std::left << std::setw(39)
             << (use_amp ? "BF16 autocast" : "FP32") << "║\n";
+  std::cout << "║  CUDA graph:      " << std::left << std::setw(39)
+            << (cuda_graph ? "ON (fwd+bwd captured)" : "OFF") << "║\n";
   std::cout << "╚══════════════════════════════════════════════════════════╝\n";
   std::cout << "\n";
 }
@@ -162,6 +169,12 @@ void train_epoch(
   double epoch_loss_sum = 0.0;
   int64_t epoch_loss_count = 0;
 
+  // Pre-allocate loss accumulator (avoids per-step allocation)
+  torch::Tensor accum_loss_tensor = torch::zeros({}, torch::TensorOptions().device(device));
+
+  // Cache model params once (avoids per-step vector allocation)
+  auto model_params = model->parameters();
+
   for (int64_t step = 0; step < num_steps; ++step) {
     auto step_start = std::chrono::steady_clock::now();
     double step_lr = cosine_warmup_lr(step, warmup_steps, lr, num_steps);
@@ -189,8 +202,9 @@ void train_epoch(
 
     {
       ProfileScope step_scope("step_total");
-      optimizer.zero_grad();
-      torch::Tensor accum_loss_tensor = torch::zeros({}, torch::TensorOptions().device(device));
+      // set_to_none=true: use nullptr instead of memset (faster)
+      optimizer.zero_grad(true);
+      accum_loss_tensor.zero_();
 
       for (int64_t accum = 0; accum < grad_accum_steps; ++accum) {
         torch::Tensor input, labels;
@@ -218,7 +232,7 @@ void train_epoch(
           ProfileScope bwd_scope("backward");
           loss.backward();
         }
-        accum_loss_tensor.add_(loss.detach().sum());
+        accum_loss_tensor.add_(loss.detach());
       }
 
       {
@@ -230,12 +244,13 @@ void train_epoch(
 
       {
         ProfileScope optim_scope("optimizer_step");
-        clip_grad_norm_gpu(model->parameters(), 1.0);
+        clip_grad_norm_gpu(model_params, 1.0);
         optimizer.step();
       }
 
       total_tokens += tokens_per_step;
 
+      // Defer D2H sync: only pull loss from GPU on log steps
       if (step % 10 == 0 && (!ddp || ddp->rank() == 0)) {
         float accum_loss = accum_loss_tensor.item<float>();
         epoch_loss_sum += accum_loss;
@@ -354,7 +369,7 @@ void train(
   if (rank == 0) {
     print_optimization_banner(cfg.optimizer, cfg.use_foreach_optimizer,
                               cfg.gpu_resident_data, gpu_data_active,
-                              cfg.use_amp, true);
+                              cfg.use_amp, true, cfg.use_cuda_graph);
   }
 
   // Pre-build DDP parameter list once (avoids per-step allocation)
@@ -382,6 +397,10 @@ void train(
   cb_mgr.on_train_start(state);
 
   int64_t total_tokens = 0;
+
+  // Pre-allocate loss accumulator and cache params (avoid per-step allocation)
+  torch::Tensor accum_loss_tensor = torch::zeros({}, torch::TensorOptions().device(device));
+  auto model_params = model->parameters();
 
   // ---- Training loop ----
   for (int64_t step = 0; step < cfg.num_steps; ++step) {
@@ -432,8 +451,8 @@ void train(
 
     cb_mgr.on_step_start(state);
 
-    optimizer->zero_grad();
-    torch::Tensor accum_loss_tensor = torch::zeros({}, torch::TensorOptions().device(device));
+    optimizer->zero_grad(true);
+    accum_loss_tensor.zero_();
 
     for (int64_t accum = 0; accum < cfg.grad_accum_steps; ++accum) {
       torch::Tensor input, labels;
@@ -459,7 +478,7 @@ void train(
       } else {
         loss.backward();
       }
-      accum_loss_tensor.add_(loss.detach().sum());
+      accum_loss_tensor.add_(loss.detach());
     }
 
     // Defer loss D2H sync: only pull from GPU when needed
@@ -487,12 +506,12 @@ void train(
     if (grad_scaler) {
       bool finite = grad_scaler->unscale_and_check(*optimizer);
       if (finite) {
-        clip_grad_norm_gpu(model->parameters(), cfg.max_grad_norm);
+        clip_grad_norm_gpu(model_params, cfg.max_grad_norm);
         grad_scaler->step(*optimizer);
       }
       grad_scaler->update();
     } else {
-      clip_grad_norm_gpu(model->parameters(), cfg.max_grad_norm);
+      clip_grad_norm_gpu(model_params, cfg.max_grad_norm);
       optimizer->step();
     }
 
@@ -631,14 +650,13 @@ void train(
   if (rank == 0) {
     print_optimization_banner(cfg.optimizer, cfg.use_foreach_optimizer,
                               cfg.gpu_resident_data, gpu_data_active,
-                              cfg.use_amp, true);
+                              cfg.use_amp, true, cfg.use_cuda_graph);
   }
 
-  // Pre-build param list once (avoids per-step vector allocation)
-  auto model_params = model->parameters();
+  // Pre-build DDP parameter list once (avoids per-step allocation)
   std::vector<torch::Tensor> ddp_params;
   if (ddp && ddp->is_distributed()) {
-    for (auto& p : model_params) ddp_params.push_back(p);
+    for (auto& p : model->parameters()) ddp_params.push_back(p);
   }
 
   // Epoch tracking
@@ -650,17 +668,86 @@ void train(
   double epoch_loss_sum = 0.0;
   int64_t epoch_loss_count = 0;
 
-  // Pre-allocate loss accumulator on device (avoid per-step allocation)
-  torch::Tensor accum_loss_tensor = torch::zeros({}, torch::TensorOptions().device(device));
-  // Pre-allocate accum_loss scalar for deferred D2H sync
-  float last_logged_loss = 0.0f;
-
   auto train_start = std::chrono::steady_clock::now();
   int64_t total_tokens = 0;
 
-  // ---- Training loop ----
+  // Pre-allocate loss accumulator outside loop (avoids per-step allocation)
+  torch::Tensor accum_loss_tensor = torch::zeros({}, torch::TensorOptions().device(device));
+
+  // Cache model params once (avoids per-step vector rebuild)
+  auto model_params = model->parameters();
+
+  // ---------------------------------------------------------------------------
+  // CUDA Graph: capture forward+backward as a replayable graph.
+  // Eliminates per-kernel launch overhead (~5μs × 100+ kernels = 0.5-1ms/step)
+  // and enables the GPU to pipeline operations without waiting for CPU dispatch.
+  //
+  // Requirements: CUDA device, fixed shapes (no curriculum), grad_accum=1,
+  // no DDP (allreduce is cross-device). The optimizer step runs OUTSIDE the
+  // graph because lr/bias_correction change per step.
+  // ---------------------------------------------------------------------------
+  bool graph_active = false;
+#ifdef USE_CUDA
+  at::cuda::CUDAGraph train_graph;
+  torch::Tensor graph_input, graph_labels, graph_loss;
+
+  bool want_graph = cfg.use_cuda_graph && device.is_cuda()
+                    && cfg.grad_accum_steps == 1
+                    && (!ddp || !ddp->is_distributed());
+  if (want_graph) {
+    auto int_opts = torch::TensorOptions().dtype(torch::kLong).device(device);
+    graph_input  = torch::empty({cfg.batch_size, cfg.seq_len}, int_opts);
+    graph_labels = torch::empty({cfg.batch_size, cfg.seq_len}, int_opts);
+
+    // ---- Warmup: populate caching allocator + cuDNN/cuBLAS benchmarks ----
+    if (rank == 0) std::cout << "CUDA Graph: warming up (3 steps)...\n";
+    for (int w = 0; w < 3; ++w) {
+      if (dataset) {
+        auto [in, lab] = dataset->get_batch(cfg.batch_size, device);
+        graph_input.copy_(in);
+        graph_labels.copy_(lab);
+      } else {
+        graph_input.copy_(torch::randint(0, model_cfg.vocab_size,
+            {cfg.batch_size, cfg.seq_len}, int_opts));
+        graph_labels.copy_(torch::randint(0, model_cfg.vocab_size,
+            {cfg.batch_size, cfg.seq_len}, int_opts));
+      }
+      optimizer->zero_grad();
+      {
+        AutocastGuard ac(cfg.use_amp, device);
+        graph_loss = model->forward(graph_input, graph_labels, -100);
+      }
+      graph_loss.backward();
+      clip_grad_norm_gpu(model_params, cfg.max_grad_norm);
+      optimizer->step();
+    }
+
+    // ---- Capture: zero_grad → forward → backward ----
+    // The graph records CUDA ops on the default stream. CPU-side logic
+    // (loop iteration, autocast flag toggling) executes during capture
+    // but is NOT part of the replayed graph — only the GPU kernels are.
+    if (rank == 0) std::cout << "CUDA Graph: capturing forward+backward...\n";
+
+    // Must use memset zero_grad (not set_to_none) — graph references
+    // specific gradient tensor addresses that must remain valid.
+    optimizer->zero_grad();
+
+    train_graph.capture_begin();
+    {
+      AutocastGuard ac(cfg.use_amp, device);
+      graph_loss = model->forward(graph_input, graph_labels, -100);
+    }
+    graph_loss.backward();
+    train_graph.capture_end();
+
+    graph_active = true;
+    if (rank == 0) std::cout << "CUDA Graph: captured successfully\n";
+  }
+#endif  // USE_CUDA
+
   for (int64_t step = 0; step < cfg.num_steps; ++step) {
     auto step_start = std::chrono::steady_clock::now();
+    double cur_lr = scheduler->get_lr(step, cfg.num_steps);
     scheduler->apply(*optimizer, step, cfg.num_steps);
 
     // Epoch boundary detection
@@ -674,33 +761,56 @@ void train(
       current_epoch = new_epoch;
     }
 
-    // zero_grad with set_to_none=true: avoids memset kernel, just nulls .grad
-    optimizer->zero_grad(/*set_to_none=*/true);
-    accum_loss_tensor.zero_();
-
-    for (int64_t accum = 0; accum < cfg.grad_accum_steps; ++accum) {
-      torch::Tensor input, labels;
+#ifdef USE_CUDA
+    if (graph_active) {
+      // ---- CUDA Graph path ----
+      // 1. Copy fresh data into static graph buffers
       if (dataset) {
         auto [in, lab] = dataset->get_batch(cfg.batch_size, device);
-        input = in; labels = lab;
-        dataset->prefetch_next(cfg.batch_size, device);
-      } else {
-        input = torch::randint(0, model_cfg.vocab_size, {cfg.batch_size, cfg.seq_len},
-                               torch::TensorOptions().dtype(torch::kLong).device(device));
-        labels = torch::randint(0, model_cfg.vocab_size, {cfg.batch_size, cfg.seq_len},
-                                torch::TensorOptions().dtype(torch::kLong).device(device));
+        graph_input.copy_(in);
+        graph_labels.copy_(lab);
       }
 
-      torch::Tensor loss;
-      {
-        AutocastGuard ac(cfg.use_amp, device);
-        loss = model->forward(input, labels, -100) / static_cast<float>(cfg.grad_accum_steps);
+      // 2. Zero gradients (memset — graph references these tensors)
+      optimizer->zero_grad();
+
+      // 3. Replay captured forward + backward (single graph launch)
+      train_graph.replay();
+
+      // 4. Read loss from graph output
+      accum_loss_tensor.copy_(graph_loss.detach());
+    } else
+#endif
+    {
+      // ---- Standard path (non-graph or CPU) ----
+      optimizer->zero_grad(true);
+      accum_loss_tensor.zero_();
+
+      for (int64_t accum = 0; accum < cfg.grad_accum_steps; ++accum) {
+        torch::Tensor input, labels;
+        if (dataset) {
+          auto [in, lab] = dataset->get_batch(cfg.batch_size, device);
+          input = in; labels = lab;
+          dataset->prefetch_next(cfg.batch_size, device);
+        } else {
+          input = torch::randint(0, model_cfg.vocab_size, {cfg.batch_size, cfg.seq_len},
+                                 torch::TensorOptions().dtype(torch::kLong).device(device));
+          labels = torch::randint(0, model_cfg.vocab_size, {cfg.batch_size, cfg.seq_len},
+                                  torch::TensorOptions().dtype(torch::kLong).device(device));
+        }
+
+        torch::Tensor loss;
+        {
+          AutocastGuard ac(cfg.use_amp, device);
+          loss = model->forward(input, labels, -100) / static_cast<float>(cfg.grad_accum_steps);
+        }
+        loss.backward();
+        accum_loss_tensor.add_(loss.detach());
       }
-      loss.backward();
-      // Accumulate on GPU — no CPU sync
-      accum_loss_tensor.add_(loss.detach());
     }
 
+    // Gradient sync + optimizer step always OUTSIDE graph
+    // (LR and bias correction change per step)
     if (ddp && ddp->is_distributed()) {
       ddp->allreduce_gradients(ddp_params);
     }
@@ -710,20 +820,19 @@ void train(
 
     total_tokens += tokens_per_step;
 
-    // Only pull loss from GPU when actually logging (avoids D2H sync stall)
+    // Defer D2H sync: only pull loss from GPU on log steps
     if (step % cfg.log_interval == 0 && rank == 0) {
-      last_logged_loss = accum_loss_tensor.item<float>();
-      epoch_loss_sum += last_logged_loss;
+      float accum_loss = accum_loss_tensor.item<float>();
+      epoch_loss_sum += accum_loss;
       epoch_loss_count++;
       auto step_end = std::chrono::steady_clock::now();
       double step_ms = std::chrono::duration<double, std::milli>(step_end - step_start).count();
       double elapsed_s = std::chrono::duration<double>(step_end - train_start).count();
       double tok_per_s = total_tokens / (elapsed_s > 0 ? elapsed_s : 1);
-      double cur_lr = scheduler->get_lr(step, cfg.num_steps);
 
       std::cout << "Epoch " << current_epoch
                 << " | Step " << step << "/" << cfg.num_steps
-                << "  loss: " << std::fixed << std::setprecision(4) << last_logged_loss
+                << "  loss: " << std::fixed << std::setprecision(4) << accum_loss
                 << "  lr: " << std::scientific << std::setprecision(2) << cur_lr
                 << "  step_ms: " << static_cast<int>(step_ms)
                 << "  tok/s: " << static_cast<int>(tok_per_s)

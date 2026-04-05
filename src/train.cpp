@@ -692,7 +692,6 @@ void train(
   torch::Tensor graph_input, graph_labels, graph_loss;
 
   bool want_graph = cfg.use_cuda_graph && device.is_cuda()
-                    && cfg.grad_accum_steps == 1
                     && (!ddp || !ddp->is_distributed());
   if (want_graph) {
     auto int_opts = torch::TensorOptions().dtype(torch::kLong).device(device);
@@ -715,18 +714,23 @@ void train(
       optimizer->zero_grad();
       {
         AutocastGuard ac(cfg.use_amp, device);
-        graph_loss = model->forward(graph_input, graph_labels, -100);
+        graph_loss = model->forward(graph_input, graph_labels, -100)
+                     / static_cast<float>(cfg.grad_accum_steps);
       }
       graph_loss.backward();
       clip_grad_norm_gpu(model_params, cfg.max_grad_norm);
       optimizer->step();
     }
 
-    // ---- Capture: zero_grad → forward → backward ----
-    // The graph records CUDA ops on the default stream. CPU-side logic
-    // (loop iteration, autocast flag toggling) executes during capture
-    // but is NOT part of the replayed graph — only the GPU kernels are.
-    if (rank == 0) std::cout << "CUDA Graph: capturing forward+backward...\n";
+    // ---- Capture: single micro-step (forward + backward) ----
+    // The graph captures one forward+backward pass on a single micro-batch.
+    // For grad_accum > 1, we replay the graph N times per optimizer step —
+    // gradients accumulate naturally across replays since we only zero_grad
+    // once at the start.
+    if (rank == 0) {
+      std::cout << "CUDA Graph: capturing forward+backward"
+                << " (will replay " << cfg.grad_accum_steps << "x per step)...\n";
+    }
 
     // Must use memset zero_grad (not set_to_none) — graph references
     // specific gradient tensor addresses that must remain valid.
@@ -735,7 +739,8 @@ void train(
     train_graph.capture_begin();
     {
       AutocastGuard ac(cfg.use_amp, device);
-      graph_loss = model->forward(graph_input, graph_labels, -100);
+      graph_loss = model->forward(graph_input, graph_labels, -100)
+                   / static_cast<float>(cfg.grad_accum_steps);
     }
     graph_loss.backward();
     train_graph.capture_end();
@@ -764,21 +769,26 @@ void train(
 #ifdef USE_CUDA
     if (graph_active) {
       // ---- CUDA Graph path ----
-      // 1. Copy fresh data into static graph buffers
-      if (dataset) {
-        auto [in, lab] = dataset->get_batch(cfg.batch_size, device);
-        graph_input.copy_(in);
-        graph_labels.copy_(lab);
-      }
-
-      // 2. Zero gradients (memset — graph references these tensors)
+      // Zero gradients once (memset — graph references these tensor addresses)
       optimizer->zero_grad();
+      accum_loss_tensor.zero_();
 
-      // 3. Replay captured forward + backward (single graph launch)
-      train_graph.replay();
+      // Replay captured micro-step for each grad_accum iteration.
+      // Gradients accumulate across replays (we only zero_grad once above).
+      for (int64_t accum = 0; accum < cfg.grad_accum_steps; ++accum) {
+        // 1. Copy fresh data into static graph buffers
+        if (dataset) {
+          auto [in, lab] = dataset->get_batch(cfg.batch_size, device);
+          graph_input.copy_(in);
+          graph_labels.copy_(lab);
+        }
 
-      // 4. Read loss from graph output
-      accum_loss_tensor.copy_(graph_loss.detach());
+        // 2. Replay captured forward + backward (single graph launch)
+        train_graph.replay();
+
+        // 3. Accumulate loss
+        accum_loss_tensor.add_(graph_loss.detach());
+      }
     } else
 #endif
     {

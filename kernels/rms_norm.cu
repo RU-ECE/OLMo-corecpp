@@ -1,13 +1,12 @@
 // Fused RMSNorm CUDA kernel - optimized for H100 (sm_90)
-// Warp-level reductions, vectorized loads, float32/float16/bfloat16 support
+// Supports FP32 and BF16 with internal FP32 accumulation for numerical stability
 #include <torch/torch.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
-#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 namespace {
 
-// Warp-level reduction (faster than shared memory for modern GPUs)
 __device__ __forceinline__ float warpReduceSum(float val) {
   #pragma unroll
   for (int offset = 16; offset > 0; offset >>= 1) {
@@ -16,9 +15,8 @@ __device__ __forceinline__ float warpReduceSum(float val) {
   return val;
 }
 
-// Block-level reduction using warp shuffles
 __device__ __forceinline__ float blockReduceSum(float val) {
-  __shared__ float shared[32];  // Max 32 warps per block
+  __shared__ float shared[32];
   int lane = threadIdx.x % 32;
   int wid = threadIdx.x / 32;
 
@@ -27,14 +25,51 @@ __device__ __forceinline__ float blockReduceSum(float val) {
   if (lane == 0) shared[wid] = val;
   __syncthreads();
 
-  // First warp reduces across warps
   val = (threadIdx.x < blockDim.x / 32) ? shared[lane] : 0.0f;
   if (wid == 0) val = warpReduceSum(val);
   return val;
 }
 
-// Vectorized RMSNorm kernel - processes 4 floats at a time
+// Templated RMSNorm kernel: works with float and __nv_bfloat16
+// Internal math always in FP32 for stability
+template <typename T>
 __global__ void rms_norm_fwd_kernel(
+    const T* __restrict__ x,
+    const T* __restrict__ weight,
+    T* __restrict__ out,
+    int64_t dim,
+    float eps) {
+  int64_t row = blockIdx.x;
+  const T* row_x = x + row * dim;
+  T* row_out = out + row * dim;
+
+  // Sum of squares in FP32
+  float sum_sq = 0.0f;
+  for (int64_t i = threadIdx.x; i < dim; i += blockDim.x) {
+    float v = static_cast<float>(row_x[i]);
+    sum_sq += v * v;
+  }
+
+  sum_sq = blockReduceSum(sum_sq);
+
+  __shared__ float s_rms_scale;
+  if (threadIdx.x == 0) {
+    s_rms_scale = rsqrtf(sum_sq / static_cast<float>(dim) + eps);
+  }
+  __syncthreads();
+
+  float scale = s_rms_scale;
+
+  // Normalize and write
+  for (int64_t i = threadIdx.x; i < dim; i += blockDim.x) {
+    float v = static_cast<float>(row_x[i]) * scale;
+    if (weight) v *= static_cast<float>(weight[i]);
+    row_out[i] = static_cast<T>(v);
+  }
+}
+
+// Vectorized FP32 specialization (4 floats at a time)
+__global__ void rms_norm_fwd_f32_vec(
     const float* __restrict__ x,
     const float* __restrict__ weight,
     float* __restrict__ out,
@@ -44,7 +79,6 @@ __global__ void rms_norm_fwd_kernel(
   const float* row_x = x + row * dim;
   float* row_out = out + row * dim;
 
-  // Vectorized sum of squares
   float sum_sq = 0.0f;
   int64_t vec_dim = dim / 4;
   const float4* x4 = reinterpret_cast<const float4*>(row_x);
@@ -53,7 +87,6 @@ __global__ void rms_norm_fwd_kernel(
     float4 v = x4[i];
     sum_sq += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
   }
-  // Handle remaining elements
   for (int64_t i = vec_dim * 4 + threadIdx.x; i < dim; i += blockDim.x) {
     float v = row_x[i];
     sum_sq += v * v;
@@ -69,7 +102,6 @@ __global__ void rms_norm_fwd_kernel(
 
   float scale = s_rms_scale;
 
-  // Vectorized output write
   float4* out4 = reinterpret_cast<float4*>(row_out);
   const float4* w4 = weight ? reinterpret_cast<const float4*>(weight) : nullptr;
 
@@ -97,43 +129,27 @@ __global__ void rms_norm_fwd_kernel(
   }
 }
 
-// Fused residual + RMSNorm: out = rms_norm(x + residual) * weight
-// Saves one full read/write of d_model vs doing add then norm separately
+// Fused residual + RMSNorm (templated for FP32/BF16)
+template <typename T>
 __global__ void residual_rms_norm_fwd_kernel(
-    const float* __restrict__ x,
-    const float* __restrict__ residual,
-    const float* __restrict__ weight,
-    float* __restrict__ out,
-    float* __restrict__ residual_out,  // x + residual (needed for backward / next block)
+    const T* __restrict__ x,
+    const T* __restrict__ residual,
+    const T* __restrict__ weight,
+    T* __restrict__ out,
+    T* __restrict__ residual_out,
     int64_t dim,
     float eps) {
   int64_t row = blockIdx.x;
-  const float* row_x = x + row * dim;
-  const float* row_res = residual + row * dim;
-  float* row_out = out + row * dim;
-  float* row_res_out = residual_out + row * dim;
+  const T* row_x = x + row * dim;
+  const T* row_res = residual + row * dim;
+  T* row_out = out + row * dim;
+  T* row_res_out = residual_out + row * dim;
 
   float sum_sq = 0.0f;
-  int64_t vec_dim = dim / 4;
-  const float4* x4 = reinterpret_cast<const float4*>(row_x);
-  const float4* res4 = reinterpret_cast<const float4*>(row_res);
-  float4* res_out4 = reinterpret_cast<float4*>(row_res_out);
 
-  // Fused: add residual + compute sum of squares in single pass
-  for (int64_t i = threadIdx.x; i < vec_dim; i += blockDim.x) {
-    float4 xv = x4[i];
-    float4 rv = res4[i];
-    float4 h;
-    h.x = xv.x + rv.x;
-    h.y = xv.y + rv.y;
-    h.z = xv.z + rv.z;
-    h.w = xv.w + rv.w;
-    res_out4[i] = h;
-    sum_sq += h.x * h.x + h.y * h.y + h.z * h.z + h.w * h.w;
-  }
-  for (int64_t i = vec_dim * 4 + threadIdx.x; i < dim; i += blockDim.x) {
-    float h = row_x[i] + row_res[i];
-    row_res_out[i] = h;
+  for (int64_t i = threadIdx.x; i < dim; i += blockDim.x) {
+    float h = static_cast<float>(row_x[i]) + static_cast<float>(row_res[i]);
+    row_res_out[i] = static_cast<T>(h);
     sum_sq += h * h;
   }
 
@@ -147,37 +163,16 @@ __global__ void residual_rms_norm_fwd_kernel(
 
   float scale = s_rms_scale;
 
-  // Normalize and write output (reads from residual_out which is in L2 cache)
-  float4* out4 = reinterpret_cast<float4*>(row_out);
-  const float4* w4 = weight ? reinterpret_cast<const float4*>(weight) : nullptr;
-
-  for (int64_t i = threadIdx.x; i < vec_dim; i += blockDim.x) {
-    float4 h = res_out4[i];
-    float4 r;
-    if (w4) {
-      float4 w = w4[i];
-      r.x = h.x * scale * w.x;
-      r.y = h.y * scale * w.y;
-      r.z = h.z * scale * w.z;
-      r.w = h.w * scale * w.w;
-    } else {
-      r.x = h.x * scale;
-      r.y = h.y * scale;
-      r.z = h.z * scale;
-      r.w = h.w * scale;
-    }
-    out4[i] = r;
-  }
-  for (int64_t i = vec_dim * 4 + threadIdx.x; i < dim; i += blockDim.x) {
-    float h = row_res_out[i] * scale;
-    if (weight) h *= weight[i];
-    row_out[i] = h;
+  for (int64_t i = threadIdx.x; i < dim; i += blockDim.x) {
+    float h = static_cast<float>(row_res_out[i]) * scale;
+    if (weight) h *= static_cast<float>(weight[i]);
+    row_out[i] = static_cast<T>(h);
   }
 }
 
 }  // namespace
 
-// C++ entry points
+// C++ entry points with dtype dispatch
 
 torch::Tensor rms_norm_cuda_impl(
     const torch::Tensor& x,
@@ -190,14 +185,26 @@ torch::Tensor rms_norm_cuda_impl(
   auto out = torch::empty_like(x_contig);
   c10::cuda::CUDAGuard device_guard(x.device());
 
-  // Choose block size based on hidden dim
   int threads = (dim <= 256) ? 128 : 256;
-  rms_norm_fwd_kernel<<<rows, threads>>>(
-      x_contig.data_ptr<float>(),
-      weight.has_value() ? weight->data_ptr<float>() : nullptr,
-      out.data_ptr<float>(),
-      dim,
-      static_cast<float>(eps));
+
+  if (x.scalar_type() == torch::kFloat32) {
+    rms_norm_fwd_f32_vec<<<rows, threads>>>(
+        x_contig.data_ptr<float>(),
+        weight.has_value() ? weight->contiguous().data_ptr<float>() : nullptr,
+        out.data_ptr<float>(),
+        dim,
+        static_cast<float>(eps));
+  } else if (x.scalar_type() == torch::kBFloat16) {
+    auto w_contig = weight.has_value() ? weight->contiguous().to(torch::kBFloat16) : torch::Tensor();
+    rms_norm_fwd_kernel<__nv_bfloat16><<<rows, threads>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x_contig.data_ptr<at::BFloat16>()),
+        w_contig.defined() ? reinterpret_cast<const __nv_bfloat16*>(w_contig.data_ptr<at::BFloat16>()) : nullptr,
+        reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
+        dim,
+        static_cast<float>(eps));
+  } else {
+    TORCH_CHECK(false, "rms_norm CUDA: unsupported dtype (need fp32 or bf16)");
+  }
   return out;
 }
 
@@ -216,14 +223,29 @@ std::vector<torch::Tensor> residual_rms_norm_cuda_impl(
   c10::cuda::CUDAGuard device_guard(x.device());
 
   int threads = (dim <= 256) ? 128 : 256;
-  residual_rms_norm_fwd_kernel<<<rows, threads>>>(
-      x_contig.data_ptr<float>(),
-      res_contig.data_ptr<float>(),
-      weight.has_value() ? weight->data_ptr<float>() : nullptr,
-      out.data_ptr<float>(),
-      residual_out.data_ptr<float>(),
-      dim,
-      static_cast<float>(eps));
+
+  if (x.scalar_type() == torch::kFloat32) {
+    residual_rms_norm_fwd_kernel<float><<<rows, threads>>>(
+        x_contig.data_ptr<float>(),
+        res_contig.data_ptr<float>(),
+        weight.has_value() ? weight->contiguous().data_ptr<float>() : nullptr,
+        out.data_ptr<float>(),
+        residual_out.data_ptr<float>(),
+        dim,
+        static_cast<float>(eps));
+  } else if (x.scalar_type() == torch::kBFloat16) {
+    auto w_contig = weight.has_value() ? weight->contiguous().to(torch::kBFloat16) : torch::Tensor();
+    residual_rms_norm_fwd_kernel<__nv_bfloat16><<<rows, threads>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x_contig.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(res_contig.data_ptr<at::BFloat16>()),
+        w_contig.defined() ? reinterpret_cast<const __nv_bfloat16*>(w_contig.data_ptr<at::BFloat16>()) : nullptr,
+        reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
+        reinterpret_cast<__nv_bfloat16*>(residual_out.data_ptr<at::BFloat16>()),
+        dim,
+        static_cast<float>(eps));
+  } else {
+    TORCH_CHECK(false, "residual_rms_norm CUDA: unsupported dtype");
+  }
   return {out, residual_out};
 }
 

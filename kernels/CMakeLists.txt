@@ -13,12 +13,13 @@ target_include_directories(olmo_kernels PRIVATE
 target_link_libraries(olmo_kernels PRIVATE ${TORCH_LIBRARIES} CUDA::cudart)
 
 # CUDA compilation flags: fast math + architecture-aware optimization
+# BF16 intrinsics require sm_80+; H100 = sm_90
+set(CMAKE_CUDA_ARCHITECTURES "70;80;90" CACHE STRING "CUDA architectures")
 target_compile_options(olmo_kernels PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:
         -O3
         --use_fast_math
         --expt-relaxed-constexpr
-        -Xptxas=-v
     >
 )
 set_target_properties(olmo_kernels PROPERTIES

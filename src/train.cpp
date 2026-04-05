@@ -707,7 +707,7 @@ void train(
     // allocator records allocations on that stream's memory pool.
     if (rank == 0) std::cout << "CUDA Graph: warming up (3 steps)...\n";
     {
-      at::cuda::CUDAStreamGuard stream_guard(capture_stream);
+      c10::cuda::CUDAStreamGuard stream_guard(capture_stream);
       for (int w = 0; w < 3; ++w) {
         if (dataset) {
           auto [in, lab] = dataset->get_batch(cfg.batch_size, device);
@@ -742,7 +742,7 @@ void train(
     }
 
     {
-      at::cuda::CUDAStreamGuard stream_guard(capture_stream);
+      c10::cuda::CUDAStreamGuard stream_guard(capture_stream);
 
       // Must use memset zero_grad (not set_to_none) — graph references
       // specific gradient tensor addresses that must remain valid.

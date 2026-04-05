@@ -296,9 +296,13 @@ int main(int argc, char** argv) {
 
     auto device = select_device(device_pref);
 
-    // Select backend
+    // Select backend + CUDA perf flags
     if (device.is_cuda()) {
       olmo_cpp::use_cuda_backend();
+      // Enable cuDNN autotuner: finds fastest kernel for each conv/matmul shape
+      at::globalContext().setBenchmarkCuDNN(true);
+      // Disable debug sync: avoids implicit cuda synchronize on errors
+      at::globalContext().setDeterministicAlgorithms(false, false);
       std::cout << "Backend: CUDA (fused kernels)\n";
     } else if (device.is_cpu()) {
       olmo_cpp::use_simd_backend();

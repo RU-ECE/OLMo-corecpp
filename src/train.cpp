@@ -8,6 +8,7 @@
 #include <ATen/cuda/CUDAGraph.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDACachingAllocator.h>
 #endif
 #include "olmo_cpp/distributed/ddp.hpp"
 #include "olmo_cpp/optim/lion.hpp"
@@ -740,6 +741,11 @@ void train(
       std::cout << "CUDA Graph: capturing forward+backward"
                 << " (will replay " << cfg.grad_accum_steps << "x per step)...\n";
     }
+
+    // Release reserved-but-unused memory from warmup so the graph's private
+    // pool can allocate. Without this, the caching allocator holds ~50+ GiB
+    // reserved for the default pool, starving the capture pool.
+    c10::cuda::CUDACachingAllocator::emptyCache();
 
     {
       c10::cuda::CUDAStreamGuard stream_guard(capture_stream);

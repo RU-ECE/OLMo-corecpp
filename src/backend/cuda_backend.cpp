@@ -6,25 +6,20 @@
 
 namespace olmo_cpp {
 
-// CUDA kernels are compiled for FP32. Under BF16 autocast, inputs arrive as
-// BF16. We promote to FP32, run the fused kernel (1 pass), then cast back.
-// This is MUCH faster than the fallback (5+ separate ATen kernels in BF16).
+// Try to call the registered CUDA kernel via torch::Dispatcher.
+// If olmo_kernels library is loaded, these dispatch to our fused CUDA kernels.
+// If not (e.g., CPU build), fall back to default ATen implementation.
 
 torch::Tensor CUDABackend::rms_norm(torch::Tensor x, torch::Tensor weight, double eps) {
 #ifdef OLMO_HAS_CUDA_KERNELS
-  if (x.is_cuda()) {
-    auto orig_dtype = x.scalar_type();
-    bool need_cast = (orig_dtype != torch::kFloat32);
-    auto x_f32 = need_cast ? x.to(torch::kFloat32) : x;
-    auto w_f32 = (weight.defined() && need_cast) ? weight.to(torch::kFloat32) : weight;
+  if (x.is_cuda() && x.scalar_type() == torch::kFloat32) {
     try {
       auto op = torch::Dispatcher::singleton()
           .findSchemaOrThrow("olmo_ops::rms_norm", "");
-      c10::optional<torch::Tensor> w = w_f32.defined()
-          ? c10::optional<torch::Tensor>(w_f32) : c10::nullopt;
-      auto result = op.typed<torch::Tensor(const torch::Tensor&, const c10::optional<torch::Tensor>&, double)>()
-          .call(x_f32, w, eps);
-      return need_cast ? result.to(orig_dtype) : result;
+      c10::optional<torch::Tensor> w = weight.defined()
+          ? c10::optional<torch::Tensor>(weight) : c10::nullopt;
+      return op.typed<torch::Tensor(const torch::Tensor&, const c10::optional<torch::Tensor>&, double)>()
+          .call(x, w, eps);
     } catch (...) {
       // Fall through to default
     }
@@ -35,17 +30,12 @@ torch::Tensor CUDABackend::rms_norm(torch::Tensor x, torch::Tensor weight, doubl
 
 torch::Tensor CUDABackend::silu_mul(torch::Tensor gate, torch::Tensor up) {
 #ifdef OLMO_HAS_CUDA_KERNELS
-  if (gate.is_cuda()) {
-    auto orig_dtype = gate.scalar_type();
-    bool need_cast = (orig_dtype != torch::kFloat32);
-    auto gate_f32 = need_cast ? gate.to(torch::kFloat32) : gate;
-    auto up_f32 = need_cast ? up.to(torch::kFloat32) : up;
+  if (gate.is_cuda() && gate.scalar_type() == torch::kFloat32) {
     try {
       auto op = torch::Dispatcher::singleton()
           .findSchemaOrThrow("olmo_ops::silu_mul", "");
-      auto result = op.typed<torch::Tensor(const torch::Tensor&, const torch::Tensor&)>()
-          .call(gate_f32, up_f32);
-      return need_cast ? result.to(orig_dtype) : result;
+      return op.typed<torch::Tensor(const torch::Tensor&, const torch::Tensor&)>()
+          .call(gate, up);
     } catch (...) {
       // Fall through to default
     }
@@ -56,18 +46,12 @@ torch::Tensor CUDABackend::silu_mul(torch::Tensor gate, torch::Tensor up) {
 
 torch::Tensor CUDABackend::apply_rope(torch::Tensor t, torch::Tensor sin, torch::Tensor cos) {
 #ifdef OLMO_HAS_CUDA_KERNELS
-  if (t.is_cuda()) {
-    auto orig_dtype = t.scalar_type();
-    bool need_cast = (orig_dtype != torch::kFloat32);
-    auto t_f32 = need_cast ? t.to(torch::kFloat32) : t;
-    auto sin_f32 = need_cast ? sin.to(torch::kFloat32) : sin;
-    auto cos_f32 = need_cast ? cos.to(torch::kFloat32) : cos;
+  if (t.is_cuda() && t.scalar_type() == torch::kFloat32) {
     try {
       auto op = torch::Dispatcher::singleton()
           .findSchemaOrThrow("olmo_ops::apply_rope", "");
-      auto result = op.typed<torch::Tensor(const torch::Tensor&, const torch::Tensor&, const torch::Tensor&)>()
-          .call(t_f32, cos_f32, sin_f32);
-      return need_cast ? result.to(orig_dtype) : result;
+      return op.typed<torch::Tensor(const torch::Tensor&, const torch::Tensor&, const torch::Tensor&)>()
+          .call(t, cos, sin);
     } catch (...) {
       // Fall through to default
     }
@@ -79,22 +63,19 @@ torch::Tensor CUDABackend::apply_rope(torch::Tensor t, torch::Tensor sin, torch:
 torch::Tensor CUDABackend::residual_rms_norm(torch::Tensor x, torch::Tensor residual,
                                                torch::Tensor weight, double eps) {
 #ifdef OLMO_HAS_CUDA_KERNELS
-  if (x.is_cuda()) {
-    auto orig_dtype = x.scalar_type();
-    bool need_cast = (orig_dtype != torch::kFloat32);
-    auto x_f32 = need_cast ? x.to(torch::kFloat32) : x;
-    auto res_f32 = need_cast ? residual.to(torch::kFloat32) : residual;
-    auto w_f32 = (weight.defined() && need_cast) ? weight.to(torch::kFloat32) : weight;
+  if (x.is_cuda() && x.scalar_type() == torch::kFloat32) {
     try {
       auto op = torch::Dispatcher::singleton()
           .findSchemaOrThrow("olmo_ops::residual_rms_norm", "");
-      c10::optional<torch::Tensor> w = w_f32.defined()
-          ? c10::optional<torch::Tensor>(w_f32) : c10::nullopt;
+      c10::optional<torch::Tensor> w = weight.defined()
+          ? c10::optional<torch::Tensor>(weight) : c10::nullopt;
       auto results = op.typed<std::vector<torch::Tensor>(
           const torch::Tensor&, const torch::Tensor&,
           const c10::optional<torch::Tensor>&, double)>()
-          .call(x_f32, res_f32, w, eps);
-      return need_cast ? results[0].to(orig_dtype) : results[0];
+          .call(x, residual, w, eps);
+      // Returns normed output; residual_out (x + residual) is results[1]
+      // but our interface only returns the normed result
+      return results[0];
     } catch (...) {
       // Fall through to default
     }

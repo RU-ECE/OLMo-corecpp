@@ -170,10 +170,10 @@ torch::Tensor apply_rope_cuda(
 
   if (x.scalar_type() == torch::kBFloat16) {
     apply_rope_bf16_kernel<<<blocks, threads>>>(
-        x_c.data_ptr<at::BFloat16>(),
-        cos_c.data_ptr<at::BFloat16>(),
-        sin_c.data_ptr<at::BFloat16>(),
-        out.data_ptr<at::BFloat16>(),
+        reinterpret_cast<const __nv_bfloat16*>(x_c.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(cos_c.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(sin_c.data_ptr<at::BFloat16>()),
+        reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
         numel, dim);
   } else {
     apply_rope_f32_kernel<<<blocks, threads>>>(
@@ -215,14 +215,14 @@ std::vector<torch::Tensor> apply_rope_qk_cuda(
 
   if (q.scalar_type() == torch::kBFloat16) {
     apply_rope_qk_bf16_kernel<<<blocks, threads>>>(
-        q_c.data_ptr<at::BFloat16>(),
-        k_c.data_ptr<at::BFloat16>(),
-        cos_q_c.data_ptr<at::BFloat16>(),
-        sin_q_c.data_ptr<at::BFloat16>(),
-        cos_k_c.data_ptr<at::BFloat16>(),
-        sin_k_c.data_ptr<at::BFloat16>(),
-        q_out.data_ptr<at::BFloat16>(),
-        k_out.data_ptr<at::BFloat16>(),
+        reinterpret_cast<const __nv_bfloat16*>(q_c.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(k_c.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(cos_q_c.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(sin_q_c.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(cos_k_c.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(sin_k_c.data_ptr<at::BFloat16>()),
+        reinterpret_cast<__nv_bfloat16*>(q_out.data_ptr<at::BFloat16>()),
+        reinterpret_cast<__nv_bfloat16*>(k_out.data_ptr<at::BFloat16>()),
         q_total, k_total, dim);
   } else {
     apply_rope_qk_f32_kernel<<<blocks, threads>>>(

@@ -38,22 +38,19 @@ if(CMAKE_CUDA_COMPILER)
     add_compile_definitions(USE_CUDA=1)
     message(STATUS "CUDA found: ${CMAKE_CUDA_COMPILER} (version ${CMAKE_CUDA_COMPILER_VERSION})")
 
-    # GPU architecture: auto-detect or use H100 (sm_90) as default
-    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-        # Detect GPU at build time; fall back to broad compatibility
-        include(FindCUDAToolkit)
-        if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.0")
-            set(CMAKE_CUDA_ARCHITECTURES "70;80;90")  # V100, A100, H100
-            message(STATUS "CUDA 12+: targeting sm_70, sm_80, sm_90 (H100)")
-        elseif(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "11.0")
-            set(CMAKE_CUDA_ARCHITECTURES "70;80")
-            message(STATUS "CUDA 11: targeting sm_70, sm_80")
-        else()
-            set(CMAKE_CUDA_ARCHITECTURES "70")
-            message(STATUS "CUDA <11: targeting sm_70")
-        endif()
+    # GPU architecture: always set based on toolkit version
+    # (CMake 3.24+ auto-populates CMAKE_CUDA_ARCHITECTURES with sm_52 default,
+    #  which doesn't support BF16 intrinsics — we must override it)
+    include(FindCUDAToolkit)
+    if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.0")
+        set(CMAKE_CUDA_ARCHITECTURES "80;90" CACHE STRING "" FORCE)
+        message(STATUS "CUDA 12+: targeting sm_80 (A100), sm_90 (H100)")
+    elseif(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "11.0")
+        set(CMAKE_CUDA_ARCHITECTURES "80" CACHE STRING "" FORCE)
+        message(STATUS "CUDA 11: targeting sm_80 (A100)")
     else()
-        message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
+        set(CMAKE_CUDA_ARCHITECTURES "70" CACHE STRING "" FORCE)
+        message(STATUS "CUDA <11: targeting sm_70 (V100, no BF16 kernel support)")
     endif()
 endif()
 

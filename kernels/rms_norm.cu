@@ -263,9 +263,9 @@ torch::Tensor rms_norm_cuda_impl(
 
   if (x.scalar_type() == torch::kBFloat16) {
     rms_norm_bf16_kernel<<<rows, threads>>>(
-        x_contig.data_ptr<at::BFloat16>(),
-        weight.has_value() ? weight->data_ptr<at::BFloat16>() : nullptr,
-        out.data_ptr<at::BFloat16>(),
+        reinterpret_cast<const __nv_bfloat16*>(x_contig.data_ptr<at::BFloat16>()),
+        weight.has_value() ? reinterpret_cast<const __nv_bfloat16*>(weight->data_ptr<at::BFloat16>()) : nullptr,
+        reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
         dim, static_cast<float>(eps));
   } else {
     rms_norm_f32_kernel<<<rows, threads>>>(
@@ -295,11 +295,11 @@ std::vector<torch::Tensor> residual_rms_norm_cuda_impl(
 
   if (x.scalar_type() == torch::kBFloat16) {
     residual_rms_norm_bf16_kernel<<<rows, threads>>>(
-        x_contig.data_ptr<at::BFloat16>(),
-        res_contig.data_ptr<at::BFloat16>(),
-        weight.has_value() ? weight->data_ptr<at::BFloat16>() : nullptr,
-        out.data_ptr<at::BFloat16>(),
-        residual_out.data_ptr<at::BFloat16>(),
+        reinterpret_cast<const __nv_bfloat16*>(x_contig.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(res_contig.data_ptr<at::BFloat16>()),
+        weight.has_value() ? reinterpret_cast<const __nv_bfloat16*>(weight->data_ptr<at::BFloat16>()) : nullptr,
+        reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
+        reinterpret_cast<__nv_bfloat16*>(residual_out.data_ptr<at::BFloat16>()),
         dim, static_cast<float>(eps));
   } else {
     residual_rms_norm_f32_kernel<<<rows, threads>>>(

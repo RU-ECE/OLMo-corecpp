@@ -78,9 +78,9 @@ torch::Tensor silu_mul_cuda_impl(
 
   if (gate.scalar_type() == torch::kBFloat16) {
     silu_mul_bf16_kernel<<<blocks, threads>>>(
-        gate_c.data_ptr<at::BFloat16>(),
-        up_c.data_ptr<at::BFloat16>(),
-        out.data_ptr<at::BFloat16>(),
+        reinterpret_cast<const __nv_bfloat16*>(gate_c.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(up_c.data_ptr<at::BFloat16>()),
+        reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
         n);
   } else {
     silu_mul_f32_kernel<<<blocks, threads>>>(

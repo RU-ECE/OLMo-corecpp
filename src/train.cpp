@@ -634,10 +634,11 @@ void train(
                               cfg.use_amp, true);
   }
 
-  // Pre-build DDP parameter list once (avoids per-step allocation)
+  // Pre-build param list once (avoids per-step vector allocation)
+  auto model_params = model->parameters();
   std::vector<torch::Tensor> ddp_params;
   if (ddp && ddp->is_distributed()) {
-    for (auto& p : model->parameters()) ddp_params.push_back(p);
+    for (auto& p : model_params) ddp_params.push_back(p);
   }
 
   // Epoch tracking
@@ -649,12 +650,17 @@ void train(
   double epoch_loss_sum = 0.0;
   int64_t epoch_loss_count = 0;
 
+  // Pre-allocate loss accumulator on device (avoid per-step allocation)
+  torch::Tensor accum_loss_tensor = torch::zeros({}, torch::TensorOptions().device(device));
+  // Pre-allocate accum_loss scalar for deferred D2H sync
+  float last_logged_loss = 0.0f;
+
   auto train_start = std::chrono::steady_clock::now();
   int64_t total_tokens = 0;
 
+  // ---- Training loop ----
   for (int64_t step = 0; step < cfg.num_steps; ++step) {
     auto step_start = std::chrono::steady_clock::now();
-    double cur_lr = scheduler->get_lr(step, cfg.num_steps);
     scheduler->apply(*optimizer, step, cfg.num_steps);
 
     // Epoch boundary detection
@@ -668,8 +674,9 @@ void train(
       current_epoch = new_epoch;
     }
 
-    optimizer->zero_grad();
-    torch::Tensor accum_loss_tensor = torch::zeros({}, torch::TensorOptions().device(device));
+    // zero_grad with set_to_none=true: avoids memset kernel, just nulls .grad
+    optimizer->zero_grad(/*set_to_none=*/true);
+    accum_loss_tensor.zero_();
 
     for (int64_t accum = 0; accum < cfg.grad_accum_steps; ++accum) {
       torch::Tensor input, labels;
@@ -690,30 +697,33 @@ void train(
         loss = model->forward(input, labels, -100) / static_cast<float>(cfg.grad_accum_steps);
       }
       loss.backward();
-      accum_loss_tensor.add_(loss.detach().sum());
+      // Accumulate on GPU — no CPU sync
+      accum_loss_tensor.add_(loss.detach());
     }
 
     if (ddp && ddp->is_distributed()) {
       ddp->allreduce_gradients(ddp_params);
     }
 
-    clip_grad_norm_gpu(model->parameters(), cfg.max_grad_norm);
+    clip_grad_norm_gpu(model_params, cfg.max_grad_norm);
     optimizer->step();
 
     total_tokens += tokens_per_step;
 
+    // Only pull loss from GPU when actually logging (avoids D2H sync stall)
     if (step % cfg.log_interval == 0 && rank == 0) {
-      float accum_loss = accum_loss_tensor.item<float>();
-      epoch_loss_sum += accum_loss;
+      last_logged_loss = accum_loss_tensor.item<float>();
+      epoch_loss_sum += last_logged_loss;
       epoch_loss_count++;
       auto step_end = std::chrono::steady_clock::now();
       double step_ms = std::chrono::duration<double, std::milli>(step_end - step_start).count();
       double elapsed_s = std::chrono::duration<double>(step_end - train_start).count();
       double tok_per_s = total_tokens / (elapsed_s > 0 ? elapsed_s : 1);
+      double cur_lr = scheduler->get_lr(step, cfg.num_steps);
 
       std::cout << "Epoch " << current_epoch
                 << " | Step " << step << "/" << cfg.num_steps
-                << "  loss: " << std::fixed << std::setprecision(4) << accum_loss
+                << "  loss: " << std::fixed << std::setprecision(4) << last_logged_loss
                 << "  lr: " << std::scientific << std::setprecision(2) << cur_lr
                 << "  step_ms: " << static_cast<int>(step_ms)
                 << "  tok/s: " << static_cast<int>(tok_per_s)

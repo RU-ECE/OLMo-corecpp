@@ -7,7 +7,7 @@
 #ifdef USE_CUDA
 #include <ATen/cuda/CUDAGraph.h>
 #include <c10/cuda/CUDAStream.h>
-#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #endif
 #include "olmo_cpp/distributed/ddp.hpp"
 #include "olmo_cpp/optim/lion.hpp"

@@ -18,7 +18,6 @@ target_compile_options(olmo_kernels PRIVATE
         -O3
         --use_fast_math
         --expt-relaxed-constexpr
-        -Xptxas=-v
     >
 )
 set_target_properties(olmo_kernels PROPERTIES

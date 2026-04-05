@@ -1,10 +1,9 @@
-// Fused SiLU(gate) * up CUDA kernel
-// Eliminates intermediate tensor allocation between SiLU and multiply.
-// On H100: saves ~2x memory bandwidth (read gate, read up, write output vs
-// read gate, write silu_gate, read silu_gate, read up, write output).
+// Fused SiLU(gate) * up CUDA kernel — FP32 and BF16
+// BF16: reads __nv_bfloat16, computes SiLU in FP32, writes __nv_bfloat16
 #include <torch/torch.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 
 namespace {
 
@@ -12,8 +11,9 @@ __device__ __forceinline__ float silu(float x) {
   return x / (1.0f + expf(-x));
 }
 
-// Vectorized SiLU*Mul: 4 elements at a time
-__global__ void silu_mul_kernel(
+// ---- FP32 vectorized ----
+
+__global__ void silu_mul_f32_kernel(
     const float* __restrict__ gate,
     const float* __restrict__ up,
     float* __restrict__ out,
@@ -21,7 +21,6 @@ __global__ void silu_mul_kernel(
   int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
 
-  // Process 4 elements at a time
   int64_t vec_n = n / 4;
   const float4* gate4 = reinterpret_cast<const float4*>(gate);
   const float4* up4 = reinterpret_cast<const float4*>(up);
@@ -38,9 +37,25 @@ __global__ void silu_mul_kernel(
     out4[i] = r;
   }
 
-  // Handle tail elements
   for (int64_t i = vec_n * 4 + idx; i < n; i += stride) {
     out[i] = silu(gate[i]) * up[i];
+  }
+}
+
+// ---- BF16 with FP32 compute ----
+
+__global__ void silu_mul_bf16_kernel(
+    const __nv_bfloat16* __restrict__ gate,
+    const __nv_bfloat16* __restrict__ up,
+    __nv_bfloat16* __restrict__ out,
+    int64_t n) {
+  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+
+  for (int64_t i = idx; i < n; i += stride) {
+    float g = __bfloat162float(gate[i]);
+    float u = __bfloat162float(up[i]);
+    out[i] = __float2bfloat16(silu(g) * u);
   }
 }
 
@@ -61,11 +76,19 @@ torch::Tensor silu_mul_cuda_impl(
   int blocks = std::min(static_cast<int64_t>((n + threads - 1) / threads),
                         static_cast<int64_t>(65535));
 
-  silu_mul_kernel<<<blocks, threads>>>(
-      gate_c.data_ptr<float>(),
-      up_c.data_ptr<float>(),
-      out.data_ptr<float>(),
-      n);
+  if (gate.scalar_type() == torch::kBFloat16) {
+    silu_mul_bf16_kernel<<<blocks, threads>>>(
+        gate_c.data_ptr<at::BFloat16>(),
+        up_c.data_ptr<at::BFloat16>(),
+        out.data_ptr<at::BFloat16>(),
+        n);
+  } else {
+    silu_mul_f32_kernel<<<blocks, threads>>>(
+        gate_c.data_ptr<float>(),
+        up_c.data_ptr<float>(),
+        out.data_ptr<float>(),
+        n);
+  }
   return out;
 }
 

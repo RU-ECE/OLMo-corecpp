@@ -1,18 +1,15 @@
-// Fused RoPE CUDA kernels
-// 1. apply_rope: Single tensor RoPE application
-// 2. apply_rope_qk: Fused Q+K RoPE in single kernel launch (halves launch overhead)
-//
-// On H100: RoPE is memory-bandwidth-bound. Fusing Q+K avoids 2 kernel launches
-// and keeps both tensors in L2 cache.
+// Fused RoPE CUDA kernels — FP32 and BF16
+// BF16: reads __nv_bfloat16, rotates in FP32, writes __nv_bfloat16
 #include <torch/torch.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 
 namespace {
 
-// Single-tensor RoPE: out = x * cos + rotate_half(x) * sin
-// Vectorized with float4 loads
-__global__ void apply_rope_kernel(
+// ---- FP32 single-tensor RoPE ----
+
+__global__ void apply_rope_f32_kernel(
     const float* __restrict__ x,
     const float* __restrict__ cos_buf,
     const float* __restrict__ sin_buf,
@@ -27,8 +24,6 @@ __global__ void apply_rope_kernel(
     int64_t col = i % dim;
     int64_t row = i / dim;
     float x_val = x[i];
-    // rotate_half: for col < half, paired with x[row*dim + col + half] (negated)
-    //              for col >= half, paired with x[row*dim + col - half]
     float x_rot;
     if (col < half) {
       x_rot = -x[row * dim + col + half];
@@ -39,12 +34,38 @@ __global__ void apply_rope_kernel(
   }
 }
 
-// Fused Q+K RoPE: applies RoPE to both Q and K in a single kernel launch
-// Q: [B, n_heads, q_len, head_dim]
-// K: [B, n_kv_heads, k_len, head_dim]
-// cos_q/sin_q: [q_len, head_dim] (broadcast over batch and heads)
-// cos_k/sin_k: [k_len, head_dim] (broadcast over batch and heads)
-__global__ void apply_rope_qk_kernel(
+// ---- BF16 single-tensor RoPE with FP32 compute ----
+
+__global__ void apply_rope_bf16_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ cos_buf,
+    const __nv_bfloat16* __restrict__ sin_buf,
+    __nv_bfloat16* __restrict__ out,
+    int64_t total_elements,
+    int64_t dim) {
+  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  int64_t half = dim / 2;
+
+  for (int64_t i = idx; i < total_elements; i += stride) {
+    int64_t col = i % dim;
+    int64_t row = i / dim;
+    float x_val = __bfloat162float(x[i]);
+    float x_rot;
+    if (col < half) {
+      x_rot = -__bfloat162float(x[row * dim + col + half]);
+    } else {
+      x_rot = __bfloat162float(x[row * dim + col - half]);
+    }
+    float c = __bfloat162float(cos_buf[col]);
+    float s = __bfloat162float(sin_buf[col]);
+    out[i] = __float2bfloat16(x_val * c + x_rot * s);
+  }
+}
+
+// ---- FP32 fused Q+K RoPE ----
+
+__global__ void apply_rope_qk_f32_kernel(
     const float* __restrict__ q,
     const float* __restrict__ k,
     const float* __restrict__ cos_q,
@@ -79,14 +100,56 @@ __global__ void apply_rope_qk_kernel(
     } else {
       x_rot = src[row * dim + col - half];
     }
-    // cos/sin are [seq_len, dim], we need position within the sequence
-    // Position in sequence = (local_i / dim) % seq_len
-    // But cos/sin are broadcast, so we just use col index
     dst[local_i] = x_val * cos_ptr[col] + x_rot * sin_ptr[col];
   }
 }
 
+// ---- BF16 fused Q+K RoPE ----
+
+__global__ void apply_rope_qk_bf16_kernel(
+    const __nv_bfloat16* __restrict__ q,
+    const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ cos_q,
+    const __nv_bfloat16* __restrict__ sin_q,
+    const __nv_bfloat16* __restrict__ cos_k,
+    const __nv_bfloat16* __restrict__ sin_k,
+    __nv_bfloat16* __restrict__ q_out,
+    __nv_bfloat16* __restrict__ k_out,
+    int64_t q_total,
+    int64_t k_total,
+    int64_t dim) {
+  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  int64_t half = dim / 2;
+  int64_t combined_total = q_total + k_total;
+
+  for (int64_t i = idx; i < combined_total; i += stride) {
+    bool is_q = (i < q_total);
+    int64_t local_i = is_q ? i : (i - q_total);
+    const __nv_bfloat16* src = is_q ? q : k;
+    __nv_bfloat16* dst = is_q ? q_out : k_out;
+    const __nv_bfloat16* cos_ptr = is_q ? cos_q : cos_k;
+    const __nv_bfloat16* sin_ptr = is_q ? sin_q : sin_k;
+
+    int64_t col = local_i % dim;
+    int64_t row = local_i / dim;
+
+    float x_val = __bfloat162float(src[local_i]);
+    float x_rot;
+    if (col < half) {
+      x_rot = -__bfloat162float(src[row * dim + col + half]);
+    } else {
+      x_rot = __bfloat162float(src[row * dim + col - half]);
+    }
+    float c = __bfloat162float(cos_ptr[col]);
+    float s = __bfloat162float(sin_ptr[col]);
+    dst[local_i] = __float2bfloat16(x_val * c + x_rot * s);
+  }
+}
+
 }  // namespace
+
+// ---- Dispatch ----
 
 torch::Tensor apply_rope_cuda(
     const torch::Tensor& x,
@@ -105,16 +168,20 @@ torch::Tensor apply_rope_cuda(
   int blocks = std::min(static_cast<int64_t>((numel + threads - 1) / threads),
                         static_cast<int64_t>(65535));
 
-  if (x.scalar_type() == torch::kFloat32) {
-    apply_rope_kernel<<<blocks, threads>>>(
+  if (x.scalar_type() == torch::kBFloat16) {
+    apply_rope_bf16_kernel<<<blocks, threads>>>(
+        x_c.data_ptr<at::BFloat16>(),
+        cos_c.data_ptr<at::BFloat16>(),
+        sin_c.data_ptr<at::BFloat16>(),
+        out.data_ptr<at::BFloat16>(),
+        numel, dim);
+  } else {
+    apply_rope_f32_kernel<<<blocks, threads>>>(
         x_c.data_ptr<float>(),
         cos_c.data_ptr<float>(),
         sin_c.data_ptr<float>(),
         out.data_ptr<float>(),
-        numel,
-        dim);
-  } else {
-    TORCH_CHECK(false, "apply_rope CUDA only supports float32 currently");
+        numel, dim);
   }
   return out;
 }
@@ -146,18 +213,29 @@ std::vector<torch::Tensor> apply_rope_qk_cuda(
   int blocks = std::min((combined + threads - 1) / threads,
                         static_cast<int64_t>(65535));
 
-  apply_rope_qk_kernel<<<blocks, threads>>>(
-      q_c.data_ptr<float>(),
-      k_c.data_ptr<float>(),
-      cos_q_c.data_ptr<float>(),
-      sin_q_c.data_ptr<float>(),
-      cos_k_c.data_ptr<float>(),
-      sin_k_c.data_ptr<float>(),
-      q_out.data_ptr<float>(),
-      k_out.data_ptr<float>(),
-      q_total,
-      k_total,
-      dim);
+  if (q.scalar_type() == torch::kBFloat16) {
+    apply_rope_qk_bf16_kernel<<<blocks, threads>>>(
+        q_c.data_ptr<at::BFloat16>(),
+        k_c.data_ptr<at::BFloat16>(),
+        cos_q_c.data_ptr<at::BFloat16>(),
+        sin_q_c.data_ptr<at::BFloat16>(),
+        cos_k_c.data_ptr<at::BFloat16>(),
+        sin_k_c.data_ptr<at::BFloat16>(),
+        q_out.data_ptr<at::BFloat16>(),
+        k_out.data_ptr<at::BFloat16>(),
+        q_total, k_total, dim);
+  } else {
+    apply_rope_qk_f32_kernel<<<blocks, threads>>>(
+        q_c.data_ptr<float>(),
+        k_c.data_ptr<float>(),
+        cos_q_c.data_ptr<float>(),
+        sin_q_c.data_ptr<float>(),
+        cos_k_c.data_ptr<float>(),
+        sin_k_c.data_ptr<float>(),
+        q_out.data_ptr<float>(),
+        k_out.data_ptr<float>(),
+        q_total, k_total, dim);
+  }
 
   return {q_out, k_out};
 }

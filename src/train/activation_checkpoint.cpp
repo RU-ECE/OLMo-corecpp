@@ -1,10 +1,11 @@
 #include "olmo_cpp/train/activation_checkpoint.hpp"
+#include "olmo_cpp/train/autocast_guard.hpp"
 
 namespace olmo_cpp {
 
-// Thread-local storage for the checkpoint function.
+// Thread-local storage for the checkpoint function and device.
 // Only tensors can safely go through autograd Function::apply.
-// The function pointer is set before apply() and read inside forward/backward.
+// These are set before apply() and read inside forward/backward.
 static thread_local std::function<torch::Tensor(torch::Tensor)>* tl_ckpt_fn = nullptr;
 
 // Custom autograd function — only takes a single Tensor through apply()
@@ -20,6 +21,18 @@ class CheckpointFunction : public torch::autograd::Function<CheckpointFunction> 
     // and the caller's stack frame won't exist when backward runs later)
     auto* fn_copy = new std::function<torch::Tensor(torch::Tensor)>(*tl_ckpt_fn);
     ctx->saved_data["fn_ptr"] = reinterpret_cast<int64_t>(fn_copy);
+
+    // Save whether autocast is active so backward can re-enable it.
+    // Without this, recomputation runs without autocast → dtype mismatch
+    // when weights are BF16 but intermediate tensors are FP32.
+    bool has_autocast = false;
+#if defined(OLMO_AUTOCAST_DEVICE_API)
+    has_autocast = at::autocast::is_autocast_enabled(at::kCUDA);
+#elif defined(OLMO_AUTOCAST_GPU_API)
+    has_autocast = at::autocast::is_autocast_gpu_enabled();
+#endif
+    ctx->saved_data["autocast"] = has_autocast;
+    ctx->saved_data["is_cuda"] = input.is_cuda();
 
     // Run forward WITHOUT gradient tracking — this is the memory saving:
     // intermediate activations are NOT stored in the autograd graph
@@ -37,15 +50,19 @@ class CheckpointFunction : public torch::autograd::Function<CheckpointFunction> 
     auto saved = ctx->get_saved_variables();
     auto input = saved[0];
 
-    // Retrieve function pointer
+    // Retrieve function pointer and autocast state
     auto fn = reinterpret_cast<std::function<torch::Tensor(torch::Tensor)>*>(
         ctx->saved_data["fn_ptr"].toInt());
+    bool had_autocast = ctx->saved_data["autocast"].toBool();
+    bool is_cuda = ctx->saved_data["is_cuda"].toBool();
 
-    // Recompute forward pass WITH gradients enabled
+    // Recompute forward pass WITH gradients enabled AND autocast restored
     torch::Tensor input_detached = input.detach().requires_grad_(true);
     torch::Tensor output;
     {
       torch::AutoGradMode enable_grad(true);
+      AutocastGuard ac(had_autocast,
+          is_cuda ? torch::Device(torch::kCUDA) : torch::Device(torch::kCPU));
       output = (*fn)(input_detached);
     }
 

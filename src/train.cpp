@@ -48,66 +48,11 @@ static void write_heartbeat(const std::string& path, int64_t epoch, int64_t step
   std::rename(tmp.c_str(), path.c_str());
 }
 
-// ---------------------------------------------------------------------------
-// RAII autocast guard — portable across ALL PyTorch 2.x versions
-//   CMake detects which API exists at configure time:
-//     OLMO_AUTOCAST_DEVICE_API  — PyTorch >= 2.4 device-parameterized API
-//     OLMO_AUTOCAST_GPU_API     — PyTorch 2.0-2.3 GPU-specific API
-//     (neither)                 — dispatch-key fallback (works on any version)
-// ---------------------------------------------------------------------------
-#include <c10/core/impl/LocalDispatchKeySet.h>
+// AutocastGuard — shared header, portable across all PyTorch 2.x versions
+#include "olmo_cpp/train/autocast_guard.hpp"
+using olmo_cpp::AutocastGuard;
 
 namespace {
-
-struct AutocastGuard {
-  explicit AutocastGuard(bool enabled, torch::Device device) : enabled_(enabled && device.is_cuda()) {
-    if (enabled_) {
-#if defined(OLMO_AUTOCAST_DEVICE_API)
-      prev_enabled_ = at::autocast::is_autocast_enabled(at::kCUDA);
-      prev_dtype_ = at::autocast::get_autocast_dtype(at::kCUDA);
-      at::autocast::set_autocast_enabled(at::kCUDA, true);
-      at::autocast::set_autocast_dtype(at::kCUDA, at::kBFloat16);
-      at::autocast::increment_nesting();
-#elif defined(OLMO_AUTOCAST_GPU_API)
-      prev_enabled_ = at::autocast::is_autocast_gpu_enabled();
-      prev_dtype_ = at::autocast::get_autocast_gpu_dtype();
-      at::autocast::set_autocast_gpu_enabled(true);
-      at::autocast::set_autocast_gpu_dtype(at::kBFloat16);
-      at::autocast::increment_nesting();
-#else
-      // Fallback: enable AutocastCUDA dispatch key directly
-      dk_guard_.emplace(c10::DispatchKey::AutocastCUDA);
-#endif
-    }
-  }
-  ~AutocastGuard() {
-    if (enabled_) {
-#if defined(OLMO_AUTOCAST_DEVICE_API)
-      at::autocast::decrement_nesting();
-      at::autocast::clear_cache();
-      at::autocast::set_autocast_enabled(at::kCUDA, prev_enabled_);
-      at::autocast::set_autocast_dtype(at::kCUDA, prev_dtype_);
-#elif defined(OLMO_AUTOCAST_GPU_API)
-      at::autocast::decrement_nesting();
-      at::autocast::clear_cache();
-      at::autocast::set_autocast_gpu_enabled(prev_enabled_);
-      at::autocast::set_autocast_gpu_dtype(prev_dtype_);
-#else
-      // dk_guard_ destructor removes the dispatch key automatically
-#endif
-    }
-  }
-  AutocastGuard(const AutocastGuard&) = delete;
-  AutocastGuard& operator=(const AutocastGuard&) = delete;
- private:
-  bool enabled_;
-#if defined(OLMO_AUTOCAST_DEVICE_API) || defined(OLMO_AUTOCAST_GPU_API)
-  bool prev_enabled_{false};
-  at::ScalarType prev_dtype_{at::kFloat};
-#else
-  std::optional<c10::impl::IncludeDispatchKeyGuard> dk_guard_;
-#endif
-};
 
 double cosine_warmup_lr(int64_t step, int64_t warmup_steps, double base_lr, int64_t total_steps) {
   if (step < warmup_steps) {

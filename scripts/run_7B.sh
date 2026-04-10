@@ -45,16 +45,9 @@ DISCORD_ALERTS=""
 DISCORD_UPDATES=""
 
 if [[ -f "$ENV_FILE" ]]; then
-  while IFS='=' read -r key val; do
-    key=$(echo "$key" | xargs)
-    [[ -z "$key" || "$key" == \#* ]] && continue
-    val=$(echo "$val" | sed 's/^["'\'']*//;s/["'\'']*$//')
-    case "$key" in
-      ALERT_EMAILS)    ALERT_EMAILS="$val" ;;
-      DISCORD_ALERTS)  DISCORD_ALERTS="$val" ;;
-      DISCORD_UPDATES) DISCORD_UPDATES="$val" ;;
-    esac
-  done < "$ENV_FILE"
+  set +u  # allow unset vars in env file
+  source "$ENV_FILE"
+  set -u
   echo "Loaded config from $ENV_FILE"
 else
   echo "WARNING: $ENV_FILE not found. cp .env.alerts.example .env.alerts"

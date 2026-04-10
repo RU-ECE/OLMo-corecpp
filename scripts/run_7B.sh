@@ -2,12 +2,12 @@
 # run_7B.sh — Launch 7B training in tmux with heartbeat monitoring + email alerts
 #
 # Usage:
-#   ./scripts/run_7B.sh                          # use defaults
-#   ./scripts/run_7B.sh --conf conf/olmo_7B_h100.conf --emails "you@example.com,prof@example.com"
+#   ./scripts/run_7B.sh --emails "you@example.com,prof@example.com"
+#   ./scripts/run_7B.sh --emails "you@example.com" --discord "https://discord.com/api/webhooks/..."
 #
 # Prerequisites:
-#   sudo apt-get install -y mailutils ssmtp   # or msmtp / postfix
-#   # Configure /etc/ssmtp/ssmtp.conf with your SMTP relay (e.g. Gmail app password)
+#   sudo apt-get install -y mailutils msmtp msmtp-mta
+#   # Configure ~/.msmtprc with your SMTP relay (e.g. Gmail app password)
 
 set -euo pipefail
 
@@ -19,6 +19,7 @@ STALE_TIMEOUT=600           # seconds without heartbeat update before alerting
 POLL_INTERVAL=60            # how often the monitor checks the heartbeat file
 SESSION="train7B"
 EMAILS=""                   # comma-separated list of emails to alert
+DISCORD_WEBHOOK=""          # Discord webhook URL (optional)
 
 # ── Parse args ──
 while [[ $# -gt 0 ]]; do
@@ -28,14 +29,15 @@ while [[ $# -gt 0 ]]; do
     --heartbeat)  HEARTBEAT="$2";      shift 2 ;;
     --timeout)    STALE_TIMEOUT="$2";  shift 2 ;;
     --emails)     EMAILS="$2";         shift 2 ;;
+    --discord)    DISCORD_WEBHOOK="$2"; shift 2 ;;
     --session)    SESSION="$2";        shift 2 ;;
     *) echo "Unknown arg: $1"; exit 1 ;;
   esac
 done
 
-if [[ -z "$EMAILS" ]]; then
-  echo "ERROR: --emails is required (comma-separated list)"
-  echo "  e.g.: ./scripts/run_7B.sh --emails 'you@uni.edu,kruger@uni.edu'"
+if [[ -z "$EMAILS" && -z "$DISCORD_WEBHOOK" ]]; then
+  echo "ERROR: --emails and/or --discord is required"
+  echo "  e.g.: ./scripts/run_7B.sh --emails 'you@uni.edu' --discord 'https://discord.com/api/webhooks/...'"
   exit 1
 fi
 
@@ -57,16 +59,44 @@ fi
 HOSTNAME="$(hostname)"
 TIMESTAMP="$(date '+%Y-%m-%d %H:%M:%S')"
 
-# ── Email helper ──
-send_alert() {
+# ── Alert helpers ──
+send_email() {
   local subject="$1"
   local body="$2"
+  [[ -z "$EMAILS" ]] && return
   IFS=',' read -ra ADDR <<< "$EMAILS"
   for addr in "${ADDR[@]}"; do
     addr="$(echo "$addr" | xargs)"  # trim whitespace
     echo "$body" | mail -s "$subject" "$addr" 2>/dev/null || \
       echo "[$(date)] WARNING: Failed to send email to $addr"
   done
+}
+
+send_discord() {
+  local subject="$1"
+  local body="$2"
+  [[ -z "$DISCORD_WEBHOOK" ]] && return
+  # Discord embeds: color red=16711680, green=65280, yellow=16776960
+  local color=16776960  # yellow default
+  if [[ "$subject" == *"FAILED"* || "$subject" == *"STALLED"* ]]; then
+    color=16711680  # red
+  elif [[ "$subject" == *"COMPLETED"* || "$subject" == *"RECOVERED"* ]]; then
+    color=65280  # green
+  elif [[ "$subject" == *"Started"* ]]; then
+    color=3447003  # blue
+  fi
+  # Truncate body to 4000 chars (Discord limit is 4096)
+  local desc="${body:0:4000}"
+  # Escape for JSON
+  desc=$(echo "$desc" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
+  local payload="{\"embeds\":[{\"title\":$(echo "$subject" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read().strip()))'),\"description\":$desc,\"color\":$color}]}"
+  curl -s -H "Content-Type: application/json" -d "$payload" "$DISCORD_WEBHOOK" >/dev/null 2>&1 || \
+    echo "[$(date)] WARNING: Failed to send Discord notification"
+}
+
+send_alert() {
+  send_email "$1" "$2"
+  send_discord "$1" "$2"
 }
 
 # ── Clean up any old heartbeat file ──
@@ -79,7 +109,8 @@ echo "  Config:     $CONF"
 echo "  Log:        $LOG"
 echo "  Heartbeat:  $HEARTBEAT"
 echo "  Timeout:    ${STALE_TIMEOUT}s"
-echo "  Emails:     $EMAILS"
+echo "  Emails:     ${EMAILS:-none}"
+echo "  Discord:    ${DISCORD_WEBHOOK:+enabled}"
 echo "  tmux:       $SESSION"
 echo "============================================"
 

@@ -29,8 +29,24 @@
 #include <iomanip>
 #include <cmath>
 #include <chrono>
+#include <fstream>
 
 namespace olmo_cpp {
+
+// Write current epoch count + timestamp to heartbeat file (atomic via rename)
+static void write_heartbeat(const std::string& path, int64_t epoch, int64_t step, int64_t total_steps) {
+  if (path.empty()) return;
+  std::string tmp = path + ".tmp";
+  {
+    std::ofstream f(tmp, std::ios::trunc);
+    auto now = std::chrono::system_clock::now();
+    auto t = std::chrono::system_clock::to_time_t(now);
+    f << "epoch=" << epoch << "\n"
+      << "step=" << step << "/" << total_steps << "\n"
+      << "time=" << std::ctime(&t);  // ctime adds newline
+  }
+  std::rename(tmp.c_str(), path.c_str());
+}
 
 // ---------------------------------------------------------------------------
 // RAII autocast guard — uses the non-deprecated PyTorch 2.6+ API
@@ -393,6 +409,18 @@ void train(
   double epoch_loss_sum = 0.0;
   int64_t epoch_loss_count = 0;
 
+  // ---- Heartbeat tracking ----
+  auto epoch_start_time = std::chrono::steady_clock::now();
+  double avg_epoch_seconds = 0.0;   // measured from second epoch
+  int64_t heartbeat_interval = 0;   // epochs between heartbeat writes (0 = not yet calibrated)
+  int64_t last_heartbeat_epoch = 0;
+  bool heartbeat_enabled = cfg.report_every > 0.0 && !cfg.heartbeat_path.empty();
+  if (heartbeat_enabled && rank == 0) {
+    write_heartbeat(cfg.heartbeat_path, 0, 0, cfg.num_steps);
+    std::cout << "Heartbeat: writing to " << cfg.heartbeat_path
+              << " every ~" << cfg.report_every << "s" << std::endl;
+  }
+
   // ---- TrainState ----
   TrainState state;
   state.train_start = std::chrono::steady_clock::now();
@@ -438,12 +466,34 @@ void train(
     // Epoch boundary detection
     int64_t new_epoch = dataset ? (step / steps_per_epoch) : 0;
     if (new_epoch > current_epoch && rank == 0) {
+      auto epoch_end_time = std::chrono::steady_clock::now();
+      double epoch_seconds = std::chrono::duration<double>(epoch_end_time - epoch_start_time).count();
+
       double avg_epoch_loss = epoch_loss_count > 0 ? epoch_loss_sum / epoch_loss_count : 0.0;
       std::cout << "--- Epoch " << current_epoch << " complete | avg_loss: "
-                << std::fixed << std::setprecision(4) << avg_epoch_loss << " ---" << std::endl;
+                << std::fixed << std::setprecision(4) << avg_epoch_loss
+                << " | time: " << std::setprecision(1) << epoch_seconds << "s ---" << std::endl;
+
+      // Calibrate heartbeat interval from second epoch (first is warmup)
+      if (heartbeat_enabled && current_epoch == 1 && avg_epoch_seconds == 0.0) {
+        avg_epoch_seconds = epoch_seconds;
+        heartbeat_interval = std::max(int64_t(1),
+            static_cast<int64_t>(cfg.report_every / avg_epoch_seconds));
+        std::cout << "Heartbeat: epoch ~" << std::setprecision(1) << avg_epoch_seconds
+                  << "s, writing every " << heartbeat_interval << " epochs" << std::endl;
+      }
+
+      // Write heartbeat every heartbeat_interval epochs
+      if (heartbeat_enabled && heartbeat_interval > 0 &&
+          (new_epoch - last_heartbeat_epoch) >= heartbeat_interval) {
+        write_heartbeat(cfg.heartbeat_path, new_epoch, step, cfg.num_steps);
+        last_heartbeat_epoch = new_epoch;
+      }
+
       epoch_loss_sum = 0.0;
       epoch_loss_count = 0;
       current_epoch = new_epoch;
+      epoch_start_time = std::chrono::steady_clock::now();
     }
 
     // LR schedule
@@ -579,6 +629,9 @@ void train(
   cb_mgr.on_train_end(state);
 
   if (rank == 0) {
+    if (heartbeat_enabled)
+      write_heartbeat(cfg.heartbeat_path, current_epoch, cfg.num_steps, cfg.num_steps);
+
     auto end = std::chrono::steady_clock::now();
     double total_s = std::chrono::duration<double>(end - state.train_start).count();
     double avg_step_ms = total_s / cfg.num_steps * 1000.0;
@@ -669,6 +722,18 @@ void train(
   int64_t current_epoch = 0;
   double epoch_loss_sum = 0.0;
   int64_t epoch_loss_count = 0;
+
+  // ---- Heartbeat tracking ----
+  auto epoch_start_time = std::chrono::steady_clock::now();
+  double avg_epoch_seconds = 0.0;
+  int64_t heartbeat_interval = 0;
+  int64_t last_heartbeat_epoch = 0;
+  bool heartbeat_enabled = cfg.report_every > 0.0 && !cfg.heartbeat_path.empty();
+  if (heartbeat_enabled && rank == 0) {
+    write_heartbeat(cfg.heartbeat_path, 0, 0, cfg.num_steps);
+    std::cout << "Heartbeat: writing to " << cfg.heartbeat_path
+              << " every ~" << cfg.report_every << "s" << std::endl;
+  }
 
   auto train_start = std::chrono::steady_clock::now();
   int64_t total_tokens = 0;
@@ -777,12 +842,34 @@ void train(
     // Epoch boundary detection
     int64_t new_epoch = dataset ? (step / steps_per_epoch) : 0;
     if (new_epoch > current_epoch && rank == 0) {
+      auto epoch_end_time = std::chrono::steady_clock::now();
+      double epoch_seconds = std::chrono::duration<double>(epoch_end_time - epoch_start_time).count();
+
       double avg_epoch_loss = epoch_loss_count > 0 ? epoch_loss_sum / epoch_loss_count : 0.0;
       std::cout << "--- Epoch " << current_epoch << " complete | avg_loss: "
-                << std::fixed << std::setprecision(4) << avg_epoch_loss << " ---" << std::endl;
+                << std::fixed << std::setprecision(4) << avg_epoch_loss
+                << " | time: " << std::setprecision(1) << epoch_seconds << "s ---" << std::endl;
+
+      // Calibrate heartbeat interval from second epoch (first is warmup)
+      if (heartbeat_enabled && current_epoch == 1 && avg_epoch_seconds == 0.0) {
+        avg_epoch_seconds = epoch_seconds;
+        heartbeat_interval = std::max(int64_t(1),
+            static_cast<int64_t>(cfg.report_every / avg_epoch_seconds));
+        std::cout << "Heartbeat: epoch ~" << std::setprecision(1) << avg_epoch_seconds
+                  << "s, writing every " << heartbeat_interval << " epochs" << std::endl;
+      }
+
+      // Write heartbeat every heartbeat_interval epochs
+      if (heartbeat_enabled && heartbeat_interval > 0 &&
+          (new_epoch - last_heartbeat_epoch) >= heartbeat_interval) {
+        write_heartbeat(cfg.heartbeat_path, new_epoch, step, cfg.num_steps);
+        last_heartbeat_epoch = new_epoch;
+      }
+
       epoch_loss_sum = 0.0;
       epoch_loss_count = 0;
       current_epoch = new_epoch;
+      epoch_start_time = std::chrono::steady_clock::now();
     }
 
 #ifdef USE_CUDA
@@ -870,6 +957,9 @@ void train(
   }
 
   if (rank == 0) {
+    if (heartbeat_enabled)
+      write_heartbeat(cfg.heartbeat_path, current_epoch, cfg.num_steps, cfg.num_steps);
+
     auto end = std::chrono::steady_clock::now();
     double total_s = std::chrono::duration<double>(end - train_start).count();
     double avg_step_ms = total_s / cfg.num_steps * 1000.0;

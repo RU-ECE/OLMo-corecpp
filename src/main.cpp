@@ -272,6 +272,10 @@ int main(int argc, char** argv) {
     train_cfg.log_interval          = train_ini.get_or<int64_t>("log_interval", 10);
     train_cfg.use_cuda_graph        = opt_ini.get_or<bool>("cuda_graph", false);
 
+    // ── Heartbeat monitoring ──
+    train_cfg.report_every          = train_ini.get_or<double>("report_every", 300.0);
+    train_cfg.heartbeat_path        = train_ini.get_or<std::string>("heartbeat_path", "");
+
     // ── Device ──
     std::string device_pref = dev_ini.get_or<std::string>("device", "auto");
 

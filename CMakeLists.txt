@@ -58,6 +58,42 @@ endif()
 find_package(Torch REQUIRED)
 find_package(ZLIB REQUIRED)
 
+# Detect which autocast C++ API is available (changed across PyTorch versions).
+# Use STATIC_LIBRARY target type so try_compile only compiles (no link step),
+# avoiding protobuf and other transitive dependency issues.
+include(CheckCXXSourceCompiles)
+set(_SAVE_TARGET_TYPE ${CMAKE_TRY_COMPILE_TARGET_TYPE})
+set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+set(CMAKE_REQUIRED_INCLUDES ${TORCH_INCLUDE_DIRS})
+set(CMAKE_REQUIRED_FLAGS "${TORCH_CXX_FLAGS} -std=c++17")
+
+check_cxx_source_compiles("
+#include <ATen/autocast_mode.h>
+#include <c10/core/DeviceType.h>
+void test() { (void)at::autocast::is_autocast_enabled(at::kCUDA); }
+" HAVE_AUTOCAST_DEVICE_API)
+
+if(NOT HAVE_AUTOCAST_DEVICE_API)
+    check_cxx_source_compiles("
+    #include <ATen/autocast_mode.h>
+    void test() { (void)at::autocast::is_autocast_gpu_enabled(); }
+    " HAVE_AUTOCAST_GPU_API)
+endif()
+
+if(HAVE_AUTOCAST_DEVICE_API)
+    add_compile_definitions(OLMO_AUTOCAST_DEVICE_API=1)
+    message(STATUS "Autocast API: device-parameterized (PyTorch >= 2.4)")
+elseif(HAVE_AUTOCAST_GPU_API)
+    add_compile_definitions(OLMO_AUTOCAST_GPU_API=1)
+    message(STATUS "Autocast API: GPU-specific (PyTorch 2.0-2.3)")
+else()
+    message(STATUS "Autocast API: dispatch-key fallback")
+endif()
+
+set(CMAKE_TRY_COMPILE_TARGET_TYPE ${_SAVE_TARGET_TYPE})
+unset(CMAKE_REQUIRED_INCLUDES)
+unset(CMAKE_REQUIRED_FLAGS)
+
 # cnpy for .npy token files (compiled directly into olmo_cpp to avoid GCC link-order issues)
 # add_subdirectory(third_party/cnpy)
 

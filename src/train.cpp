@@ -49,17 +49,32 @@ static void write_heartbeat(const std::string& path, int64_t epoch, int64_t step
 }
 
 // ---------------------------------------------------------------------------
-// RAII autocast guard — uses the non-deprecated PyTorch 2.6+ API
+// RAII autocast guard — portable across PyTorch versions
+//   PyTorch >= 2.4: device-parameterized API  (is_autocast_enabled(kCUDA))
+//   PyTorch <  2.4: GPU-specific API          (is_autocast_gpu_enabled())
 // ---------------------------------------------------------------------------
+#if TORCH_VERSION_MAJOR > 2 || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR >= 4)
+  #define OLMO_AUTOCAST_NEW_API 1
+#else
+  #define OLMO_AUTOCAST_NEW_API 0
+#endif
+
 namespace {
 
 struct AutocastGuard {
   explicit AutocastGuard(bool enabled, torch::Device device) : enabled_(enabled && device.is_cuda()) {
     if (enabled_) {
+#if OLMO_AUTOCAST_NEW_API
       prev_enabled_ = at::autocast::is_autocast_enabled(at::kCUDA);
       prev_dtype_ = at::autocast::get_autocast_dtype(at::kCUDA);
       at::autocast::set_autocast_enabled(at::kCUDA, true);
       at::autocast::set_autocast_dtype(at::kCUDA, at::kBFloat16);
+#else
+      prev_enabled_ = at::autocast::is_autocast_gpu_enabled();
+      prev_dtype_ = at::autocast::get_autocast_gpu_dtype();
+      at::autocast::set_autocast_gpu_enabled(true);
+      at::autocast::set_autocast_gpu_dtype(at::kBFloat16);
+#endif
       at::autocast::increment_nesting();
     }
   }
@@ -67,8 +82,13 @@ struct AutocastGuard {
     if (enabled_) {
       at::autocast::decrement_nesting();
       at::autocast::clear_cache();
+#if OLMO_AUTOCAST_NEW_API
       at::autocast::set_autocast_enabled(at::kCUDA, prev_enabled_);
       at::autocast::set_autocast_dtype(at::kCUDA, prev_dtype_);
+#else
+      at::autocast::set_autocast_gpu_enabled(prev_enabled_);
+      at::autocast::set_autocast_gpu_dtype(prev_dtype_);
+#endif
     }
   }
   AutocastGuard(const AutocastGuard&) = delete;

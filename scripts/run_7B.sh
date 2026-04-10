@@ -236,8 +236,9 @@ echo "============================================"
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 
 # Window 0: "training" — live output + log file
+# expandable_segments reduces fragmentation from Muon's Newton-Schulz temporaries
 tmux new-session -d -s "$SESSION" -n "training" \
-  "bash -c 'cd $PROJECT_DIR && ./build/olmo_train $CONF 2>&1 | tee $LOG; echo EXIT_CODE=\${PIPESTATUS[0]} >> $LOG; echo; echo Training ended. Press any key.; read -n1'"
+  "bash -c 'cd $PROJECT_DIR && PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True ./build/olmo_train $CONF 2>&1 | tee $LOG; echo EXIT_CODE=\${PIPESTATUS[0]} >> $LOG; echo; echo Training ended. Press any key.; read -n1'"
 
 # Window 1: "monitor" — alerts, heartbeat checks, progress updates
 tmux new-window -t "$SESSION" -n "monitor" \

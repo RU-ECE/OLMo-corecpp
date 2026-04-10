@@ -79,12 +79,35 @@ elif [ -n "$FORCE_CUDA" ]; then
     echo "  Jetstream: module load cuda/12.x"
     exit 1
   fi
-  CUDA_VER=$(nvcc --version | grep -oP 'V\K[0-9]+\.[0-9]+')
+  CUDA_VER=$(nvcc --version | grep -oP 'V\K[0-9]+\.[0-9]+' || nvcc --version | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p')
   echo "CUDA Version: $CUDA_VER"
   if [ -n "$CUDA_VER" ]; then
     MAJOR=$(echo "$CUDA_VER" | cut -d. -f1)
     if [ "$MAJOR" -lt 12 ]; then
       echo "Warning: CUDA $CUDA_VER detected. H100 requires CUDA 12.0+"
+    fi
+  fi
+
+  # Auto-detect nvToolsExt (required by some PyTorch builds)
+  if [ -z "${NVTOOLSEXT_PATH:-}" ]; then
+    for candidate in /usr/local/cuda /usr/lib/x86_64-linux-gnu /usr/local/cuda/targets/x86_64-linux; do
+      if [ -f "$candidate/lib/libnvToolsExt.so" ] || [ -f "$candidate/lib64/libnvToolsExt.so" ]; then
+        export NVTOOLSEXT_PATH="$candidate"
+        echo "Found nvToolsExt: $candidate"
+        break
+      fi
+    done
+    # Also check conda env
+    if [ -z "${NVTOOLSEXT_PATH:-}" ] && [ -n "${CONDA_PREFIX:-}" ]; then
+      if [ -f "$CONDA_PREFIX/lib/libnvToolsExt.so" ]; then
+        export NVTOOLSEXT_PATH="$CONDA_PREFIX"
+        echo "Found nvToolsExt in conda: $CONDA_PREFIX"
+      fi
+    fi
+    if [ -z "${NVTOOLSEXT_PATH:-}" ]; then
+      echo "Warning: nvToolsExt not found. If build fails, install with:"
+      echo "  sudo apt-get install -y nvidia-cuda-toolkit"
+      echo "  # or: conda install -c conda-forge cudatoolkit-dev"
     fi
   fi
 else

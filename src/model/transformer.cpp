@@ -1,4 +1,5 @@
 #include "olmo_cpp/model/transformer.hpp"
+#include "olmo_cpp/train/activation_checkpoint.hpp"
 #include <torch/nn/init.h>
 
 namespace {
@@ -124,10 +125,28 @@ torch::Tensor TransformerImpl::forward_backbone(
   std::optional<int64_t> start_pos =
       kv_cache ? std::optional<int64_t>(cached_len) : std::nullopt;
 
+  bool use_act_ckpt = config_.activation_checkpoint_mode != TransformerConfig::ActivationCheckpointMode::None
+                      && is_training();
+  int64_t ckpt_interval = config_.activation_checkpoint_interval;
+
   for (int64_t i = 0; i < config_.n_layers; ++i) {
     auto block = blocks_->ptr<ReorderedNormTransformerBlockImpl>(i);
     LayerKVCache* layer_cache = kv_cache ? &kv_cache->layers[static_cast<size_t>(i)] : nullptr;
-    h = block->forward(h, &rope_bufs[i], start_pos, layer_cache);
+
+    bool do_ckpt = use_act_ckpt &&
+        (config_.activation_checkpoint_mode == TransformerConfig::ActivationCheckpointMode::Full ||
+         ActivationCheckpoint::should_checkpoint(i, ckpt_interval));
+
+    if (do_ckpt && !layer_cache) {
+      auto* rope_buf = &rope_bufs[i];
+      auto sp = start_pos;
+      h = ActivationCheckpoint::checkpoint(
+          [block, rope_buf, sp](torch::Tensor x) {
+            return block->forward(x, rope_buf, sp, nullptr);
+          }, h);
+    } else {
+      h = block->forward(h, &rope_bufs[i], start_pos, layer_cache);
+    }
   }
 
   return h;

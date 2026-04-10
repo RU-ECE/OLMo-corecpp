@@ -33,6 +33,13 @@ third_party/*/
 # Benchmark outputs
 benchmark_results.json
 
+# Secrets / env files
+.env*
+!.env.alerts.example
+
+# Heartbeat files
+heartbeat_*.txt
+
 # Python
 __pycache__/
 *.pyc

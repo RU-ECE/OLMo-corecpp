@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# run_7B.sh — Launch 7B training in tmux with heartbeat monitoring + email alerts
+# run_7B.sh — Launch 7B training in tmux with heartbeat monitoring + alerts
 #
 # Usage:
-#   ./scripts/run_7B.sh --emails "you@example.com,prof@example.com"
-#   ./scripts/run_7B.sh --emails "you@example.com" --discord "https://discord.com/api/webhooks/..."
+#   ./scripts/run_7B.sh                    # reads .env.alerts for secrets
+#   ./scripts/run_7B.sh --conf conf/olmo_7B_h100.conf --timeout 600
 #
-# Prerequisites:
-#   sudo apt-get install -y mailutils msmtp msmtp-mta
-#   # Configure ~/.msmtprc with your SMTP relay (e.g. Gmail app password)
+# Secrets go in .env.alerts (gitignored):
+#   ALERT_EMAILS="you@uni.edu,kruger@uni.edu"
+#   DISCORD_WEBHOOKS="https://discord.com/api/webhooks/...,https://discord.com/api/webhooks/..."
 
 set -euo pipefail
 
@@ -18,8 +18,7 @@ HEARTBEAT="heartbeat_7B.txt"
 STALE_TIMEOUT=600           # seconds without heartbeat update before alerting
 POLL_INTERVAL=60            # how often the monitor checks the heartbeat file
 SESSION="train7B"
-EMAILS=""                   # comma-separated list of emails to alert
-DISCORD_WEBHOOK=""          # Discord webhook URL (optional)
+ENV_FILE=".env.alerts"
 
 # ── Parse args ──
 while [[ $# -gt 0 ]]; do
@@ -28,21 +27,40 @@ while [[ $# -gt 0 ]]; do
     --log)        LOG="$2";            shift 2 ;;
     --heartbeat)  HEARTBEAT="$2";      shift 2 ;;
     --timeout)    STALE_TIMEOUT="$2";  shift 2 ;;
-    --emails)     EMAILS="$2";         shift 2 ;;
-    --discord)    DISCORD_WEBHOOK="$2"; shift 2 ;;
     --session)    SESSION="$2";        shift 2 ;;
+    --env)        ENV_FILE="$2";       shift 2 ;;
     *) echo "Unknown arg: $1"; exit 1 ;;
   esac
 done
 
-if [[ -z "$EMAILS" && -z "$DISCORD_WEBHOOK" ]]; then
-  echo "ERROR: --emails and/or --discord is required"
-  echo "  e.g.: ./scripts/run_7B.sh --emails 'you@uni.edu' --discord 'https://discord.com/api/webhooks/...'"
-  exit 1
-fi
-
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_DIR"
+
+# ── Load secrets from env file ──
+ALERT_EMAILS=""
+DISCORD_WEBHOOKS=""
+
+if [[ -f "$ENV_FILE" ]]; then
+  # Source only the vars we care about (safe: no arbitrary execution)
+  while IFS='=' read -r key val; do
+    key=$(echo "$key" | xargs)
+    [[ -z "$key" || "$key" == \#* ]] && continue
+    val=$(echo "$val" | sed 's/^["'\'']*//;s/["'\'']*$//')  # strip quotes
+    case "$key" in
+      ALERT_EMAILS)     ALERT_EMAILS="$val" ;;
+      DISCORD_WEBHOOKS) DISCORD_WEBHOOKS="$val" ;;
+    esac
+  done < "$ENV_FILE"
+  echo "Loaded alerts config from $ENV_FILE"
+else
+  echo "WARNING: $ENV_FILE not found — no alerts will be sent."
+  echo "  Create it:  cp .env.alerts.example .env.alerts"
+fi
+
+if [[ -z "$ALERT_EMAILS" && -z "$DISCORD_WEBHOOKS" ]]; then
+  echo "WARNING: No emails or Discord webhooks configured in $ENV_FILE"
+  echo "  Training will run but no alerts will be sent."
+fi
 
 # Verify binary exists
 if [[ ! -x build/olmo_train ]]; then
@@ -63,10 +81,11 @@ TIMESTAMP="$(date '+%Y-%m-%d %H:%M:%S')"
 send_email() {
   local subject="$1"
   local body="$2"
-  [[ -z "$EMAILS" ]] && return
-  IFS=',' read -ra ADDR <<< "$EMAILS"
+  [[ -z "$ALERT_EMAILS" ]] && return
+  IFS=',' read -ra ADDR <<< "$ALERT_EMAILS"
   for addr in "${ADDR[@]}"; do
-    addr="$(echo "$addr" | xargs)"  # trim whitespace
+    addr="$(echo "$addr" | xargs)"
+    [[ -z "$addr" ]] && continue
     echo "$body" | mail -s "$subject" "$addr" 2>/dev/null || \
       echo "[$(date)] WARNING: Failed to send email to $addr"
   done
@@ -75,23 +94,34 @@ send_email() {
 send_discord() {
   local subject="$1"
   local body="$2"
-  [[ -z "$DISCORD_WEBHOOK" ]] && return
-  # Discord embeds: color red=16711680, green=65280, yellow=16776960
-  local color=16776960  # yellow default
+  [[ -z "$DISCORD_WEBHOOKS" ]] && return
+
+  # Color coding: red=fail, green=success, blue=start, yellow=default
+  local color=16776960
   if [[ "$subject" == *"FAILED"* || "$subject" == *"STALLED"* ]]; then
-    color=16711680  # red
+    color=16711680
   elif [[ "$subject" == *"COMPLETED"* || "$subject" == *"RECOVERED"* ]]; then
-    color=65280  # green
+    color=65280
   elif [[ "$subject" == *"Started"* ]]; then
-    color=3447003  # blue
+    color=3447003
   fi
+
   # Truncate body to 4000 chars (Discord limit is 4096)
   local desc="${body:0:4000}"
   # Escape for JSON
   desc=$(echo "$desc" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
-  local payload="{\"embeds\":[{\"title\":$(echo "$subject" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read().strip()))'),\"description\":$desc,\"color\":$color}]}"
-  curl -s -H "Content-Type: application/json" -d "$payload" "$DISCORD_WEBHOOK" >/dev/null 2>&1 || \
-    echo "[$(date)] WARNING: Failed to send Discord notification"
+  local title
+  title=$(echo "$subject" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read().strip()))')
+  local payload="{\"embeds\":[{\"title\":$title,\"description\":$desc,\"color\":$color}]}"
+
+  # Send to ALL webhooks (multiple channels/servers)
+  IFS=',' read -ra HOOKS <<< "$DISCORD_WEBHOOKS"
+  for hook in "${HOOKS[@]}"; do
+    hook="$(echo "$hook" | xargs)"
+    [[ -z "$hook" ]] && continue
+    curl -s -H "Content-Type: application/json" -d "$payload" "$hook" >/dev/null 2>&1 || \
+      echo "[$(date)] WARNING: Failed to send to Discord webhook"
+  done
 }
 
 send_alert() {
@@ -102,6 +132,11 @@ send_alert() {
 # ── Clean up any old heartbeat file ──
 rm -f "$HEARTBEAT"
 
+# Count configured channels
+n_emails=0; n_discord=0
+[[ -n "$ALERT_EMAILS" ]] && IFS=',' read -ra _e <<< "$ALERT_EMAILS" && n_emails=${#_e[@]}
+[[ -n "$DISCORD_WEBHOOKS" ]] && IFS=',' read -ra _d <<< "$DISCORD_WEBHOOKS" && n_discord=${#_d[@]}
+
 echo "============================================"
 echo "  7B Training Launch"
 echo "============================================"
@@ -109,8 +144,8 @@ echo "  Config:     $CONF"
 echo "  Log:        $LOG"
 echo "  Heartbeat:  $HEARTBEAT"
 echo "  Timeout:    ${STALE_TIMEOUT}s"
-echo "  Emails:     ${EMAILS:-none}"
-echo "  Discord:    ${DISCORD_WEBHOOK:+enabled}"
+echo "  Emails:     ${n_emails} recipient(s)"
+echo "  Discord:    ${n_discord} webhook(s)"
 echo "  tmux:       $SESSION"
 echo "============================================"
 
@@ -143,7 +178,6 @@ while true; do
 
   # Check if training process is still running
   if ! tmux has-session -t "$SESSION" 2>/dev/null; then
-    # Training ended — check exit status
     exit_line=$(grep 'EXIT_CODE=' "$LOG" 2>/dev/null | tail -1 || true)
     exit_code="${exit_line#EXIT_CODE=}"
     last_epoch=$(grep -oP 'Epoch \K[0-9]+' "$LOG" 2>/dev/null | tail -1 || echo "?")
@@ -205,7 +239,7 @@ $tail_log
 
 Action needed: ssh $HOSTNAME and check tmux attach -t $SESSION"
 
-        echo "[$(date)] ALERT: Heartbeat stale for ${age}s — emails sent."
+        echo "[$(date)] ALERT: Heartbeat stale for ${age}s — alerts sent."
         alerted=1
       fi
     else
@@ -216,13 +250,11 @@ Action needed: ssh $HOSTNAME and check tmux attach -t $SESSION"
           "Training heartbeat recovered at $(date). Age: ${age}s."
       fi
       alerted=0
-      # Print status
       hb_epoch=$(grep 'epoch=' "$HEARTBEAT" 2>/dev/null | head -1 | cut -d= -f2 || echo "?")
       hb_step=$(grep 'step=' "$HEARTBEAT" 2>/dev/null | head -1 | cut -d= -f2 || echo "?")
       echo "[$(date)] OK: epoch=$hb_epoch step=$hb_step (heartbeat age=${age}s)"
     fi
   else
-    # No heartbeat file yet — training is still in warmup/first epochs
     echo "[$(date)] Waiting for heartbeat file..."
   fi
 done

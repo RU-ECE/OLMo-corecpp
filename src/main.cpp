@@ -76,6 +76,15 @@ void run(Model& model, const olmo_cpp::TransformerConfig& cfg,
   std::cout << ")\n";
 
   model->to(device);
+
+  // For large models on GPU with AMP, use BF16 master weights to halve
+  // memory for params + optimizer state + gradients (~99 GB → ~49 GB for 7B).
+  // µP init happens in FP32 above, then we downcast.
+  if (device.is_cuda() && train_cfg.use_amp) {
+    model->to(torch::kBFloat16);
+    std::cout << "Weights: BF16 (saves ~50% GPU memory)\n";
+  }
+
   olmo_cpp::train(model, cfg, train_cfg, device);
 
   if (enable_profile) {

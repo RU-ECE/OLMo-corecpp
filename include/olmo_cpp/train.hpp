@@ -26,8 +26,9 @@ struct TrainConfig {
   double weight_decay = 0.01;
 
   // Mixed precision
-  bool use_amp = false;
-  bool use_grad_scaler = false;  // loss scaling for fp16
+  bool use_amp = false;           // autocast: FP32 master weights, per-op BF16 (small models)
+  bool use_bf16 = false;          // pure BF16: convert weights to BF16, no autocast (large models)
+  bool use_grad_scaler = false;   // loss scaling for fp16
 
   // Optimizer selection
   std::string optimizer = "adamw";  // adamw, lion, muon, dion

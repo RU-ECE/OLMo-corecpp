@@ -50,7 +50,7 @@ int64_t count_parameters(const torch::nn::Module& model) {
 
 template<typename Model>
 void run(Model& model, const olmo_cpp::TransformerConfig& cfg,
-         const olmo_cpp::TrainConfig& train_cfg, torch::Device device,
+         olmo_cpp::TrainConfig train_cfg, torch::Device device,
          bool use_mup, bool use_fused, bool use_multi_res,
          bool enable_profile, const std::string& save_path,
          const olmo_cpp::SeedState& seed_state) {
@@ -77,10 +77,22 @@ void run(Model& model, const olmo_cpp::TransformerConfig& cfg,
 
   model->to(device);
 
-  // Autocast keeps FP32 master weights and casts per-op in forward;
-  // backward automatically uses the same types. Converting weights to
-  // BF16 here would cause dtype mismatches in the backward pass
-  // (FP32 gradients × BF16 weights).
+  // Pure BF16 mode: convert all floating-point params to BF16 after init.
+  // Halves memory for weights + optimizer state + gradients (~3x savings).
+  // Incompatible with autocast (which expects FP32 master weights).
+  if (train_cfg.use_bf16 && device.is_cuda()) {
+    if (train_cfg.use_amp) {
+      std::cerr << "WARNING: bf16=1 and amp=1 are mutually exclusive; disabling amp.\n";
+      train_cfg.use_amp = false;
+    }
+    torch::NoGradGuard no_grad;
+    for (auto& p : model->parameters()) {
+      if (p.is_floating_point()) {
+        p.set_data(p.data().to(torch::kBFloat16));
+      }
+    }
+    std::cout << "Weights: BF16 (saves ~50% GPU memory)\n";
+  }
 
   olmo_cpp::train(model, cfg, train_cfg, device);
 
@@ -232,6 +244,7 @@ int main(int argc, char** argv) {
     train_cfg.grad_accum_steps = train_ini.get_or<int64_t>("grad_accum", 1);
     train_cfg.optimizer        = train_ini.get_or<std::string>("optimizer", "adamw");
     train_cfg.use_amp          = train_ini.get_or<bool>("amp", false);
+    train_cfg.use_bf16         = train_ini.get_or<bool>("bf16", false);
     train_cfg.use_grad_scaler  = train_ini.get_or<bool>("grad_scaler", false);
     train_cfg.max_grad_norm    = train_ini.get_or<double>("max_grad_norm", 1.0);
     train_cfg.weight_decay     = train_ini.get_or<double>("weight_decay", 0.01);

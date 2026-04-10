@@ -71,7 +71,10 @@ std::string optimizer_display_name(const std::string& name, bool use_foreach) {
 void print_optimization_banner(const std::string& optimizer_name, bool use_foreach,
                                bool gpu_data, bool gpu_data_active,
                                bool use_amp, bool fused_grad_clip,
-                               bool cuda_graph = false) {
+                               bool cuda_graph = false, bool use_bf16 = false) {
+  const char* prec = use_bf16 ? "BF16 (pure, master weights BF16)"
+                   : use_amp  ? "BF16 autocast"
+                              : "FP32";
   std::cout << "\n";
   std::cout << "╔══════════════════════════════════════════════════════════╗\n";
   std::cout << "║  OPTIMIZATION STATUS                                    ║\n";
@@ -83,7 +86,7 @@ void print_optimization_banner(const std::string& optimizer_name, bool use_forea
   std::cout << "║  Data loading:    " << std::left << std::setw(39)
             << (gpu_data_active ? "GPU-resident (zero per-step H2D)" : "CPU + async prefetch") << "║\n";
   std::cout << "║  Mixed precision: " << std::left << std::setw(39)
-            << (use_amp ? "BF16 autocast" : "FP32") << "║\n";
+            << prec << "║\n";
   std::cout << "║  CUDA graph:      " << std::left << std::setw(39)
             << (cuda_graph ? "ON (fwd+bwd captured)" : "OFF") << "║\n";
   std::cout << "╚══════════════════════════════════════════════════════════╝\n";
@@ -362,7 +365,7 @@ void train(
   if (rank == 0) {
     print_optimization_banner(cfg.optimizer, cfg.use_foreach_optimizer,
                               cfg.gpu_resident_data, gpu_data_active,
-                              cfg.use_amp, true, cfg.use_cuda_graph);
+                              cfg.use_amp, true, cfg.use_cuda_graph, cfg.use_bf16);
   }
 
   // Pre-build DDP parameter list once (avoids per-step allocation)
@@ -680,7 +683,7 @@ void train(
   if (rank == 0) {
     print_optimization_banner(cfg.optimizer, cfg.use_foreach_optimizer,
                               cfg.gpu_resident_data, gpu_data_active,
-                              cfg.use_amp, true, cfg.use_cuda_graph);
+                              cfg.use_amp, true, cfg.use_cuda_graph, cfg.use_bf16);
   }
 
   // Pre-build DDP parameter list once (avoids per-step allocation)

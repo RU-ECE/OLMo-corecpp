@@ -45,3 +45,9 @@ __pycache__/
 *.pyc
 .venv/
 CLAUDE.md
+*.nsys-rep
+*.qdstrm
+*.sqlite
+*.nsys-rep.md
+*.qdstrm.md
+*.sqlite.md

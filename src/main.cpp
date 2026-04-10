@@ -77,20 +77,10 @@ void run(Model& model, const olmo_cpp::TransformerConfig& cfg,
 
   model->to(device);
 
-  // For large models on GPU with AMP, use BF16 master weights to halve
-  // memory for params + optimizer state + gradients (~99 GB → ~49 GB for 7B).
-  // µP init happens in FP32 above, then we downcast.
-  // Only convert floating-point params — integer buffers (embedding indices,
-  // DC-MRE lookups) must stay Long.
-  if (device.is_cuda() && train_cfg.use_amp) {
-    torch::NoGradGuard no_grad;
-    for (auto& p : model->parameters()) {
-      if (p.is_floating_point()) {
-        p.set_data(p.data().to(torch::kBFloat16));
-      }
-    }
-    std::cout << "Weights: BF16 (saves ~50% GPU memory)\n";
-  }
+  // Autocast keeps FP32 master weights and casts per-op in forward;
+  // backward automatically uses the same types. Converting weights to
+  // BF16 here would cause dtype mismatches in the backward pass
+  // (FP32 gradients × BF16 weights).
 
   olmo_cpp::train(model, cfg, train_cfg, device);
 

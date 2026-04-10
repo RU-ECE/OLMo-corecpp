@@ -1,13 +1,17 @@
 cmake_minimum_required(VERSION 3.18)
 project(olmo_cpp LANGUAGES CXX)
 
-# Default: optimized + debug symbols (Ninja/Make; multi-config IDEs ignore CMAKE_BUILD_TYPE)
+# Default: "release with debug info" → RelWithDebInfo (-O2 + debug symbols on GCC/Clang).
+# Single-config generators only (Ninja/Make); Visual Studio/Xcode use --config RelWithDebInfo.
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
-  set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
+  set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING
+    "Release with debug info (optimized + symbols). Alternatives: Debug, Release, MinSizeRel." FORCE)
   set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS Debug Release RelWithDebInfo MinSizeRel)
 endif()
 
 set(CMAKE_CXX_STANDARD 17)
+
+
 
 
 
@@ -31,26 +35,31 @@ endif()
 
 # Enable CUDA if available (for Jetstream H100, etc.)
 include(CheckLanguage)
+
+# Prefer nvcc from CUDAToolkit_ROOT when set (-DCUDAToolkit_ROOT=...), so we don't pick
+# /usr/bin/nvcc while a newer CUDA's ptxas appears earlier on PATH (mixed toolchains break).
+if(NOT CMAKE_CUDA_COMPILER AND DEFINED CUDAToolkit_ROOT AND EXISTS "${CUDAToolkit_ROOT}/bin/nvcc")
+  set(CMAKE_CUDA_COMPILER "${CUDAToolkit_ROOT}/bin/nvcc" CACHE FILEPATH "CUDA compiler" FORCE)
+endif()
+
+# CMake's CUDA compiler probe defaults to sm_52. CUDA 13+ ptxas rejects sm_52; CUDA 12+
+# also needs real archs for BF16 kernels. Set before check_language / enable_language.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES "80;86;89;90" CACHE STRING
+    "CUDA arch list (e.g. 86 for RTX 3060, 90 for H100). Must be set before first CUDA probe.")
+endif()
+
 check_language(CUDA)
 if(CMAKE_CUDA_COMPILER)
     enable_language(CUDA)
     set(CMAKE_CUDA_STANDARD 17)
     add_compile_definitions(USE_CUDA=1)
     message(STATUS "CUDA found: ${CMAKE_CUDA_COMPILER} (version ${CMAKE_CUDA_COMPILER_VERSION})")
+    message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 
-    # GPU architecture: always set based on toolkit version
-    # (CMake 3.24+ auto-populates CMAKE_CUDA_ARCHITECTURES with sm_52 default,
-    #  which doesn't support BF16 intrinsics — we must override it)
     include(FindCUDAToolkit)
-    if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.0")
-        set(CMAKE_CUDA_ARCHITECTURES "80;90" CACHE STRING "" FORCE)
-        message(STATUS "CUDA 12+: targeting sm_80 (A100), sm_90 (H100)")
-    elseif(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "11.0")
-        set(CMAKE_CUDA_ARCHITECTURES "80" CACHE STRING "" FORCE)
-        message(STATUS "CUDA 11: targeting sm_80 (A100)")
-    else()
-        set(CMAKE_CUDA_ARCHITECTURES "70" CACHE STRING "" FORCE)
-        message(STATUS "CUDA <11: targeting sm_70 (V100, no BF16 kernel support)")
+    if(CUDAToolkit_VERSION)
+      message(STATUS "CUDA toolkit version: ${CUDAToolkit_VERSION}")
     endif()
 endif()
 
@@ -67,12 +76,14 @@ set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 set(CMAKE_REQUIRED_INCLUDES ${TORCH_INCLUDE_DIRS})
 set(CMAKE_REQUIRED_FLAGS "${TORCH_CXX_FLAGS} -std=c++17")
 
+# Probe 1: newest API — is_autocast_enabled(at::kCUDA) (PyTorch >= 2.4)
 check_cxx_source_compiles("
 #include <ATen/autocast_mode.h>
 #include <c10/core/DeviceType.h>
 void test() { (void)at::autocast::is_autocast_enabled(at::kCUDA); }
 " HAVE_AUTOCAST_DEVICE_API)
 
+# Probe 2: mid-era — is_autocast_gpu_enabled() (some PyTorch 2.x builds)
 if(NOT HAVE_AUTOCAST_DEVICE_API)
     check_cxx_source_compiles("
     #include <ATen/autocast_mode.h>
@@ -80,14 +91,25 @@ if(NOT HAVE_AUTOCAST_DEVICE_API)
     " HAVE_AUTOCAST_GPU_API)
 endif()
 
+# Probe 3: older PyTorch 2.1 — is_enabled() + set_enabled(bool) (no device param, GPU-only)
+if(NOT HAVE_AUTOCAST_DEVICE_API AND NOT HAVE_AUTOCAST_GPU_API)
+    check_cxx_source_compiles("
+    #include <ATen/autocast_mode.h>
+    void test() { at::autocast::set_enabled(true); (void)at::autocast::is_enabled(); }
+    " HAVE_AUTOCAST_LEGACY_API)
+endif()
+
 if(HAVE_AUTOCAST_DEVICE_API)
     add_compile_definitions(OLMO_AUTOCAST_DEVICE_API=1)
     message(STATUS "Autocast API: device-parameterized (PyTorch >= 2.4)")
 elseif(HAVE_AUTOCAST_GPU_API)
     add_compile_definitions(OLMO_AUTOCAST_GPU_API=1)
-    message(STATUS "Autocast API: GPU-specific (PyTorch 2.0-2.3)")
+    message(STATUS "Autocast API: GPU-specific (PyTorch 2.x)")
+elseif(HAVE_AUTOCAST_LEGACY_API)
+    add_compile_definitions(OLMO_AUTOCAST_LEGACY_API=1)
+    message(STATUS "Autocast API: legacy is_enabled/set_enabled (PyTorch 2.0-2.1)")
 else()
-    message(STATUS "Autocast API: dispatch-key fallback")
+    message(STATUS "Autocast API: dispatch-key fallback (autocast may not work)")
 endif()
 
 set(CMAKE_TRY_COMPILE_TARGET_TYPE ${_SAVE_TARGET_TYPE})

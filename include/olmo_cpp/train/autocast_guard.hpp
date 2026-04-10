@@ -11,6 +11,12 @@ namespace olmo_cpp {
 
 /// RAII guard that enables BF16 autocast on CUDA.
 /// Portable across PyTorch 2.0 through 2.6+.
+///
+/// API variants detected at CMake configure time:
+///   OLMO_AUTOCAST_DEVICE_API  — is_autocast_enabled(at::kCUDA)    (PyTorch >= 2.4)
+///   OLMO_AUTOCAST_GPU_API     — is_autocast_gpu_enabled()          (some 2.x builds)
+///   OLMO_AUTOCAST_LEGACY_API  — is_enabled() / set_enabled(bool)   (PyTorch 2.0-2.1)
+///   (none)                    — dispatch-key fallback
 struct AutocastGuard {
   explicit AutocastGuard(bool enabled, torch::Device device)
       : enabled_(enabled && device.is_cuda()) {
@@ -25,6 +31,12 @@ struct AutocastGuard {
       prev_enabled_ = at::autocast::is_autocast_gpu_enabled();
       prev_dtype_ = at::autocast::get_autocast_gpu_dtype();
       at::autocast::set_autocast_gpu_enabled(true);
+      at::autocast::set_autocast_gpu_dtype(at::kBFloat16);
+      at::autocast::increment_nesting();
+#elif defined(OLMO_AUTOCAST_LEGACY_API)
+      prev_enabled_ = at::autocast::is_enabled();
+      prev_dtype_ = at::autocast::get_autocast_gpu_dtype();
+      at::autocast::set_enabled(true);
       at::autocast::set_autocast_gpu_dtype(at::kBFloat16);
       at::autocast::increment_nesting();
 #else
@@ -45,6 +57,11 @@ struct AutocastGuard {
       at::autocast::clear_cache();
       at::autocast::set_autocast_gpu_enabled(prev_enabled_);
       at::autocast::set_autocast_gpu_dtype(prev_dtype_);
+#elif defined(OLMO_AUTOCAST_LEGACY_API)
+      at::autocast::decrement_nesting();
+      at::autocast::clear_cache();
+      at::autocast::set_enabled(prev_enabled_);
+      at::autocast::set_autocast_gpu_dtype(prev_dtype_);
 #else
       // dk_guard_ destructor removes the dispatch key automatically
 #endif
@@ -56,7 +73,7 @@ struct AutocastGuard {
 
  private:
   bool enabled_;
-#if defined(OLMO_AUTOCAST_DEVICE_API) || defined(OLMO_AUTOCAST_GPU_API)
+#if defined(OLMO_AUTOCAST_DEVICE_API) || defined(OLMO_AUTOCAST_GPU_API) || defined(OLMO_AUTOCAST_LEGACY_API)
   bool prev_enabled_{false};
   at::ScalarType prev_dtype_{at::kFloat};
 #else

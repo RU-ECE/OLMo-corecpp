@@ -138,11 +138,13 @@ torch::Tensor TransformerImpl::forward_backbone(
          ActivationCheckpoint::should_checkpoint(i, ckpt_interval));
 
     if (do_ckpt && !layer_cache) {
-      auto* rope_buf = &rope_bufs[i];
+      // Capture by VALUE — the lambda outlives forward_backbone() (used in
+      // backward for recomputation), so raw pointers into locals would dangle.
+      auto rope_buf = rope_bufs[i];
       auto sp = start_pos;
       h = ActivationCheckpoint::checkpoint(
           [block, rope_buf, sp](torch::Tensor x) {
-            return block->forward(x, rope_buf, sp, nullptr);
+            return block->forward(x, &rope_buf, sp, nullptr);
           }, h);
     } else {
       h = block->forward(h, &rope_bufs[i], start_pos, layer_cache);

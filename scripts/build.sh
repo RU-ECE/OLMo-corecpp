@@ -79,7 +79,7 @@ elif [ -n "$FORCE_CUDA" ]; then
     echo "  Jetstream: module load cuda/12.x"
     exit 1
   fi
-  CUDA_VER=$(nvcc --version | grep -oP 'V\K[0-9]+\.[0-9]+' || nvcc --version | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p')
+  CUDA_VER=$(nvcc --version | grep -oP 'V\K[0-9]+\.[0-9]+' 2>/dev/null || nvcc --version | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p')
   echo "CUDA Version: $CUDA_VER"
   if [ -n "$CUDA_VER" ]; then
     MAJOR=$(echo "$CUDA_VER" | cut -d. -f1)
@@ -88,16 +88,42 @@ elif [ -n "$FORCE_CUDA" ]; then
     fi
   fi
 
-  # Auto-detect nvToolsExt (required by some PyTorch builds)
+  # ── Resolve CUDA_HOME to a single path (avoids "conflicting CUDA installs" error) ──
+  if [ -z "${CUDA_HOME:-}" ]; then
+    # Prefer /usr/local/cuda (system CUDA), then try to find from nvcc
+    if [ -d "/usr/local/cuda" ]; then
+      export CUDA_HOME="/usr/local/cuda"
+    else
+      # Derive from nvcc location: /usr/bin/nvcc → /usr, /usr/local/cuda/bin/nvcc → /usr/local/cuda
+      NVCC_PATH="$(which nvcc 2>/dev/null)"
+      if [ -n "$NVCC_PATH" ]; then
+        export CUDA_HOME="$(dirname "$(dirname "$NVCC_PATH")")"
+      fi
+    fi
+  fi
+  if [ -n "${CUDA_HOME:-}" ]; then
+    echo "CUDA_HOME: $CUDA_HOME"
+    # Force CMake to use only this CUDA — prevents "conflicting installs" when
+    # conda and system both have CUDA headers
+    export CMAKE_CUDA_COMPILER="${CUDA_HOME}/bin/nvcc"
+    export CUDACXX="${CUDA_HOME}/bin/nvcc"
+    EXTRA_CMAKE_ARGS="$EXTRA_CMAKE_ARGS -DCUDA_TOOLKIT_ROOT_DIR=$CUDA_HOME"
+    # If nvcc isn't in CUDA_HOME (e.g. system nvcc at /usr/bin), fall back
+    if [ ! -x "${CUDA_HOME}/bin/nvcc" ]; then
+      unset CMAKE_CUDA_COMPILER CUDACXX
+    fi
+  fi
+
+  # ── Auto-detect nvToolsExt (required by some PyTorch builds) ──
   if [ -z "${NVTOOLSEXT_PATH:-}" ]; then
-    for candidate in /usr/local/cuda /usr/lib/x86_64-linux-gnu /usr/local/cuda/targets/x86_64-linux; do
+    for candidate in "${CUDA_HOME:-/usr/local/cuda}" /usr/local/cuda /usr/lib/x86_64-linux-gnu /usr/local/cuda/targets/x86_64-linux; do
       if [ -f "$candidate/lib/libnvToolsExt.so" ] || [ -f "$candidate/lib64/libnvToolsExt.so" ]; then
         export NVTOOLSEXT_PATH="$candidate"
         echo "Found nvToolsExt: $candidate"
         break
       fi
     done
-    # Also check conda env
+    # Check conda env
     if [ -z "${NVTOOLSEXT_PATH:-}" ] && [ -n "${CONDA_PREFIX:-}" ]; then
       if [ -f "$CONDA_PREFIX/lib/libnvToolsExt.so" ]; then
         export NVTOOLSEXT_PATH="$CONDA_PREFIX"

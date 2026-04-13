@@ -9,8 +9,11 @@ torch::Tensor clip_grad_norm_gpu(
     double max_norm,
     double norm_type) {
 
-  // Collect defined gradients
-  std::vector<torch::Tensor> grads;
+  // Collect defined gradients into a thread-local scratch vector. Reusing
+  // the vector's capacity avoids a per-step heap allocation + N push_backs
+  // on the hot training loop (called once per optimizer step).
+  static thread_local std::vector<torch::Tensor> grads;
+  grads.clear();
   grads.reserve(parameters.size());
   for (const auto& p : parameters) {
     if (p.grad().defined()) {

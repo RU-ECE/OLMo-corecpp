@@ -1,0 +1,61 @@
+WARNING: CPU IP/backtrace sampling not supported, disabling.
+Try the 'nsys status --environment' command to learn more.
+
+WARNING: CPU context switch tracing not supported, disabling.
+Try the 'nsys status --environment' command to learn more.
+
+
+╔══════════════════════════════════════════════╗
+║  SEED: 42                                   ║
+║  Mode: explicit (--seed)                    ║
+╚══════════════════════════════════════════════╝
+
+Device: CUDA GPU
+Backend: CUDA (fused kernels)
+Config: /media/volume/Prep_and_Voice_Training/llm_benchmark_results/benchmark_125M.conf
+Model: 190M params (d=768, layers=12, heads=12, FUSED)
+
+╔══════════════════════════════════════════════════════════╗
+║  OPTIMIZATION STATUS                                    ║
+╠══════════════════════════════════════════════════════════╣
+║  Optimizer:       ForeachAdamW (batched _foreach_* ops)  ║
+║  Grad clipping:   GPU-resident (foreach_norm, no D2H)    ║
+║  Data loading:    GPU-resident (zero per-step H2D)       ║
+║  Mixed precision: BF16 autocast                          ║
+╚══════════════════════════════════════════════════════════╝
+
+Epoch 0 | Step 0/100  loss: 11.2772  lr: 0.00e+00  step_ms: 1357  tok/s: 3018
+Epoch 0 | Step 10/100  loss: 9.2676  lr: 3.00e-04  step_ms: 79  tok/s: 20715
+Epoch 0 | Step 20/100  loss: 7.0270  lr: 2.91e-04  step_ms: 68  tok/s: 29916
+Epoch 0 | Step 30/100  loss: 5.6655  lr: 2.65e-04  step_ms: 67  tok/s: 35889
+Epoch 0 | Step 40/100  loss: 5.0171  lr: 2.25e-04  step_ms: 78  tok/s: 39477
+Epoch 0 | Step 50/100  loss: 4.5999  lr: 1.76e-04  step_ms: 72  tok/s: 42144
+Epoch 0 | Step 60/100  loss: 4.6510  lr: 1.24e-04  step_ms: 85  tok/s: 43502
+Epoch 0 | Step 70/100  loss: 4.5286  lr: 7.50e-05  step_ms: 81  tok/s: 44835
+Epoch 0 | Step 80/100  loss: 4.6925  lr: 3.51e-05  step_ms: 81  tok/s: 45968
+Epoch 0 | Step 90/100  loss: 4.5185  lr: 9.05e-06  step_ms: 71  tok/s: 47014
+
+=== Training Summary ===
+  Steps: 100 (1 epochs)
+  Total tokens: 409600
+  Wall time: 8.59s
+  Avg step: 85.9ms
+  Throughput: 47661 tok/s
+========================
+[Profiler] No data collected.
+
+[Memory] Device: cuda
+  Allocated: 9310.9 MB
+  Reserved:  81079.0 MB
+  Peak:      9310.9 MB
+
+[RNG] State summary:
+  Original seed: 42 (explicit)
+  torch generator seed: 42
+  torch CUDA devices: 1
+
+Importer error status: The importer binary and its dependencies were not found.
+Unable to retrieve the importer version: skipping importation of the QDSTRM file.
+Generating '/tmp/nsys-report-28c0.qdstrm'
+Generated:
+    /media/volume/Prep_and_Voice_Training/llm_benchmark_results/cpp_profile.qdstrm

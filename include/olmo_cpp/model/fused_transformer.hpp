@@ -41,8 +41,14 @@ class FusedTransformerImpl : public torch::nn::Module {
 
   void init_weights(torch::optional<torch::Generator> gen = c10::nullopt);
 
-  std::vector<RoPEBuffers> get_rope_buffers(int64_t seq_len, torch::Device device,
-                                             torch::Dtype dtype = torch::kFloat32);
+  // Returns a reference to the cached per-layer RoPE buffers, recomputing them
+  // only when seq_len grows past the cache or dtype changes. Returning by const
+  // ref avoids a per-forward std::vector<RoPEBuffers> copy (and 2*n_layers
+  // tensor refcount ops). The returned reference is stable until the next call
+  // that triggers a recompute.
+  const std::vector<RoPEBuffers>& get_rope_buffers(
+      int64_t seq_len, torch::Device device,
+      torch::Dtype dtype = torch::kFloat32);
 
   int64_t n_layers() const { return config_.n_layers; }
   int64_t num_mtp_heads() const { return config_.num_mtp_heads; }

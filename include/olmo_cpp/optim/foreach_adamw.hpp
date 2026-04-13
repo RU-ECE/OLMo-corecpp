@@ -27,6 +27,13 @@ class ForeachAdamW : public torch::optim::Optimizer {
 
  private:
   int64_t step_count_ = 0;
+  // Scratch vectors reused across steps — we .clear() at the start of each
+  // step so the capacity (sized to n_params on the first call) is retained
+  // and subsequent push_backs allocate nothing.
+  std::vector<torch::Tensor> params_scratch_;
+  std::vector<torch::Tensor> grads_scratch_;
+  std::vector<torch::Tensor> exp_avg_scratch_;
+  std::vector<torch::Tensor> exp_avg_sq_scratch_;
 };
 
 }  // namespace olmo_cpp

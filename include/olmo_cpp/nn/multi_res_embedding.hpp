@@ -108,6 +108,9 @@ class MultiResEmbeddingImpl : public torch::nn::Module {
   // Buffers: precomputed char trigram indices and mask
   torch::Tensor char_trigram_map_;   // [vocab_size, max_trigrams] int64
   torch::Tensor char_trigram_count_; // [vocab_size] float — number of valid trigrams
+  // Precomputed [1, 1, T] range used to build the trigram-count mask in forward.
+  // Registered as a buffer so it moves with the module and never reallocates.
+  torch::Tensor trigram_range_;
 
   // Stream 4: Phrase context (local syntactic features)
   torch::nn::Embedding phrase_embed_{nullptr}; // [phrase_buckets, phrase_dim]

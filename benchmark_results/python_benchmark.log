@@ -1,0 +1,43 @@
+WARNING: CPU IP/backtrace sampling not supported, disabling.
+Try the 'nsys status --environment' command to learn more.
+
+WARNING: CPU context switch tracing not supported, disabling.
+Try the 'nsys status --environment' command to learn more.
+
+/home/exouser/Satrajits_Exp/OLMo-corecpp/scripts/py_benchmark_125M.py:234: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+/home/exouser/Satrajits_Exp/OLMo-corecpp/scripts/py_benchmark_125M.py:267: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+=== Python PyTorch Benchmark ===
+Model: 768d, 12L, 12H, vocab=50257
+Training: batch=8, seq_len=512, steps=100
+Optimizer: AdamW (lr=0.0003, wd=0.01)
+Device: NVIDIA H100 80GB HBM3
+
+Parameters: 151.9M
+Dataset: /media/volume/Prep_and_Voice_Training/llm_benchmark_data/tinystories_gpt2.npy (2371 chunks, GPU-resident)
+
+Warmup complete, starting timed run...
+Step 0/100  loss: 10.9445  lr: 0.000030  step_ms: 184  tok/s: 22301
+Step 10/100  loss: 8.1004  lr: 0.000300  step_ms: 72  tok/s: 52141
+Step 20/100  loss: 6.3425  lr: 0.000291  step_ms: 77  tok/s: 53665
+Step 30/100  loss: 6.0311  lr: 0.000265  step_ms: 82  tok/s: 52555
+Step 40/100  loss: 5.8523  lr: 0.000225  step_ms: 78  tok/s: 52222
+Step 50/100  loss: 5.7064  lr: 0.000176  step_ms: 77  tok/s: 52747
+Step 60/100  loss: 5.4610  lr: 0.000124  step_ms: 70  tok/s: 53470
+Step 70/100  loss: 5.2472  lr: 0.000075  step_ms: 75  tok/s: 53982
+Step 80/100  loss: 5.2990  lr: 0.000035  step_ms: 79  tok/s: 54004
+Step 90/100  loss: 5.1908  lr: 0.000009  step_ms: 79  tok/s: 54098
+
+=== Python Training Summary ===
+  Steps: 100
+  Total tokens: 409600
+  Wall time: 7.66s
+  Avg step: 76.6ms
+  Throughput: 53466 tok/s
+===============================
+Importer error status: The importer binary and its dependencies were not found.
+Unable to retrieve the importer version: skipping importation of the QDSTRM file.
+Generating '/tmp/nsys-report-107f.qdstrm'
+Generated:
+    /media/volume/Prep_and_Voice_Training/llm_benchmark_results/python_profile.qdstrm

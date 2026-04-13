@@ -117,14 +117,17 @@ std::tuple<torch::Tensor, torch::Tensor> TokenDataset::prepare_batch_cpu(int64_t
     }
   }
 
-  // Build index tensor for gather
+  // Build index tensor for gather. The [0, seq_len) range is shape-constant,
+  // so cache it across calls — avoids one CPU allocation per batch.
   auto idx_opts = torch::TensorOptions().dtype(torch::kInt64);
-  auto range = torch::arange(seq_len_, idx_opts);
+  if (!cpu_range_.defined()) {
+    cpu_range_ = torch::arange(seq_len_, idx_opts).unsqueeze(0);  // [1, seq_len]
+  }
   auto offset_tensor = torch::from_blob(
       offsets.data(), {batch_size, 1}, idx_opts).clone();
 
-  auto input_indices = offset_tensor + range.unsqueeze(0);
-  auto label_indices = offset_tensor + range.unsqueeze(0) + 1;
+  auto input_indices = offset_tensor + cpu_range_;
+  auto label_indices = input_indices + 1;
 
   auto input = tokens_tensor_.index_select(0, input_indices.reshape(-1)).reshape({batch_size, seq_len_});
   auto labels = tokens_tensor_.index_select(0, label_indices.reshape(-1)).reshape({batch_size, seq_len_});
@@ -178,10 +181,15 @@ std::tuple<torch::Tensor, torch::Tensor> TokenDataset::get_batch_gpu(int64_t bat
   auto offsets = gpu_chunk_indices_.narrow(0, gpu_cursor_, batch_size) * seq_len_;
   gpu_cursor_ += batch_size;
 
-  // Build gather indices entirely on GPU
-  auto range = torch::arange(seq_len_,
-      torch::TensorOptions().dtype(torch::kInt64).device(resident_device_));
-  auto input_indices = offsets.unsqueeze(1) + range.unsqueeze(0);   // [B, seq_len]
+  // Build gather indices entirely on GPU. The [0, seq_len) range is
+  // shape-constant, so cache it — avoids one GPU allocation + kernel
+  // launch on every step of the hot data path.
+  if (!gpu_range_.defined()) {
+    gpu_range_ = torch::arange(seq_len_,
+        torch::TensorOptions().dtype(torch::kInt64).device(resident_device_))
+        .unsqueeze(0);  // [1, seq_len]
+  }
+  auto input_indices = offsets.unsqueeze(1) + gpu_range_;   // [B, seq_len]
   auto label_indices = input_indices + 1;
 
   auto input = gpu_tokens_tensor_.index_select(0, input_indices.reshape(-1))

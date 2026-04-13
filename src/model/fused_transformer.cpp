@@ -45,18 +45,19 @@ FusedTransformerImpl::FusedTransformerImpl(const TransformerConfig& cfg)
   }
 }
 
-std::vector<RoPEBuffers> FusedTransformerImpl::get_rope_buffers(int64_t seq_len, torch::Device device,
-                                                                torch::Dtype dtype) {
+const std::vector<RoPEBuffers>& FusedTransformerImpl::get_rope_buffers(
+    int64_t seq_len, torch::Device device, torch::Dtype dtype) {
   if (seq_len <= cached_rope_len_ && !cached_rope_bufs_.empty() && dtype == cached_rope_dtype_) {
     return cached_rope_bufs_;
   }
 
   int64_t alloc_len = std::max(seq_len, cached_rope_len_ * 2);
+  // All layers currently share the same RoPE parameters, so compute one
+  // RoPEBuffers and populate the per-layer cache by (cheap) tensor-refcount
+  // copy. Avoids n_layers independent sin/cos allocations on cache miss.
   RotaryEmbedding rope(config_.get_head_dim(), config_.rope_theta);
-  cached_rope_bufs_.resize(static_cast<size_t>(config_.n_layers));
-  for (int64_t i = 0; i < config_.n_layers; ++i) {
-    cached_rope_bufs_[i] = rope->get_buffers(alloc_len, device, dtype);
-  }
+  auto bufs = rope->get_buffers(alloc_len, device, dtype);
+  cached_rope_bufs_.assign(static_cast<size_t>(config_.n_layers), bufs);
   cached_rope_len_ = alloc_len;
   cached_rope_dtype_ = dtype;
   return cached_rope_bufs_;
@@ -113,7 +114,7 @@ torch::Tensor FusedTransformerImpl::forward_backbone(
 
   int64_t cached_len = kv_cache ? kv_cache->seq_len() : 0;
   int64_t total_len = cached_len + new_seq_len;
-  auto rope_bufs = get_rope_buffers(total_len, device, h.dtype().toScalarType());
+  const auto& rope_bufs = get_rope_buffers(total_len, device, h.dtype().toScalarType());
 
   std::optional<int64_t> start_pos =
       kv_cache ? std::optional<int64_t>(cached_len) : std::nullopt;

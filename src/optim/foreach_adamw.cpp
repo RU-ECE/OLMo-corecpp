@@ -61,10 +61,22 @@ torch::Tensor ForeachAdamW::step(LossClosure closure) {
     const double eps = options.eps();
     const double weight_decay = options.weight_decay();
 
-    std::vector<torch::Tensor> params_vec;
-    std::vector<torch::Tensor> grads_vec;
-    std::vector<torch::Tensor> exp_avg_vec;
-    std::vector<torch::Tensor> exp_avg_sq_vec;
+    // Reuse the scratch vectors across steps — clear() retains capacity so
+    // we pay for one allocation per vector on the first step, zero on every
+    // step thereafter.
+    auto& params_vec = params_scratch_;
+    auto& grads_vec = grads_scratch_;
+    auto& exp_avg_vec = exp_avg_scratch_;
+    auto& exp_avg_sq_vec = exp_avg_sq_scratch_;
+    params_vec.clear();
+    grads_vec.clear();
+    exp_avg_vec.clear();
+    exp_avg_sq_vec.clear();
+    const size_t n_params = group.params().size();
+    params_vec.reserve(n_params);
+    grads_vec.reserve(n_params);
+    exp_avg_vec.reserve(n_params);
+    exp_avg_sq_vec.reserve(n_params);
 
     for (auto& p : group.params()) {
       if (!p.grad().defined()) continue;

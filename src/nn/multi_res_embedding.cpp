@@ -98,6 +98,13 @@ MultiResEmbeddingImpl::MultiResEmbeddingImpl(
         "char_proj",
         torch::nn::Linear(torch::nn::LinearOptions(config.char_embed_dim, d_model).bias(false)));
     build_char_trigram_map(bpe_vocab_path);
+    // [1, 1, T] int64 — shared mask template. Registered as a buffer so the
+    // module's .to(device) call places it on the correct device; forward can
+    // then use it directly without per-call allocation.
+    trigram_range_ = register_buffer(
+        "trigram_range",
+        torch::arange(config.max_trigrams_per_token, torch::kLong)
+            .unsqueeze(0).unsqueeze(0));
   }
 
   // Stream 4: Phrase context
@@ -243,11 +250,10 @@ torch::Tensor MultiResEmbeddingImpl::forward(torch::Tensor token_ids) {
     auto counts = char_trigram_count_.index_select(0, flat_ids)
                       .reshape({B, S}).to(e_chars.dtype());   // [B, S]
 
-    // Mask is built from an int64 range vs cast counts; comparison result is
-    // bool, then we cast to the activation dtype.
-    auto t_range = torch::arange(T, token_ids.options())
-                       .unsqueeze(0).unsqueeze(0);            // [1, 1, T]
-    auto mask = (t_range < counts.unsqueeze(-1))
+    // Mask is built from the precomputed [1, 1, T] range buffer and the
+    // per-token counts; comparison is bool, cast to the activation dtype.
+    (void)T;
+    auto mask = (trigram_range_ < counts.unsqueeze(-1))
                     .to(e_chars.dtype()).unsqueeze(-1);       // [B, S, T, 1]
 
     // Masked mean pooling: sum valid trigram embeddings / count
@@ -260,14 +266,13 @@ torch::Tensor MultiResEmbeddingImpl::forward(torch::Tensor token_ids) {
 
   // ── Stream 4: Phrase context (local syntactic) ──
   if (config_.enable_phrase_context && phrase_embed_) {
-    // Hash local context: (token[i-1] * P1 + token[i] * P2 + token[i+1] * P3) % phrase_buckets
-    // Using large primes for mixing (minimal collision, GPU-friendly arithmetic)
-    auto ids = token_ids.to(torch::kLong);
-    auto left = torch::roll(ids, 1, 1);                      // token[i-1]
-    auto right = torch::roll(ids, -1, 1);                    // token[i+1]
+    // Hash local context: (token[i-1] * P1 + token[i] * P2 + token[i+1] * P3) % phrase_buckets.
+    // token_ids is already int64 so we skip the redundant dtype cast.
+    auto left = torch::roll(token_ids, 1, 1);                // token[i-1]
+    auto right = torch::roll(token_ids, -1, 1);              // token[i+1]
 
     // Pure arithmetic — maps to a single CUDA kernel
-    auto phrase_hash = (left * 6291469 + ids * 12582917 + right * 25165843)
+    auto phrase_hash = (left * 6291469 + token_ids * 12582917 + right * 25165843)
                            % config_.phrase_buckets;
     phrase_hash = phrase_hash.abs();                           // ensure non-negative
 

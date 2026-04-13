@@ -87,6 +87,12 @@ class TokenDataset {
   int64_t gpu_cursor_ = 0;
   bool gpu_resident_ = false;
   torch::Device resident_device_{torch::kCPU};
+
+  // Cached [0, seq_len) index ranges used to build gather indices.
+  // Built once per device so we don't reallocate a seq_len tensor on every
+  // get_batch call (per-step GPU allocation + kernel launch).
+  torch::Tensor cpu_range_;   // [seq_len] int64 on host, built lazily in prepare_batch_cpu
+  torch::Tensor gpu_range_;   // [seq_len] int64 on GPU, built lazily in get_batch_gpu
 };
 
 }  // namespace olmo_cpp

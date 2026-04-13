@@ -320,6 +320,12 @@ int main(int argc, char** argv) {
     train_cfg.report_every          = train_ini.get_or<double>("report_every", 300.0);
     train_cfg.heartbeat_path        = train_ini.get_or<std::string>("heartbeat_path", "");
 
+    // ── Speculative Gradient Prediction ──
+    train_cfg.sgp_enabled           = opt_ini.get_or<bool>("sgp", false);
+    train_cfg.sgp_initial_k         = opt_ini.get_or<int64_t>("sgp_initial_k", 2);
+    train_cfg.sgp_max_k             = opt_ini.get_or<int64_t>("sgp_max_k", 8);
+    train_cfg.sgp_warmup_steps      = opt_ini.get_or<int64_t>("sgp_warmup_steps", 100);
+
     // ── Gradient statistics (SGP Phase 0) ──
     train_cfg.grad_stats_path       = train_ini.get_or<std::string>("grad_stats_path", "");
     train_cfg.grad_stats_interval   = train_ini.get_or<int64_t>("grad_stats_interval", 10);

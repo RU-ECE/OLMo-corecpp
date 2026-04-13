@@ -71,6 +71,12 @@ struct TrainConfig {
   // Async Muon: run Newton-Schulz orthogonalization on a side CUDA stream
   bool async_muon = false;
 
+  // Speculative Gradient Prediction (SGP)
+  bool sgp_enabled = false;
+  int64_t sgp_initial_k = 2;
+  int64_t sgp_max_k = 8;
+  int64_t sgp_warmup_steps = 100;
+
   // Gradient statistics (Phase 0 of SGP research track)
   std::string grad_stats_path;       // empty = disabled; path to CSV output
   int64_t grad_stats_interval = 10;  // steps between measurements

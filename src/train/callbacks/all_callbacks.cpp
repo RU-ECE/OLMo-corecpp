@@ -267,34 +267,43 @@ void GradientMonitorCallback::on_after_backward(TrainState& state) {
   if (state.global_step % log_interval_ != 0) return;
   if (!model_) return;
 
-  float min_norm = std::numeric_limits<float>::max();
-  float max_norm = 0.0f;
-  float total_norm = 0.0f;
-  int64_t param_count = 0;
-
+  // Collect per-param norms as device tensors first, then a single
+  // stack+transfer at the end. Replaces N_params syncs with one.
+  torch::NoGradGuard no_grad;
+  std::vector<torch::Tensor> norms;
+  norms.reserve(64);
   for (const auto& pair : model_->named_parameters()) {
     const auto& param = pair.value();
     if (!param.grad().defined()) continue;
+    norms.push_back(param.grad().norm().to(torch::kFloat));
+  }
+  if (norms.empty()) return;
 
-    float norm = param.grad().norm().item<float>();
-    min_norm = std::min(min_norm, norm);
-    max_norm = std::max(max_norm, norm);
-    total_norm += norm;
-    param_count++;
+  // Stack on-device, one sync to host.
+  const auto stacked = torch::stack(norms).to(torch::kCPU);
+  const auto* data = stacked.data_ptr<float>();
+  const int64_t param_count = stacked.size(0);
+
+  float min_norm = std::numeric_limits<float>::max();
+  float max_norm = 0.0f;
+  float total_norm = 0.0f;
+  for (int64_t i = 0; i < param_count; ++i) {
+    const float n = data[i];
+    min_norm = std::min(min_norm, n);
+    max_norm = std::max(max_norm, n);
+    total_norm += n;
   }
 
-  if (param_count > 0) {
-    float mean_norm = total_norm / static_cast<float>(param_count);
-    state.metrics["grad/min_norm"] = min_norm;
-    state.metrics["grad/max_norm"] = max_norm;
-    state.metrics["grad/mean_norm"] = mean_norm;
-    state.metrics["grad/num_params"] = static_cast<float>(param_count);
+  const float mean_norm = total_norm / static_cast<float>(param_count);
+  state.metrics["grad/min_norm"] = min_norm;
+  state.metrics["grad/max_norm"] = max_norm;
+  state.metrics["grad/mean_norm"] = mean_norm;
+  state.metrics["grad/num_params"] = static_cast<float>(param_count);
 
-    std::cout << "[GradientMonitor] step=" << state.global_step
-              << " grad_norms: min=" << min_norm << " max=" << max_norm
-              << " mean=" << mean_norm << " params=" << param_count
-              << std::endl;
-  }
+  std::cout << "[GradientMonitor] step=" << state.global_step
+            << " grad_norms: min=" << min_norm << " max=" << max_norm
+            << " mean=" << mean_norm << " params=" << param_count
+            << std::endl;
 }
 
 // ---------------------------------------------------------------------------
@@ -353,42 +362,100 @@ void GradientStatsCallback::on_after_backward(TrainState& state) {
   if (!model_) return;
 
   torch::NoGradGuard no_grad;
+
+  // Per-layer device-side metrics. All computations stay on-device; we batch
+  // the final transfer into a single stack+copy so the whole callback costs
+  // one sync instead of O(N_params).
+  struct LayerMetrics {
+    size_t tracked_idx;
+    int64_t numel;
+    bool was_initialized;
+    torch::Tensor l2_norm;     // 0-dim float, device
+    torch::Tensor cosine_sim;  // 0-dim float, device
+    torch::Tensor pred_error;  // 0-dim float, device
+  };
+  std::vector<LayerMetrics> metrics;
+  metrics.reserve(tracked_.size());
+
   size_t ti = 0;
   for (const auto& pair : model_->named_parameters()) {
     const auto& param = pair.value();
     if (param.dim() < 2) continue;
     if (ti >= tracked_.size()) break;
 
-    auto& ps = tracked_[ti++];
+    const size_t this_ti = ti++;
+    auto& ps = tracked_[this_ti];
     if (!param.grad().defined()) continue;
 
-    // Flatten and sample on CPU to avoid polluting GPU memory
-    auto grad_flat = param.grad().detach().reshape(-1).to(torch::kCPU, torch::kFloat);
-    auto sampled = grad_flat.index_select(0, ps.sample_indices);
-
-    float l2_norm = sampled.norm().item<float>();
-    float cosine_sim = 0.0f;
-    float pred_error = 0.0f;
-
-    if (ps.initialized) {
-      auto dot = (sampled * ps.prev_sampled).sum().item<float>();
-      float prev_norm = ps.prev_sampled.norm().item<float>();
-      float denom = l2_norm * prev_norm;
-      cosine_sim = (denom > 1e-12f) ? (dot / denom) : 0.0f;
-
-      // L1 prediction error: how close was prev_grad to current_grad?
-      pred_error = (sampled - ps.prev_sampled).abs().mean().item<float>();
+    // Move the fixed sample indices onto the param's device on first use.
+    if (!ps.sample_indices.defined()) continue;
+    if (ps.sample_indices.device() != param.device()) {
+      ps.sample_indices = ps.sample_indices.to(param.device());
     }
 
+    const auto grad_flat = param.grad().detach().reshape(-1).to(torch::kFloat);
+    const auto sampled = grad_flat.index_select(0, ps.sample_indices);
+
+    LayerMetrics m;
+    m.tracked_idx = this_ti;
+    m.numel = param.numel();
+    m.was_initialized = ps.initialized;
+    m.l2_norm = sampled.norm();
+
+    if (ps.initialized) {
+      const auto dot = (sampled * ps.prev_sampled).sum();
+      const auto prev_norm = ps.prev_sampled.norm();
+      const auto denom = m.l2_norm * prev_norm;
+      // Device-side guard: where denom is degenerate, emit 0 instead of a
+      // division that would explode. Matches the old CPU branch without a
+      // host-side if.
+      const auto safe_cos = dot / denom.clamp_min(1e-12f);
+      m.cosine_sim = torch::where(
+          denom > 1e-12f, safe_cos, torch::zeros_like(safe_cos));
+      m.pred_error = (sampled - ps.prev_sampled).abs().mean();
+    } else {
+      m.cosine_sim = torch::zeros({}, sampled.options());
+      m.pred_error = torch::zeros({}, sampled.options());
+    }
+
+    // prev_sampled stays on-device now — ~num_samples floats per tracked
+    // param, trivial VRAM vs. avoiding the per-param CPU round-trip.
     ps.prev_sampled = sampled;
     ps.initialized = true;
+    metrics.push_back(std::move(m));
+  }
 
+  if (metrics.empty()) return;
+
+  // Stack per-metric, one sync to host covers all three arrays.
+  std::vector<torch::Tensor> l2_list, cos_list, pe_list;
+  l2_list.reserve(metrics.size());
+  cos_list.reserve(metrics.size());
+  pe_list.reserve(metrics.size());
+  for (const auto& m : metrics) {
+    l2_list.push_back(m.l2_norm);
+    cos_list.push_back(m.cosine_sim);
+    pe_list.push_back(m.pred_error);
+  }
+  const auto l2_cpu = torch::stack(l2_list).to(torch::kCPU);
+  const auto cos_cpu = torch::stack(cos_list).to(torch::kCPU);
+  const auto pe_cpu = torch::stack(pe_list).to(torch::kCPU);
+
+  const auto* l2_p = l2_cpu.data_ptr<float>();
+  const auto* cos_p = cos_cpu.data_ptr<float>();
+  const auto* pe_p = pe_cpu.data_ptr<float>();
+
+  for (size_t i = 0; i < metrics.size(); ++i) {
+    const auto& m = metrics[i];
+    const auto& ps = tracked_[m.tracked_idx];
+    const float cos = m.was_initialized ? cos_p[i] : 0.0f;
+    const float pe = m.was_initialized ? pe_p[i] : 0.0f;
     out_ << state.global_step << ","
          << ps.name << ","
-         << param.numel() << ","
-         << l2_norm << ","
-         << cosine_sim << ","
-         << pred_error << "\n";
+         << m.numel << ","
+         << l2_p[i] << ","
+         << cos << ","
+         << pe << "\n";
   }
   out_.flush();
 }

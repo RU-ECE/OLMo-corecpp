@@ -45,22 +45,30 @@ Muon::Muon(std::vector<torch::optim::OptimizerParamGroup> param_groups, MuonOpti
           std::make_unique<MuonOptions>(defaults)) {}
 
 torch::Tensor Muon::newton_schulz_orthogonalize(torch::Tensor G, int64_t steps) {
+  // Device-side only — called on the async Muon side stream for 2D params.
+  // Any host sync here (e.g. .item()) serializes the side stream against the
+  // main stream and destroys the async overlap.
   bool transposed = false;
   if (G.size(0) < G.size(1)) {
     G = G.t();
     transposed = true;
   }
 
-  auto norm = G.norm();
-  if (norm.item<double>() < 1e-12) {
-    return transposed ? G.t() : G;
-  }
+  // clamp_min keeps the division safe without a host-side branch. For a
+  // genuinely zero-norm grad the result is a vanishingly small X that the
+  // NS iteration leaves near-zero; the caller's learning rate scales it
+  // down further, so the numerical effect is indistinguishable from the
+  // old early-return.
+  auto norm = G.norm().clamp_min(1e-12);
   auto X = G / norm;
 
-  auto I = torch::eye(X.size(1), X.options());
+  // X @ (3I - A)/2  ≡  1.5*X - 0.5*X@A.
+  // Equivalent matmul count, but avoids allocating and materializing the
+  // (X.size(1) × X.size(1)) identity matrix every NS iteration.
   for (int64_t i = 0; i < steps; ++i) {
     auto A = torch::mm(X.t(), X);
-    X = torch::mm(X, (3.0 * I - A) / 2.0);
+    auto XA = torch::mm(X, A);
+    X = X * 1.5 - XA * 0.5;
   }
 
   X = X * norm;

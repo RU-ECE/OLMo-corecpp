@@ -190,6 +190,7 @@ set(OLMO_SOURCES
     src/optim/grad_clip.cpp
     src/optim/skip_step.cpp
     src/optim/sgp.cpp
+    src/optim/sgp_v2.cpp
     src/optim/scheduler.cpp
     # Evaluation
     src/eval/metrics.cpp

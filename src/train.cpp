@@ -19,6 +19,7 @@
 #include "olmo_cpp/optim/skip_step.hpp"
 #include "olmo_cpp/optim/scheduler.hpp"
 #include "olmo_cpp/optim/sgp.hpp"
+#include "olmo_cpp/optim/sgp_v2.hpp"
 #include "olmo_cpp/train/callback.hpp"
 #include "olmo_cpp/train/grad_scaler.hpp"
 #include "olmo_cpp/train/activation_checkpoint.hpp"
@@ -698,7 +699,7 @@ void train(
   for (auto& cb : callbacks) cb_mgr.add(cb);
 
   // ---- SGP (Speculative Gradient Prediction) ----
-  std::unique_ptr<SGPPredictor> sgp;
+  std::unique_ptr<ISGPPredictor> sgp;
   if (cfg.sgp_enabled) {
     SGPConfig sgp_cfg;
     sgp_cfg.initial_k = cfg.sgp_initial_k;
@@ -706,11 +707,18 @@ void train(
     sgp_cfg.warmup_steps = cfg.sgp_warmup_steps;
     std::vector<torch::Tensor> sgp_params;
     for (auto& p : model->parameters()) sgp_params.push_back(p);
-    sgp = std::make_unique<SGPPredictor>(sgp_params, sgp_cfg);
+    if (cfg.sgp_version == 2) {
+      sgp = std::make_unique<SGPv2Predictor>(sgp_params, sgp_cfg, cfg.sgp_rank);
+    } else {
+      sgp = std::make_unique<SGPPredictor>(sgp_params, sgp_cfg);
+    }
     if (rank == 0) {
-      std::cout << "SGP: enabled (initial_k=" << sgp_cfg.initial_k
+      std::cout << "SGP: enabled v" << cfg.sgp_version
+                << " (initial_k=" << sgp_cfg.initial_k
                 << ", max_k=" << sgp_cfg.max_k
-                << ", warmup=" << sgp_cfg.warmup_steps << ")\n";
+                << ", warmup=" << sgp_cfg.warmup_steps;
+      if (cfg.sgp_version == 2) std::cout << ", rank=" << cfg.sgp_rank;
+      std::cout << ")\n";
     }
   }
 

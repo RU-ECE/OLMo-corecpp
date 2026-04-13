@@ -322,9 +322,11 @@ int main(int argc, char** argv) {
 
     // ── Speculative Gradient Prediction ──
     train_cfg.sgp_enabled           = opt_ini.get_or<bool>("sgp", false);
+    train_cfg.sgp_version           = opt_ini.get_or<int64_t>("sgp_version", 1);
     train_cfg.sgp_initial_k         = opt_ini.get_or<int64_t>("sgp_initial_k", 2);
     train_cfg.sgp_max_k             = opt_ini.get_or<int64_t>("sgp_max_k", 8);
     train_cfg.sgp_warmup_steps      = opt_ini.get_or<int64_t>("sgp_warmup_steps", 100);
+    train_cfg.sgp_rank              = opt_ini.get_or<int64_t>("sgp_rank", 4);
 
     // ── Gradient statistics (SGP Phase 0) ──
     train_cfg.grad_stats_path       = train_ini.get_or<std::string>("grad_stats_path", "");

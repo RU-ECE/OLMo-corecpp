@@ -73,9 +73,11 @@ struct TrainConfig {
 
   // Speculative Gradient Prediction (SGP)
   bool sgp_enabled = false;
+  int64_t sgp_version = 1;         // 1 = linear predictor (v1); 2 = rank-r subspace (v2)
   int64_t sgp_initial_k = 2;
   int64_t sgp_max_k = 8;
   int64_t sgp_warmup_steps = 100;
+  int64_t sgp_rank = 4;            // rank for v2 subspace predictor
 
   // Gradient statistics (Phase 0 of SGP research track)
   std::string grad_stats_path;       // empty = disabled; path to CSV output

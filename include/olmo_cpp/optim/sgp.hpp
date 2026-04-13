@@ -24,25 +24,33 @@ struct SGPConfig {
   int64_t min_param_numel = 1024; // only predict for params above this size
 };
 
-class SGPPredictor {
+/// Abstract interface so v1 (linear) and v2 (rank-r subspace) can share a call site.
+class ISGPPredictor {
+ public:
+  virtual ~ISGPPredictor() = default;
+  virtual bool should_skip_backward(int64_t global_step) const = 0;
+  virtual void observe_real_gradients() = 0;
+  virtual void apply_predicted_gradients() = 0;
+  virtual int64_t current_k() const = 0;
+  virtual double last_prediction_error() const = 0;
+  virtual int64_t skipped_steps() const = 0;
+  virtual int64_t total_steps() const = 0;
+  virtual double skip_rate() const = 0;
+};
+
+class SGPPredictor : public ISGPPredictor {
  public:
   SGPPredictor(const std::vector<torch::Tensor>& params, SGPConfig config = {});
 
-  /// Returns true if the current step should skip backward (use predicted grads)
-  bool should_skip_backward(int64_t global_step) const;
+  bool should_skip_backward(int64_t global_step) const override;
+  void observe_real_gradients() override;
+  void apply_predicted_gradients() override;
 
-  /// Call after a real backward — records the true gradients for future prediction
-  void observe_real_gradients();
-
-  /// Call instead of backward — fills param.grad() with predicted gradients
-  void apply_predicted_gradients();
-
-  /// Statistics
-  int64_t current_k() const { return k_; }
-  double last_prediction_error() const { return last_error_; }
-  int64_t skipped_steps() const { return skipped_; }
-  int64_t total_steps() const { return total_; }
-  double skip_rate() const { return total_ > 0 ? static_cast<double>(skipped_) / total_ : 0.0; }
+  int64_t current_k() const override { return k_; }
+  double last_prediction_error() const override { return last_error_; }
+  int64_t skipped_steps() const override { return skipped_; }
+  int64_t total_steps() const override { return total_; }
+  double skip_rate() const override { return total_ > 0 ? static_cast<double>(skipped_) / total_ : 0.0; }
 
  private:
   struct ParamState {

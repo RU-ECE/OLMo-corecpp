@@ -1,10 +1,15 @@
 #include "olmo_cpp/optim/muon.hpp"
 
+#ifdef USE_CUDA
+#include <c10/cuda/CUDAStream.h>
+#include <ATen/cuda/CUDAEvent.h>
+#include <c10/cuda/CUDAGuard.h>
+#endif
+
 namespace olmo_cpp {
 
 namespace {
 
-/// Per-parameter state for Muon optimizer
 struct MuonParamState : public torch::optim::OptimizerCloneableParamState<MuonParamState> {
   TORCH_ARG(torch::Tensor, momentum_buffer);
   TORCH_ARG(int64_t, step) = 0;
@@ -40,32 +45,24 @@ Muon::Muon(std::vector<torch::optim::OptimizerParamGroup> param_groups, MuonOpti
           std::make_unique<MuonOptions>(defaults)) {}
 
 torch::Tensor Muon::newton_schulz_orthogonalize(torch::Tensor G, int64_t steps) {
-  // Newton-Schulz iteration for polar decomposition
-  // Finds the nearest orthogonal matrix to G
-  //
-  // For a tall matrix (rows >= cols), we compute U from the polar decomposition G = U * S
-  // For a wide matrix (rows < cols), we transpose, orthogonalize, then transpose back
   bool transposed = false;
   if (G.size(0) < G.size(1)) {
     G = G.t();
     transposed = true;
   }
 
-  // Normalize by Frobenius norm
   auto norm = G.norm();
   if (norm.item<double>() < 1e-12) {
     return transposed ? G.t() : G;
   }
   auto X = G / norm;
 
-  // Newton-Schulz iterations: X = X * (3*I - X^T @ X) / 2
   auto I = torch::eye(X.size(1), X.options());
   for (int64_t i = 0; i < steps; ++i) {
     auto A = torch::mm(X.t(), X);
     X = torch::mm(X, (3.0 * I - A) / 2.0);
   }
 
-  // Scale back by original norm
   X = X * norm;
 
   if (transposed) {
@@ -88,6 +85,8 @@ torch::Tensor Muon::step(LossClosure closure) {
     const double mom = options.momentum();
     const double weight_decay = options.weight_decay();
     const int64_t ns_steps = options.ns_steps();
+    const bool async_ns = options.async_ns();
+    const int64_t async_min = options.async_min_numel();
 
     for (auto& p : group.params()) {
       if (!p.grad().defined()) {
@@ -97,7 +96,6 @@ torch::Tensor Muon::step(LossClosure closure) {
       auto grad = p.grad();
       auto key = p.unsafeGetTensorImpl();
 
-      // Initialize state if needed
       if (state_.find(key) == state_.end()) {
         auto s = std::make_unique<MuonParamState>();
         s->momentum_buffer(torch::zeros_like(p.data()));
@@ -109,25 +107,52 @@ torch::Tensor Muon::step(LossClosure closure) {
       auto& buf = state.momentum_buffer();
       state.step(state.step() + 1);
 
-      // Step 1: Weight decay (decoupled)
       if (weight_decay != 0.0) {
         p.data().add_(p.data(), -lr * weight_decay);
       }
 
-      // Step 2: Update momentum buffer: buf = momentum * buf + grad
       buf.mul_(mom).add_(grad);
 
-      // Step 3: Compute update
       torch::Tensor update;
+
       if (p.dim() == 2) {
-        // For 2D (matrix) parameters: apply Newton-Schulz orthogonalization
+#ifdef USE_CUDA
+        if (async_ns && p.is_cuda() && p.numel() >= async_min) {
+          // ── Async path: apply previous step's ortho, launch current on side stream ──
+          auto it = async_states_.find(key);
+          if (it != async_states_.end() && it->second.has_pending) {
+            // Wait for the side stream to finish previous NS
+            it->second.ready_event.block(at::cuda::getCurrentCUDAStream(p.device().index()));
+            // Apply the stale-by-1-step orthogonalized update
+            p.data().add_(it->second.pending_update, -lr);
+          }
+
+          // Launch current NS on side stream
+          if (!ns_stream_.has_value()) {
+            ns_stream_ = at::cuda::getStreamFromPool(false, p.device().index());
+          }
+
+          auto& as = async_states_[key];
+          {
+            // Record an event on the current stream so the NS stream waits
+            // until buf is fully computed before reading it.
+            at::cuda::CUDAEvent buf_ready;
+            buf_ready.record(at::cuda::getCurrentCUDAStream(p.device().index()));
+            buf_ready.block(*ns_stream_);
+
+            c10::cuda::CUDAStreamGuard guard(*ns_stream_);
+            as.pending_update = newton_schulz_orthogonalize(buf, ns_steps);
+            as.ready_event.record(*ns_stream_);
+            as.has_pending = true;
+          }
+          continue;  // skip synchronous apply — will be applied next step
+        }
+#endif
         update = newton_schulz_orthogonalize(buf, ns_steps);
       } else {
-        // For non-matrix parameters: just use the momentum buffer directly
         update = buf;
       }
 
-      // Step 4: Apply update
       p.data().add_(update, -lr);
     }
   }

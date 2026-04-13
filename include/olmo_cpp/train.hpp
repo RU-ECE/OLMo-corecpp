@@ -67,6 +67,13 @@ struct TrainConfig {
   // Heartbeat monitoring
   double report_every = 300.0;       // seconds between heartbeat writes (0 = disabled)
   std::string heartbeat_path;        // file to write heartbeat to (empty = disabled)
+
+  // Async Muon: run Newton-Schulz orthogonalization on a side CUDA stream
+  bool async_muon = false;
+
+  // Gradient statistics (Phase 0 of SGP research track)
+  std::string grad_stats_path;       // empty = disabled; path to CSV output
+  int64_t grad_stats_interval = 10;  // steps between measurements
 };
 
 /// Train for num_steps (legacy API, kept for backward compat)

@@ -12,6 +12,9 @@ class RMSNormImpl : public torch::nn::Module {
 
   torch::Tensor forward(torch::Tensor x);
 
+  /// Fused: returns residual + rms_norm(x) * weight
+  torch::Tensor forward_add(torch::Tensor x, torch::Tensor residual);
+
  private:
   torch::Tensor weight_;
   double eps_;

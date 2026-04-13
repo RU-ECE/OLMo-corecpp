@@ -298,6 +298,109 @@ void GradientMonitorCallback::on_after_backward(TrainState& state) {
 }
 
 // ---------------------------------------------------------------------------
+// 6b. GradientStatsCallback — per-layer gradient predictability measurement
+// ---------------------------------------------------------------------------
+
+GradientStatsCallback::GradientStatsCallback(
+    const std::string& output_path, const std::string& mode,
+    int64_t log_interval, int64_t num_samples)
+    : output_path_(output_path), mode_(mode),
+      log_interval_(log_interval), num_samples_(num_samples) {}
+
+bool GradientStatsCallback::should_track(const std::string& name) const {
+  // Track 2D+ weight matrices (attention, FFN, projections) — these are what
+  // SGP would predict. Skip biases, norms, embeddings (1D or too small).
+  (void)name;
+  return true;  // filtering done by dim check in on_train_start
+}
+
+void GradientStatsCallback::on_train_start(TrainState& /*state*/) {
+  if (!model_) return;
+
+  fs::path p(output_path_);
+  if (p.has_parent_path()) fs::create_directories(p.parent_path());
+  out_.open(output_path_, std::ios::trunc);
+  if (!out_.is_open()) {
+    std::cerr << "[GradientStats] Failed to open " << output_path_ << "\n";
+    return;
+  }
+  out_ << "step,layer,numel,l2_norm,cosine_sim,pred_error_l1\n";
+
+  tracked_.clear();
+  for (const auto& pair : model_->named_parameters()) {
+    const auto& param = pair.value();
+    if (param.dim() < 2) continue;  // skip 1D (norms, biases)
+
+    ParamState ps;
+    ps.name = pair.key();
+
+    int64_t numel = param.numel();
+    int64_t ns = std::min(num_samples_, numel);
+    // Fixed random sample indices — consistent across steps for fair comparison
+    ps.sample_indices = torch::randperm(numel, torch::kLong).narrow(0, 0, ns);
+    ps.initialized = false;
+    tracked_.push_back(std::move(ps));
+  }
+
+  std::cout << "[GradientStats] Tracking " << tracked_.size()
+            << " parameters, " << num_samples_ << " samples each → "
+            << output_path_ << "\n";
+}
+
+void GradientStatsCallback::on_after_backward(TrainState& state) {
+  if (!out_.is_open()) return;
+  if (state.global_step % log_interval_ != 0) return;
+  if (!model_) return;
+
+  torch::NoGradGuard no_grad;
+  size_t ti = 0;
+  for (const auto& pair : model_->named_parameters()) {
+    const auto& param = pair.value();
+    if (param.dim() < 2) continue;
+    if (ti >= tracked_.size()) break;
+
+    auto& ps = tracked_[ti++];
+    if (!param.grad().defined()) continue;
+
+    // Flatten and sample on CPU to avoid polluting GPU memory
+    auto grad_flat = param.grad().detach().reshape(-1).to(torch::kCPU, torch::kFloat);
+    auto sampled = grad_flat.index_select(0, ps.sample_indices);
+
+    float l2_norm = sampled.norm().item<float>();
+    float cosine_sim = 0.0f;
+    float pred_error = 0.0f;
+
+    if (ps.initialized) {
+      auto dot = (sampled * ps.prev_sampled).sum().item<float>();
+      float prev_norm = ps.prev_sampled.norm().item<float>();
+      float denom = l2_norm * prev_norm;
+      cosine_sim = (denom > 1e-12f) ? (dot / denom) : 0.0f;
+
+      // L1 prediction error: how close was prev_grad to current_grad?
+      pred_error = (sampled - ps.prev_sampled).abs().mean().item<float>();
+    }
+
+    ps.prev_sampled = sampled;
+    ps.initialized = true;
+
+    out_ << state.global_step << ","
+         << ps.name << ","
+         << param.numel() << ","
+         << l2_norm << ","
+         << cosine_sim << ","
+         << pred_error << "\n";
+  }
+  out_.flush();
+}
+
+void GradientStatsCallback::on_train_end(TrainState& /*state*/) {
+  if (out_.is_open()) {
+    out_.close();
+    std::cout << "[GradientStats] Saved to " << output_path_ << "\n";
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 7. MetricSaverCallback
 // ---------------------------------------------------------------------------
 

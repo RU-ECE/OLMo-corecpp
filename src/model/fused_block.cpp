@@ -19,11 +19,11 @@ torch::Tensor FusedTransformerBlockImpl::forward(
   auto& backend = get_backend();
   backend.begin_scope();
 
-  // Attention with fused QKV projection
-  auto h = x + attention_norm_(attention_(x, rope_bufs, start_pos, layer_cache));
+  // Fused norm+residual: h = x + rms_norm(attention(x))
+  auto h = attention_norm_->forward_add(attention_(x, rope_bufs, start_pos, layer_cache), x);
 
-  // Feed-forward with fused gate_up projection
-  auto out = h + feed_forward_norm_(feed_forward_(h));
+  // Fused norm+residual: out = h + rms_norm(ffn(h))
+  auto out = feed_forward_norm_->forward_add(feed_forward_(h), h);
 
   backend.end_scope();
   return out;

@@ -15,4 +15,9 @@ torch::Tensor RMSNormImpl::forward(torch::Tensor x) {
   return get_backend().rms_norm(x, w, eps_);
 }
 
+torch::Tensor RMSNormImpl::forward_add(torch::Tensor x, torch::Tensor residual) {
+  torch::Tensor w = (elementwise_affine_ && weight_.defined()) ? weight_ : torch::Tensor();
+  return get_backend().rms_norm_add(x, residual, w, eps_);
+}
+
 }  // namespace olmo_cpp

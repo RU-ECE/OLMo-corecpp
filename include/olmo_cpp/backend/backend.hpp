@@ -33,6 +33,11 @@ class IBackend {
   virtual torch::Tensor residual_rms_norm(torch::Tensor x, torch::Tensor residual,
                                            torch::Tensor weight, double eps);
 
+  /// Fused RMSNorm + residual add: returns residual + norm(x) * weight
+  /// One pass over x and residual instead of two (norm then add).
+  virtual torch::Tensor rms_norm_add(torch::Tensor x, torch::Tensor residual,
+                                      torch::Tensor weight, double eps);
+
   /// Arena memory hints (no-ops by default)
   virtual void begin_scope() {}
   virtual void end_scope() {}

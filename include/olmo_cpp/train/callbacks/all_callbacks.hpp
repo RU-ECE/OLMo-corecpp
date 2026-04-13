@@ -86,6 +86,39 @@ class GradientMonitorCallback : public Callback {
   std::shared_ptr<torch::nn::Module> model_;
 };
 
+// 6b. Gradient statistics logger — per-layer cosine similarity, L2 norms.
+// Used by the SGP research track (speed-xp-sg) to measure how predictable
+// gradients are step-to-step before building a predictor. Index-sampling
+// keeps memory O(num_tracked * NUM_SAMPLES) instead of O(total_params).
+class GradientStatsCallback : public Callback {
+ public:
+  GradientStatsCallback(const std::string& output_path,
+                        const std::string& mode = "sample",
+                        int64_t log_interval = 10,
+                        int64_t num_samples = 4096);
+  std::string name() const override { return "GradientStats"; }
+  void on_train_start(TrainState& state) override;
+  void on_after_backward(TrainState& state) override;
+  void on_train_end(TrainState& state) override;
+  void set_model(std::shared_ptr<torch::nn::Module> model) { model_ = std::move(model); }
+ private:
+  struct ParamState {
+    std::string name;
+    torch::Tensor sample_indices;   // int64, fixed at train_start
+    torch::Tensor prev_sampled;     // same dtype as grad, [num_samples]
+    bool initialized = false;
+  };
+  bool should_track(const std::string& name) const;
+
+  std::string output_path_;
+  std::string mode_;
+  int64_t log_interval_;
+  int64_t num_samples_;
+  std::ofstream out_;
+  std::shared_ptr<torch::nn::Module> model_;
+  std::vector<ParamState> tracked_;
+};
+
 // 7. Metric saver: save metrics to JSON file
 class MetricSaverCallback : public Callback {
  public:

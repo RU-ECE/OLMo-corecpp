@@ -14,6 +14,7 @@
 #include "olmo_cpp/profiler.hpp"
 #include "olmo_cpp/backend/simd_backend.hpp"
 #include "olmo_cpp/backend/cuda_backend.hpp"
+#include "olmo_cpp/train/callbacks/all_callbacks.hpp"
 #include <torch/torch.h>
 #include <filesystem>
 #include <iostream>
@@ -107,7 +108,17 @@ void run(Model& model, const olmo_cpp::TransformerConfig& cfg,
     std::cout << "Weights: BF16 (saves ~50% GPU memory)\n";
   }
 
-  olmo_cpp::train(model, cfg, train_cfg, device);
+  // ── Build callbacks ──
+  std::vector<std::shared_ptr<olmo_cpp::Callback>> callbacks;
+  std::shared_ptr<olmo_cpp::GradientStatsCallback> grad_stats_cb;
+  if (!train_cfg.grad_stats_path.empty()) {
+    grad_stats_cb = std::make_shared<olmo_cpp::GradientStatsCallback>(
+        train_cfg.grad_stats_path, "sample", train_cfg.grad_stats_interval);
+    grad_stats_cb->set_model(model.ptr());
+    callbacks.push_back(grad_stats_cb);
+  }
+
+  olmo_cpp::train(model, cfg, train_cfg, device, std::move(callbacks));
 
   if (enable_profile) {
     olmo_cpp::profiler().report("Training Profile");
@@ -303,10 +314,15 @@ int main(int argc, char** argv) {
     train_cfg.max_gpu_data_tokens   = opt_ini.get_or<int64_t>("gpu_data_max_tokens", 0);
     train_cfg.log_interval          = train_ini.get_or<int64_t>("log_interval", 10);
     train_cfg.use_cuda_graph        = opt_ini.get_or<bool>("cuda_graph", false);
+    train_cfg.async_muon            = opt_ini.get_or<bool>("async_muon", false);
 
     // ── Heartbeat monitoring ──
     train_cfg.report_every          = train_ini.get_or<double>("report_every", 300.0);
     train_cfg.heartbeat_path        = train_ini.get_or<std::string>("heartbeat_path", "");
+
+    // ── Gradient statistics (SGP Phase 0) ──
+    train_cfg.grad_stats_path       = train_ini.get_or<std::string>("grad_stats_path", "");
+    train_cfg.grad_stats_interval   = train_ini.get_or<int64_t>("grad_stats_interval", 10);
 
     // ── Device ──
     std::string device_pref = dev_ini.get_or<std::string>("device", "auto");

@@ -31,6 +31,11 @@ torch::Tensor IBackend::residual_rms_norm(torch::Tensor x, torch::Tensor residua
   return rms_norm(h, weight, eps);
 }
 
+torch::Tensor IBackend::rms_norm_add(torch::Tensor x, torch::Tensor residual,
+                                      torch::Tensor weight, double eps) {
+  return residual + rms_norm(x, weight, eps);
+}
+
 // ---------------------------------------------------------------------------
 // Default LibTorch backend (just inherits default impls)
 // ---------------------------------------------------------------------------

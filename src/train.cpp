@@ -314,8 +314,8 @@ void train(
     optim_display = "Lion";
   } else if (cfg.optimizer == "muon") {
     optimizer = std::make_unique<Muon>(
-        model->parameters(), MuonOptions(cfg.lr));
-    optim_display = "Muon";
+        model->parameters(), MuonOptions(cfg.lr).async_ns(cfg.async_muon));
+    optim_display = cfg.async_muon ? "Muon (async NS)" : "Muon";
   } else if (cfg.optimizer == "dion") {
     optimizer = std::make_unique<DION>(
         model->parameters(), DIONOptions(cfg.lr).weight_decay(cfg.weight_decay));
@@ -692,6 +692,10 @@ void train(
     for (auto& p : model->parameters()) ddp_params.push_back(p);
   }
 
+  // ---- Callback manager ----
+  CallbackManager cb_mgr;
+  for (auto& cb : callbacks) cb_mgr.add(cb);
+
   // Epoch tracking
   int64_t tokens_per_step = cfg.batch_size * cfg.seq_len * cfg.grad_accum_steps;
   int64_t dataset_tokens = dataset ? dataset->size() * cfg.seq_len : 0;
@@ -713,6 +717,12 @@ void train(
               << " every ~" << cfg.report_every << "s" << std::endl;
   }
 
+  TrainState state;
+  state.batch_size = cfg.batch_size;
+  state.seq_len = cfg.seq_len;
+  state.train_start = std::chrono::steady_clock::now();
+  cb_mgr.on_train_start(state);
+
   auto train_start = std::chrono::steady_clock::now();
   int64_t total_tokens = 0;
 
@@ -727,9 +737,10 @@ void train(
   // Eliminates per-kernel launch overhead (~5μs × 100+ kernels = 0.5-1ms/step)
   // and enables the GPU to pipeline operations without waiting for CPU dispatch.
   //
-  // Requirements: CUDA device, fixed shapes (no curriculum), grad_accum=1,
-  // no DDP (allreduce is cross-device). The optimizer step runs OUTSIDE the
-  // graph because lr/bias_correction change per step.
+  // Requirements: CUDA device, fixed shapes (no curriculum), no activation
+  // checkpointing, no DDP (allreduce is cross-device). The optimizer step
+  // runs OUTSIDE the graph because lr/bias_correction change per step.
+  // grad_accum > 1 works: we replay the captured graph N times per step.
   // ---------------------------------------------------------------------------
   bool graph_active = false;
 #ifdef USE_CUDA
@@ -814,7 +825,13 @@ void train(
 
   for (int64_t step = 0; step < cfg.num_steps; ++step) {
     auto step_start = std::chrono::steady_clock::now();
+    state.global_step = step;
+    state.step_start = step_start;
+    state.tokens_seen = total_tokens;
+    cb_mgr.on_step_start(state);
+
     double cur_lr = scheduler->get_lr(step, cfg.num_steps);
+    state.learning_rate = static_cast<float>(cur_lr);
     scheduler->apply(*optimizer, step, cfg.num_steps);
 
     // Epoch boundary detection
@@ -903,6 +920,8 @@ void train(
       }
     }
 
+    cb_mgr.on_after_backward(state);
+
     // Gradient sync + optimizer step always OUTSIDE graph
     // (LR and bias correction change per step)
     if (ddp && ddp->is_distributed()) {
@@ -911,12 +930,15 @@ void train(
 
     clip_grad_norm_gpu(model_params, cfg.max_grad_norm);
     optimizer->step();
+    cb_mgr.on_after_optimizer_step(state);
 
     total_tokens += tokens_per_step;
+    state.tokens_seen = total_tokens;
 
     // Defer D2H sync: only pull loss from GPU on log steps
     if (step % cfg.log_interval == 0 && rank == 0) {
       float accum_loss = accum_loss_tensor.item<float>();
+      state.loss = accum_loss;
       epoch_loss_sum += accum_loss;
       epoch_loss_count++;
       auto step_end = std::chrono::steady_clock::now();
@@ -932,7 +954,11 @@ void train(
                 << "  tok/s: " << static_cast<int>(tok_per_s)
                 << std::endl;
     }
+
+    cb_mgr.on_step_end(state);
   }
+
+  cb_mgr.on_train_end(state);
 
   if (rank == 0) {
     if (heartbeat_enabled)

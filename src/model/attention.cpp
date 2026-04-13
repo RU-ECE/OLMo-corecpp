@@ -90,11 +90,14 @@ torch::Tensor AttentionImpl::forward(
         mask = mask & (cols <= (rows + offset));
       }
 
+      // Mask dtype must match the activation dtype so SDPA doesn't reject a
+      // BF16 q/k/v with an FP32 attention bias (same class of bug as the one
+      // that killed 7B startup).
+      auto mask_opts = torch::TensorOptions().dtype(x.dtype()).device(x.device());
       cached_attn_mask_ = torch::where(
           mask,
-          torch::zeros({S, full_S}, torch::TensorOptions().dtype(torch::kFloat).device(x.device())),
-          torch::full({S, full_S}, -std::numeric_limits<float>::infinity(),
-                      torch::TensorOptions().dtype(torch::kFloat).device(x.device())));
+          torch::zeros({S, full_S}, mask_opts),
+          torch::full({S, full_S}, -std::numeric_limits<float>::infinity(), mask_opts));
       cached_mask_S_ = S;
       cached_mask_full_S_ = full_S;
     }

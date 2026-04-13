@@ -116,11 +116,14 @@ torch::Tensor FusedAttentionImpl::forward(
         mask = mask & (cols <= (rows + offset));
       }
 
+      // Mask dtype must match the activation dtype, otherwise SDPA with BF16
+      // q/k/v and an FP32 mask will throw the same dtype-mismatch error we
+      // already fixed in DC-MRE.
+      auto mask_opts = torch::TensorOptions().dtype(x.dtype()).device(x.device());
       cached_attn_mask_ = torch::where(
           mask,
-          torch::zeros({S, full_S}, torch::TensorOptions().dtype(torch::kFloat).device(x.device())),
-          torch::full({S, full_S}, -std::numeric_limits<float>::infinity(),
-                      torch::TensorOptions().dtype(torch::kFloat).device(x.device())));
+          torch::zeros({S, full_S}, mask_opts),
+          torch::full({S, full_S}, -std::numeric_limits<float>::infinity(), mask_opts));
       cached_mask_S_ = S;
       cached_mask_full_S_ = full_S;
     }

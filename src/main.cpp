@@ -77,9 +77,17 @@ void run(Model& model, const olmo_cpp::TransformerConfig& cfg,
 
   model->to(device);
 
-  // Pure BF16 mode: convert all floating-point params to BF16 after init.
-  // Halves memory for weights + optimizer state + gradients (~3x savings).
-  // Incompatible with autocast (which expects FP32 master weights).
+  // Pure BF16 mode: convert every floating-point parameter AND buffer to BF16
+  // after init. Halves memory for weights + optimizer state + gradients
+  // (~3x savings). Integer buffers (embedding indices, trigram maps) MUST be
+  // skipped — torch::nn::Module::to(kBFloat16) would clobber them and break
+  // embedding lookups. Incompatible with autocast (which expects FP32 master
+  // weights), so we auto-disable it.
+  //
+  // Why buffers matter: DC-MRE registers float buffers (char_trigram_count)
+  // that participate in forward arithmetic. If they stay FP32 while weights
+  // are BF16, the first BF16/FP32 op promotes activations to FP32 and the
+  // next Linear call dies with "mat1 and mat2 have different dtypes".
   if (train_cfg.use_bf16 && device.is_cuda()) {
     if (train_cfg.use_amp) {
       std::cerr << "WARNING: bf16=1 and amp=1 are mutually exclusive; disabling amp.\n";
@@ -89,6 +97,11 @@ void run(Model& model, const olmo_cpp::TransformerConfig& cfg,
     for (auto& p : model->parameters()) {
       if (p.is_floating_point()) {
         p.set_data(p.data().to(torch::kBFloat16));
+      }
+    }
+    for (auto& b : model->buffers()) {
+      if (b.is_floating_point()) {
+        b.set_data(b.to(torch::kBFloat16));
       }
     }
     std::cout << "Weights: BF16 (saves ~50% GPU memory)\n";

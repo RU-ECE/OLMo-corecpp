@@ -232,23 +232,27 @@ torch::Tensor MultiResEmbeddingImpl::forward(torch::Tensor token_ids) {
     // Gather precomputed trigram indices: [B*S, T] → [B, S, T]
     auto tri_ids = char_trigram_map_.index_select(0, flat_ids)
                        .reshape({B, S, T});                   // [B, S, T]
-    // Gather counts: [B*S] → [B, S]
-    auto counts = char_trigram_count_.index_select(0, flat_ids)
-                      .reshape({B, S});                       // [B, S]
 
     // Lookup char embeddings: [B, S, T, char_dim]
     auto e_chars = char_embed_->forward(tri_ids);
 
-    // Build mask from counts: for each position, trigrams [0, count) are valid
-    // counts [B, S], expand to [B, S, T]
+    // Gather counts and cast to the activation dtype so the final division
+    // stays in that precision. If counts remains FP32 while e_chars is BF16,
+    // `e_char / safe_count` promotes e_char to FP32, and char_proj_ (whose
+    // weight is BF16 in pure-BF16 mode) then sees an FP32 input and errors.
+    auto counts = char_trigram_count_.index_select(0, flat_ids)
+                      .reshape({B, S}).to(e_chars.dtype());   // [B, S]
+
+    // Mask is built from an int64 range vs cast counts; comparison result is
+    // bool, then we cast to the activation dtype.
     auto t_range = torch::arange(T, token_ids.options())
                        .unsqueeze(0).unsqueeze(0);            // [1, 1, T]
     auto mask = (t_range < counts.unsqueeze(-1))
-                    .to(e_chars.dtype()).unsqueeze(-1);        // [B, S, T, 1]
+                    .to(e_chars.dtype()).unsqueeze(-1);       // [B, S, T, 1]
 
     // Masked mean pooling: sum valid trigram embeddings / count
     auto e_char = (e_chars * mask).sum(2);                    // [B, S, char_dim]
-    auto safe_count = counts.clamp_min(1.0f).unsqueeze(-1);   // [B, S, 1]
+    auto safe_count = counts.clamp_min(1.0).unsqueeze(-1);    // [B, S, 1]
     e_char = e_char / safe_count;
 
     e = e + char_proj_->forward(e_char);                      // [B, S, d_model]

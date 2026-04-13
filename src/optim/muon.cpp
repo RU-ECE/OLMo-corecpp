@@ -104,14 +104,17 @@ torch::Tensor Muon::step(LossClosure closure) {
       auto grad = p.grad();
       auto key = p.unsafeGetTensorImpl();
 
-      if (state_.find(key) == state_.end()) {
+      // Single hash lookup per param per step. The old code ran find() then
+      // an unconditional operator[] — two lookups every step on the hot path.
+      auto it = state_.find(key);
+      if (it == state_.end()) {
         auto s = std::make_unique<MuonParamState>();
         s->momentum_buffer(torch::zeros_like(p.data()));
         s->step(0);
-        state_[key] = std::move(s);
+        it = state_.emplace(key, std::move(s)).first;
       }
 
-      auto& state = static_cast<MuonParamState&>(*state_[key]);
+      auto& state = static_cast<MuonParamState&>(*it->second);
       auto& buf = state.momentum_buffer();
       state.step(state.step() + 1);
 

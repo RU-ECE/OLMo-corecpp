@@ -17,8 +17,9 @@ torch::Tensor ReorderedNormTransformerBlockImpl::forward(
     LayerKVCache* layer_cache) {
   auto& backend = get_backend();
   backend.begin_scope();  // Arena scope for block intermediates
-  auto h = x + attention_norm_(attention_(x, rope_bufs, start_pos, layer_cache));
-  auto out = h + feed_forward_norm_(feed_forward_(h));
+  auto h = attention_norm_->forward_add(
+      attention_(x, rope_bufs, start_pos, layer_cache), x);
+  auto out = feed_forward_norm_->forward_add(feed_forward_(h), h);
   backend.end_scope();    // Free all scratch within this block
   return out;
 }

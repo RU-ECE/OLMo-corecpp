@@ -83,15 +83,18 @@ torch::Tensor ForeachAdamW::step(LossClosure closure) {
 
       auto key = p.unsafeGetTensorImpl();
 
-      // Lazy-init state on first step
-      if (state_.find(key) == state_.end()) {
+      // One hash lookup per param per step (steady state). The old code did
+      // find()+insert() on first step and operator[] on every subsequent step,
+      // burning two lookups per param every step.
+      auto it = state_.find(key);
+      if (it == state_.end()) {
         auto s = std::make_unique<ForeachAdamWParamState>();
         s->exp_avg(torch::zeros_like(p.data()));
         s->exp_avg_sq(torch::zeros_like(p.data()));
-        state_[key] = std::move(s);
+        it = state_.emplace(key, std::move(s)).first;
       }
 
-      auto& state = static_cast<ForeachAdamWParamState&>(*state_[key]);
+      auto& state = static_cast<ForeachAdamWParamState&>(*it->second);
       params_vec.push_back(p.data());
       grads_vec.push_back(p.grad());
       exp_avg_vec.push_back(state.exp_avg());

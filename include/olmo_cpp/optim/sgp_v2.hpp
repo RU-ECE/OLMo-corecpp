@@ -22,39 +22,48 @@ namespace olmo_cpp {
 ///
 /// For 1D parameters or small 2D parameters, falls back to the v1 linear
 /// predictor exactly so that biases, norms and embeddings are still handled.
-class SGPv2Predictor : public ISGPPredictor {
+class SGPv2Predictor final : public ISGPPredictor {
  public:
-  SGPv2Predictor(const std::vector<torch::Tensor>& params,
-                 SGPConfig config = {},
-                 int64_t rank = 4);
+  explicit SGPv2Predictor(const std::vector<torch::Tensor>& params,
+                          SGPConfig config = {},
+                          int64_t rank = 4);
 
-  bool should_skip_backward(int64_t global_step) const override;
+  [[nodiscard]] bool should_skip_backward(int64_t global_step) const noexcept override;
   void observe_real_gradients() override;
   void apply_predicted_gradients() override;
 
-  int64_t current_k() const override { return k_; }
-  double last_prediction_error() const override { return last_error_; }
-  int64_t skipped_steps() const override { return skipped_; }
-  int64_t total_steps() const override { return total_; }
-  double skip_rate() const override { return total_ > 0 ? static_cast<double>(skipped_) / total_ : 0.0; }
+  [[nodiscard]] int64_t current_k() const noexcept override { return k_; }
+  [[nodiscard]] double last_prediction_error() const noexcept override { return last_error_; }
+  [[nodiscard]] int64_t skipped_steps() const noexcept override { return skipped_; }
+  [[nodiscard]] int64_t total_steps() const noexcept override { return total_; }
+  [[nodiscard]] double skip_rate() const noexcept override {
+    return total_ > 0 ? static_cast<double>(skipped_) / static_cast<double>(total_) : 0.0;
+  }
 
  private:
   enum class Mode { Rank2D, Linear };
 
   struct ParamState {
     Mode mode = Mode::Linear;
-    // Shared linear-predictor state (used by Linear; also used as grad history for Rank2D)
+    // Gradient history (used by both Linear and Rank2D; for Rank2D it holds
+    // the already-reshaped 2D view so we never re-view on the hot path).
     torch::Tensor prev_grad;
     torch::Tensor prev_prev_grad;
-    float alpha = 1.0f;
-    float beta = 0.0f;
+    // 0-dim FP32 scalars on device. Lazy-initialized on first real backward.
+    // For Rank2D mode these live in coordinate space; for Linear they live in
+    // flat-grad space, but the math is identical.
+    torch::Tensor alpha;
+    torch::Tensor beta;
     bool has_history = false;
     bool has_two_history = false;
-    // Rank-r basis (used only when mode == Rank2D)
-    torch::Tensor U_left;    // m × r (FP32)
-    torch::Tensor U_right;   // n × r (FP32)
+    // Rank-r basis (only populated when mode == Rank2D). Stored in FP32 since
+    // they are small (m × r, n × r for r = 4) and numerical stability matters
+    // for the SVD that produced them.
+    torch::Tensor U_left;
+    torch::Tensor U_right;
     bool has_basis = false;
-    int64_t m = 0, n = 0;
+    int64_t m = 0;
+    int64_t n = 0;
   };
 
   void update_basis(ParamState& ps, const torch::Tensor& G_2d);

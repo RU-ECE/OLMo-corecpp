@@ -28,36 +28,40 @@ struct SGPConfig {
 class ISGPPredictor {
  public:
   virtual ~ISGPPredictor() = default;
-  virtual bool should_skip_backward(int64_t global_step) const = 0;
+  [[nodiscard]] virtual bool should_skip_backward(int64_t global_step) const noexcept = 0;
   virtual void observe_real_gradients() = 0;
   virtual void apply_predicted_gradients() = 0;
-  virtual int64_t current_k() const = 0;
-  virtual double last_prediction_error() const = 0;
-  virtual int64_t skipped_steps() const = 0;
-  virtual int64_t total_steps() const = 0;
-  virtual double skip_rate() const = 0;
+  [[nodiscard]] virtual int64_t current_k() const noexcept = 0;
+  [[nodiscard]] virtual double last_prediction_error() const noexcept = 0;
+  [[nodiscard]] virtual int64_t skipped_steps() const noexcept = 0;
+  [[nodiscard]] virtual int64_t total_steps() const noexcept = 0;
+  [[nodiscard]] virtual double skip_rate() const noexcept = 0;
 };
 
-class SGPPredictor : public ISGPPredictor {
+class SGPPredictor final : public ISGPPredictor {
  public:
-  SGPPredictor(const std::vector<torch::Tensor>& params, SGPConfig config = {});
+  explicit SGPPredictor(const std::vector<torch::Tensor>& params, SGPConfig config = {});
 
-  bool should_skip_backward(int64_t global_step) const override;
+  [[nodiscard]] bool should_skip_backward(int64_t global_step) const noexcept override;
   void observe_real_gradients() override;
   void apply_predicted_gradients() override;
 
-  int64_t current_k() const override { return k_; }
-  double last_prediction_error() const override { return last_error_; }
-  int64_t skipped_steps() const override { return skipped_; }
-  int64_t total_steps() const override { return total_; }
-  double skip_rate() const override { return total_ > 0 ? static_cast<double>(skipped_) / total_ : 0.0; }
+  [[nodiscard]] int64_t current_k() const noexcept override { return k_; }
+  [[nodiscard]] double last_prediction_error() const noexcept override { return last_error_; }
+  [[nodiscard]] int64_t skipped_steps() const noexcept override { return skipped_; }
+  [[nodiscard]] int64_t total_steps() const noexcept override { return total_; }
+  [[nodiscard]] double skip_rate() const noexcept override {
+    return total_ > 0 ? static_cast<double>(skipped_) / static_cast<double>(total_) : 0.0;
+  }
 
  private:
   struct ParamState {
     torch::Tensor prev_grad;       // G_{t-1}
     torch::Tensor prev_prev_grad;  // G_{t-2}
-    float alpha = 1.0f;            // linear predictor: G_pred = alpha * G_{t-1} + beta * G_{t-2}
-    float beta = 0.0f;
+    // 0-dim FP32 scalars on the same device as the gradient. Lazy-initialized
+    // on first real backward so we can adopt the grad's device automatically.
+    torch::Tensor alpha;
+    torch::Tensor beta;
     bool has_history = false;
     bool has_two_history = false;
   };

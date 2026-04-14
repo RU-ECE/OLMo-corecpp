@@ -247,6 +247,74 @@ target_include_directories(olmo_cpp PUBLIC
 target_link_libraries(olmo_cpp PUBLIC ${TORCH_LIBRARIES} ZLIB::ZLIB)
 target_compile_options(olmo_cpp PRIVATE -O3 -march=native)
 
+# ========================================================================
+# Zero-Wait Trainer (zwt) — LibTorch-free training framework
+# Own tensor/allocator/ops/layers/optim. Built as an independent static lib
+# alongside olmo_cpp; zwt has zero dependency on torch. Keeps cuBLAS for
+# GEMMs (industry ceiling) and dispatches elementwise / norm / xent / attn
+# to custom bf16 CUDA kernels.
+# ========================================================================
+set(ZWT_CPP_SOURCES
+    zwt/src/core/allocator.cpp
+    zwt/src/core/tensor.cpp
+    zwt/src/core/stream.cpp
+    zwt/src/ops/gemm.cpp
+    zwt/src/ops/elementwise.cpp
+    zwt/src/ops/norm.cpp
+    zwt/src/ops/xent.cpp
+    zwt/src/ops/attn.cpp
+    zwt/src/ops/rope.cpp
+    zwt/src/layers/module.cpp
+    zwt/src/layers/parameter.cpp
+    zwt/src/layers/linear.cpp
+    zwt/src/layers/rmsnorm.cpp
+    zwt/src/layers/embedding.cpp
+    zwt/src/layers/ffn.cpp
+    zwt/src/layers/attention.cpp
+    zwt/src/layers/transformer_block.cpp
+    zwt/src/layers/transformer.cpp
+    zwt/src/optim/adamw.cpp
+    zwt/src/optim/grad_clip.cpp
+    zwt/src/data/token_loader.cpp
+    zwt/src/train/checkpoint.cpp
+    zwt/src/train/config.cpp
+)
+set(ZWT_CUDA_SOURCES
+    zwt/src/ops/elementwise.cu
+    zwt/src/ops/norm.cu
+    zwt/src/ops/xent.cu
+    zwt/src/ops/attn.cu
+    zwt/src/ops/rope.cu
+    zwt/src/optim/adamw.cu
+    zwt/src/optim/grad_clip.cu
+)
+if(CMAKE_CUDA_COMPILER)
+    add_library(zwt STATIC ${ZWT_CPP_SOURCES} ${ZWT_CUDA_SOURCES})
+    set_target_properties(zwt PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        POSITION_INDEPENDENT_CODE ON)
+    find_package(CUDAToolkit REQUIRED)
+    target_link_libraries(zwt PUBLIC CUDA::cublas CUDA::cudart)
+else()
+    add_library(zwt STATIC ${ZWT_CPP_SOURCES})
+endif()
+target_include_directories(zwt PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/zwt/include
+    ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_options(zwt PRIVATE -O3 -march=native -Wall)
+if(CMAKE_CUDA_COMPILER)
+    target_compile_definitions(zwt PUBLIC USE_CUDA=1)
+endif()
+
+# ZWT end-to-end training demo binary — exercises every path of the framework.
+add_executable(zwt_train zwt/tools/zwt_train.cpp)
+target_link_libraries(zwt_train PRIVATE zwt)
+target_compile_options(zwt_train PRIVATE -O3 -march=native)
+
+add_executable(zwt_pretrain zwt/tools/zwt_pretrain.cpp)
+target_link_libraries(zwt_pretrain PRIVATE zwt)
+target_compile_options(zwt_pretrain PRIVATE -O3 -march=native)
+
 # CUDA kernels (auto-enabled when CUDA compiler is found)
 option(OLMO_BUILD_KERNELS "Build custom CUDA kernels" ON)
 if(CMAKE_CUDA_COMPILER AND OLMO_BUILD_KERNELS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/CMakeLists.txt")

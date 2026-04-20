@@ -45,6 +45,10 @@ __pycache__/
 *.pyc
 .venv/
 CLAUDE.md
+
+# Personal research plan — stays local, not tracked
+plan.md
+
 *.nsys-rep
 *.qdstrm
 *.sqlite

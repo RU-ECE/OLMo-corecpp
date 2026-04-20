@@ -95,6 +95,22 @@ class WSDLR : public LRScheduler {
   int64_t warmup_steps_, stable_steps_;
 };
 
+/// Leslie Smith LR range test (2017): exponentially sweep LR from start_lr to
+/// end_lr across total_steps. Run for a short pretraining warmup, plot loss vs
+/// lr, and pick the LR just before loss explodes (typically 1/10th of the lr
+/// that gave the steepest descent).
+///
+/// Usage: set scheduler = lr_range_test, set [training] lr = <end_lr> (upper
+/// bound, e.g. 1.0), min_lr = <start_lr> (lower bound, e.g. 1e-8), steps = 100.
+/// Keep log_interval = 1 so every step prints a point.
+class LRRangeTest : public LRScheduler {
+ public:
+  LRRangeTest(double start_lr, double end_lr);
+  double get_lr(int64_t step, int64_t total_steps) const override;
+ private:
+  double log_start_, log_end_;
+};
+
 /// Custom schedule from a user-provided function
 class CustomLR : public LRScheduler {
  public:

@@ -20,6 +20,7 @@ struct TrainConfig {
   int64_t batch_size = 4;
   int64_t seq_len = 128;
   double lr = 1e-4;
+  double min_lr = 0.0;              // floor LR for cosine/linear; start LR for lr_range_test
   int64_t warmup_steps = 100;
   int64_t grad_accum_steps = 1;
   double max_grad_norm = 1.0;

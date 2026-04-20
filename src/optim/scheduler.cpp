@@ -201,6 +201,25 @@ double WSDLR::get_lr(int64_t step, int64_t total_steps) const {
 }
 
 // ============================================================================
+// LRRangeTest — Leslie Smith (2017) exponential LR sweep.
+// ============================================================================
+
+LRRangeTest::LRRangeTest(double start_lr, double end_lr) {
+  const double safe_start = std::max(start_lr, 1e-12);
+  const double safe_end   = std::max(end_lr,   safe_start * 10.0);
+  log_start_ = std::log(safe_start);
+  log_end_   = std::log(safe_end);
+}
+
+double LRRangeTest::get_lr(int64_t step, int64_t total_steps) const {
+  const int64_t denom = std::max<int64_t>(total_steps - 1, 1);
+  double progress = static_cast<double>(step) / static_cast<double>(denom);
+  progress = std::clamp(progress, 0.0, 1.0);
+  const double log_lr = log_start_ + (log_end_ - log_start_) * progress;
+  return std::exp(log_lr);
+}
+
+// ============================================================================
 // Factory function
 // ============================================================================
 
@@ -225,6 +244,12 @@ std::unique_ptr<LRScheduler> create_scheduler(
     return std::make_unique<StepDecayLR>(base_lr, gamma, step_size, warmup_steps);
   } else if (name == "wsd" || name == "warmup_stable_decay") {
     return std::make_unique<WSDLR>(base_lr, warmup_steps, stable_steps, min_lr);
+  } else if (name == "lr_range_test" || name == "lr_finder") {
+    // Sweep from min_lr → base_lr exponentially. Keep min_lr small (e.g. 1e-8)
+    // and base_lr large (e.g. 1.0) in your conf. total_steps controls how many
+    // points you sample across that range — 100 is usually enough.
+    const double start = (min_lr > 0.0) ? min_lr : 1e-8;
+    return std::make_unique<LRRangeTest>(start, base_lr);
   } else {
     throw std::invalid_argument("Unknown scheduler name: " + name);
   }

@@ -332,7 +332,7 @@ void train(
   }
 
   // ---- Create LR scheduler ----
-  auto scheduler = create_scheduler(cfg.scheduler, cfg.lr, cfg.warmup_steps);
+  auto scheduler = create_scheduler(cfg.scheduler, cfg.lr, cfg.warmup_steps, cfg.min_lr);
 
   // ---- Gradient scaler for mixed precision ----
   std::optional<GradScaler> grad_scaler;
@@ -663,7 +663,7 @@ void train(
         torch::optim::AdamWOptions(cfg.lr).weight_decay(cfg.weight_decay));
   }
 
-  auto scheduler = create_scheduler(cfg.scheduler, cfg.lr, cfg.warmup_steps);
+  auto scheduler = create_scheduler(cfg.scheduler, cfg.lr, cfg.warmup_steps, cfg.min_lr);
 
   std::optional<TokenDataset> dataset;
   bool gpu_data_active = false;
@@ -793,9 +793,12 @@ void train(
     {
       c10::cuda::CUDAStreamGuard stream_guard(capture_stream);
 
-      // Must use memset zero_grad (not set_to_none) — graph references
-      // specific gradient tensor addresses that must remain valid.
-      optimizer->zero_grad();
+      // MUST pass false: set_to_none=true would reset p.grad() to an
+      // undefined tensor, orphaning the grad memory the captured graph
+      // writes to. Optimizer then sees p.grad().defined()==false and
+      // skips every param, freezing weights. Keep handles alive, zero
+      // the existing buffers in place.
+      optimizer->zero_grad(/*set_to_none=*/false);
 
       train_graph.capture_begin();
       {
@@ -853,8 +856,10 @@ void train(
 #ifdef USE_CUDA
     if (graph_active) {
       // ---- CUDA Graph path ----
-      // Zero gradients once (memset — graph references these tensor addresses)
-      optimizer->zero_grad();
+      // MUST pass false: set_to_none=true would undefine p.grad(), and the
+      // replayed graph cannot re-allocate grad tensors — Muon would then
+      // see !p.grad().defined() and skip every param, freezing the loss.
+      optimizer->zero_grad(/*set_to_none=*/false);
       accum_loss_tensor.zero_();
 
       // Replay captured micro-step for each grad_accum iteration.

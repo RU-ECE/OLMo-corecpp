@@ -253,6 +253,7 @@ int main(int argc, char** argv) {
     train_ini.get("batch_size", train_cfg.batch_size);
     train_ini.get("seq_len", train_cfg.seq_len);
     train_ini.get("lr", train_cfg.lr);
+    train_cfg.min_lr           = train_ini.get_or<double>("min_lr", 0.0);
     train_cfg.warmup_steps     = train_ini.get_or<int64_t>("warmup_steps", 100);
     train_cfg.grad_accum_steps = train_ini.get_or<int64_t>("grad_accum", 1);
     train_cfg.optimizer        = train_ini.get_or<std::string>("optimizer", "adamw");

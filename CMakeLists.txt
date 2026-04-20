@@ -287,6 +287,7 @@ set(ZWT_CUDA_SOURCES
     zwt/src/ops/rope.cu
     zwt/src/optim/adamw.cu
     zwt/src/optim/grad_clip.cu
+    zwt/src/layers/embedding.cu
 )
 if(CMAKE_CUDA_COMPILER)
     add_library(zwt STATIC ${ZWT_CPP_SOURCES} ${ZWT_CUDA_SOURCES})

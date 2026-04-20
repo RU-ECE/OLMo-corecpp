@@ -14,6 +14,19 @@
 
 namespace zwt {
 
+#ifdef USE_CUDA
+// Launchers live in embedding.cu — host/device split so nvcc compiles the
+// kernels and g++ compiles everything else.
+namespace k {
+void embed_gather_bf16(const int64_t* ids, const __nv_bfloat16* W,
+                       __nv_bfloat16* out, int64_t N, int64_t D,
+                       cudaStream_t s);
+void embed_scatter_add(const int64_t* ids, const __nv_bfloat16* grad_y,
+                       float* grad_W, int64_t N, int64_t D,
+                       cudaStream_t s);
+}  // namespace k
+#endif
+
 namespace {
 
 void normal_init(Tensor& w, float std_, uint64_t seed) {
@@ -52,32 +65,6 @@ void normal_init(Tensor& w, float std_, uint64_t seed) {
   }
 }
 
-#ifdef USE_CUDA
-// Gather kernel: for each (b,s,d), out[b,s,d] = W[ids[b,s], d].
-__global__ void embed_gather_bf16(const int64_t* ids, const __nv_bfloat16* W,
-                                  __nv_bfloat16* out, int64_t N, int64_t D) {
-  int64_t i = blockIdx.x;
-  if (i >= N) return;
-  int64_t id = ids[i];
-  const __nv_bfloat16* src = W + id * D;
-  __nv_bfloat16* dst = out + i * D;
-  for (int64_t d = threadIdx.x; d < D; d += blockDim.x) dst[d] = src[d];
-}
-
-// Scatter-add grad rows back into grad_W (fp32 grad buffer).
-__global__ void embed_scatter_add(const int64_t* ids, const __nv_bfloat16* grad_y,
-                                  float* grad_W, int64_t N, int64_t D) {
-  int64_t i = blockIdx.x;
-  if (i >= N) return;
-  int64_t id = ids[i];
-  const __nv_bfloat16* src = grad_y + i * D;
-  float* dst = grad_W + id * D;
-  for (int64_t d = threadIdx.x; d < D; d += blockDim.x) {
-    atomicAdd(dst + d, __bfloat162float(src[d]));
-  }
-}
-#endif
-
 }  // namespace
 
 Embedding::Embedding(int64_t vocab_size, int64_t d_model, DType dtype, Device device)
@@ -104,12 +91,13 @@ Tensor Embedding::forward(const Tensor& token_ids) {
     if (weight_.value.dtype() != DType::BF16) {
       throw std::runtime_error("Embedding CUDA path currently BF16 only");
     }
-    embed_gather_bf16<<<static_cast<unsigned>(N), 256, 0,
-        reinterpret_cast<cudaStream_t>(compute_stream(token_ids.device()).handle)>>>(
+    k::embed_gather_bf16(
         token_ids.as<int64_t>(),
         reinterpret_cast<const __nv_bfloat16*>(weight_.value.data()),
         reinterpret_cast<__nv_bfloat16*>(out.data()),
-        N, d_model_);
+        N, d_model_,
+        reinterpret_cast<cudaStream_t>(
+            compute_stream(token_ids.device()).handle));
     return out;
 #else
     throw std::runtime_error("Embedding: CUDA path requested on CPU-only build");
@@ -137,12 +125,13 @@ Tensor Embedding::backward(const Tensor& grad_y) {
 
   if (grad_y.device().is_cuda()) {
 #ifdef USE_CUDA
-    embed_scatter_add<<<static_cast<unsigned>(N), 256, 0,
-        reinterpret_cast<cudaStream_t>(compute_stream(grad_y.device()).handle)>>>(
+    k::embed_scatter_add(
         saved_ids_.as<int64_t>(),
         reinterpret_cast<const __nv_bfloat16*>(grad_y.data()),
         weight_.grad.as<float>(),
-        N, d_model_);
+        N, d_model_,
+        reinterpret_cast<cudaStream_t>(
+            compute_stream(grad_y.device()).handle));
 #endif
   } else {
     const int64_t* ids = saved_ids_.as<int64_t>();

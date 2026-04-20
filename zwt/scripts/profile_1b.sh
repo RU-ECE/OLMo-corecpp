@@ -67,22 +67,22 @@ if [[ ! -e data/owt/owt_tokens.npy ]]; then
 fi
 
 # --- nsys args ---
-# trace: cuda (kernels, memcpy), osrt (pthread/sleep/io — catches host stalls),
-#        nvtx (we don't emit any yet but harmless)
-# sample: none — sampling the CPU adds noise and isn't useful here; the
-#        OS-runtime trace already shows host blocking.
-# delay: --short skips 15 sec of init so the trace focuses on steady state.
+# Using short-form flags to avoid ambiguous-prefix errors on older nsys
+# (CUDA 12.0 ships nsys 2022.x where --sample prefix-matches a dozen opts).
+#   -t : trace flavors (cuda = kernels+memcpy, osrt = OS runtime/blocking,
+#        nvtx = harmless even if we don't emit any)
+#   -s none : no CPU stack sampling (keeps trace smaller)
+#   -o : output prefix (nsys appends .nsys-rep)
+#   -y : delay seconds (skips init when --short)
 NSYS_ARGS=(
   profile
-  --trace=cuda,osrt,nvtx
-  --sample=none
-  --cuda-memory-usage=true
+  -t cuda,osrt,nvtx
+  -s none
+  -o "$OUT"
   --force-overwrite=true
-  --stop-on-exit=true
-  --output "$OUT"
 )
 if [[ "$DO_SHORT" -eq 1 ]]; then
-  NSYS_ARGS+=( --delay 15 )
+  NSYS_ARGS+=( -y 15 )
 fi
 
 echo "=== nsys profile: $OUT.nsys-rep ==="
@@ -90,13 +90,9 @@ nsys "${NSYS_ARGS[@]}" -- "$BIN" "$CONF"
 
 echo
 echo "=== Stats summary: $OUT.summary.txt ==="
-# These reports give the 90% view:
-#   cuda_gpu_kern_sum : time per CUDA kernel (where the GPU spends time)
-#   cuda_gpu_mem_time_sum : memcpy/memset time on the GPU
-#   cuda_api_sum : time in CUDA API calls (cudaLaunch, memcpy, etc.)
-#   osrt_sum : OS-runtime calls (blocking syscalls, sleeps)
+# Let nsys pick its default report set — names differ between versions.
+# Default gives: gpukernsum, gpumemtimesum, gpumemsizesum, cudaapisum, osrtsum.
 nsys stats \
-  --report cuda_gpu_kern_sum,cuda_gpu_mem_time_sum,cuda_api_sum,osrt_sum \
   --format table "$OUT.nsys-rep" \
   2>&1 | tee "$OUT.summary.txt"
 

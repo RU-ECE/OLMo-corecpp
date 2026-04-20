@@ -23,7 +23,8 @@ cublasHandle_t& cublas_handle() {
   static std::once_flag flag;
   std::call_once(flag, []() {
     cublasCreate(&h);
-    cublasSetMathMode(h, CUBLAS_TF32_TENSOR_OP_MATH);
+    // No math-mode override: BF16 gemms already run on tensor cores regardless,
+    // and forcing TF32 would only affect F32 gemms we don't issue.
   });
   return h;
 }

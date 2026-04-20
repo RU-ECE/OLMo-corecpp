@@ -22,7 +22,7 @@ __device__ __forceinline__ __nv_bfloat16 f_to_bf(float v) { return __float2bfloa
 
 __global__ void adamw_kernel(
     void** p_ptrs, float** g_ptrs, float** m_ptrs, float** v_ptrs,
-    const int64_t* sizes, int n_tensors,
+    const int64_t* sizes,
     float lr, float beta1, float beta2, float eps, float wd,
     float bc1, float bc2_sqrt,
     int64_t total_chunks,
@@ -58,69 +58,25 @@ __global__ void adamw_kernel(
   }
 }
 
-// Pack chunks on the host. This is a tiny one-time cost per step (O(n_tensors)).
 }  // namespace
 
+// Launcher. Caller owns the chunk plan buffers on device (set once at AdamW
+// construction, reused on every step). No process-scope state here.
 void adamw_multi_tensor_bf16(
     void** p_ptrs, float** g_ptrs, float** m_ptrs, float** v_ptrs,
-    const int64_t* sizes, int n_tensors,
+    const int64_t* sizes,
     float lr, float beta1, float beta2, float eps, float wd,
     float bc1, float bc2_sqrt,
+    int64_t total_chunks,
+    const int64_t* d_chunk_tensor_idx, const int64_t* d_chunk_offsets,
     cudaStream_t s) {
-  // Pull sizes back to host to chunk. This is tiny (n_tensors longs, <1 KiB).
-  // We could cache this on the CPU side of the AdamW object, but since
-  // sizes don't change we can do it once on first launch and reuse.
-  static int cached_n = 0;
-  static int64_t* d_chunk_tensor_idx = nullptr;
-  static int64_t* d_chunk_offsets = nullptr;
-  static int64_t cached_chunks = 0;
-
-  if (cached_n != n_tensors) {
-    if (d_chunk_tensor_idx) cudaFree(d_chunk_tensor_idx);
-    if (d_chunk_offsets)    cudaFree(d_chunk_offsets);
-
-    // Pull sizes to host.
-    int64_t* h_sizes = new int64_t[n_tensors];
-    cudaMemcpy(h_sizes, sizes, sizeof(int64_t) * n_tensors, cudaMemcpyDeviceToHost);
-
-    int64_t total_chunks = 0;
-    for (int i = 0; i < n_tensors; ++i) {
-      int64_t n = h_sizes[i];
-      total_chunks += (n + kChunkSize - 1) / kChunkSize;
-    }
-
-    int64_t* h_idx  = new int64_t[total_chunks];
-    int64_t* h_off  = new int64_t[total_chunks];
-    int64_t cur = 0;
-    for (int i = 0; i < n_tensors; ++i) {
-      int64_t n = h_sizes[i];
-      int64_t off = 0;
-      while (off < n) {
-        h_idx[cur] = i;
-        h_off[cur] = off;
-        ++cur;
-        off += kChunkSize;
-      }
-    }
-
-    cudaMalloc(&d_chunk_tensor_idx, sizeof(int64_t) * total_chunks);
-    cudaMalloc(&d_chunk_offsets,    sizeof(int64_t) * total_chunks);
-    cudaMemcpyAsync(d_chunk_tensor_idx, h_idx, sizeof(int64_t) * total_chunks,
-                    cudaMemcpyHostToDevice, s);
-    cudaMemcpyAsync(d_chunk_offsets,    h_off, sizeof(int64_t) * total_chunks,
-                    cudaMemcpyHostToDevice, s);
-
-    delete[] h_sizes; delete[] h_idx; delete[] h_off;
-    cached_n = n_tensors;
-    cached_chunks = total_chunks;
-  }
-
-  dim3 grid(static_cast<unsigned>(cached_chunks));
+  if (total_chunks == 0) return;
+  dim3 grid(static_cast<unsigned>(total_chunks));
   dim3 block(256);
   adamw_kernel<<<grid, block, 0, s>>>(
-      p_ptrs, g_ptrs, m_ptrs, v_ptrs, sizes, n_tensors,
+      p_ptrs, g_ptrs, m_ptrs, v_ptrs, sizes,
       lr, beta1, beta2, eps, wd, bc1, bc2_sqrt,
-      cached_chunks, d_chunk_tensor_idx, d_chunk_offsets);
+      total_chunks, d_chunk_tensor_idx, d_chunk_offsets);
 }
 
 }  // namespace zwt::optim::k

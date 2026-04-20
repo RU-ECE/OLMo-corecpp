@@ -7,6 +7,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <unordered_map>
+#include <vector>
 
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
@@ -19,21 +20,9 @@ namespace {
 constexpr char     kMagic[8]     = {'Z','W','T','C','K','P','T','1'};
 constexpr uint32_t kVersion      = 1;
 constexpr size_t   kHeaderBytes  = 64;
-constexpr size_t   kTRecBytes    = 80;   // tensor record header — fixed size
+constexpr size_t   kTRecBytes    = 80;
+constexpr size_t   kStreamBuf    = 2 << 20;  // 2 MiB ofstream buffer
 
-// File header (kHeaderBytes). Everything else is tensor records.
-//
-// [0..8)    magic                 "ZWTCKPT1"
-// [8..12)   version               u32
-// [12..16)  flags                 u32   (reserved)
-// [16..24)  step                  i64
-// [24..32)  data_cursor           i64
-// [32..40)  seed                  u64
-// [40..44)  n_records             i32
-// [44..48)  pad
-// [48..52)  lr                    f32
-// [52..56)  loss                  f32
-// [56..64)  reserved              u64
 #pragma pack(push, 1)
 struct FileHeader {
   char     magic[8];
@@ -50,17 +39,6 @@ struct FileHeader {
 };
 static_assert(sizeof(FileHeader) == kHeaderBytes, "FileHeader size");
 
-// Tensor record header (kTRecBytes). Followed by name bytes (padded to 8)
-// then data bytes (padded to 8).
-//
-// [0..4)    name_len              u32
-// [4..5)    dtype                 u8
-// [5..6)    rank                  u8
-// [6..8)    pad
-// [8..16)   nbytes                u64
-// [16..64)  dims[6]               i64 * 6
-// [64..72)  reserved
-// [72..80)  reserved
 struct TRec {
   uint32_t name_len;
   uint8_t  dtype;
@@ -101,47 +79,6 @@ void skip_pad_to_8(std::ifstream& f, size_t bytes_read) {
   f.seekg(static_cast<std::streamoff>(rem), std::ios::cur);
 }
 
-// Stage a tensor's bytes into a host buffer (downloading from device if
-// needed). Synchronous on the compute stream.
-std::vector<uint8_t> tensor_to_host(const Tensor& t) {
-  std::vector<uint8_t> buf(t.nbytes());
-  if (t.nbytes() == 0) return buf;
-  if (t.device().is_cuda()) {
-#ifdef USE_CUDA
-    cudaStream_t s =
-        reinterpret_cast<cudaStream_t>(compute_stream(t.device()).handle);
-    cudaMemcpyAsync(buf.data(), t.data(), t.nbytes(),
-                    cudaMemcpyDeviceToHost, s);
-    cudaStreamSynchronize(s);
-#else
-    throw std::runtime_error("checkpoint: CUDA tensor on CPU-only build");
-#endif
-  } else {
-    std::memcpy(buf.data(), t.data(), t.nbytes());
-  }
-  return buf;
-}
-
-// Upload a host buffer into an existing tensor (or host-copy if CPU).
-void tensor_from_host(Tensor& t, const void* src, size_t n) {
-  if (n != t.nbytes()) {
-    throw std::runtime_error("checkpoint: tensor size mismatch on load");
-  }
-  if (n == 0) return;
-  if (t.device().is_cuda()) {
-#ifdef USE_CUDA
-    cudaStream_t s =
-        reinterpret_cast<cudaStream_t>(compute_stream(t.device()).handle);
-    cudaMemcpyAsync(t.data(), src, n, cudaMemcpyHostToDevice, s);
-    cudaStreamSynchronize(s);
-#else
-    throw std::runtime_error("checkpoint: CUDA tensor on CPU-only build");
-#endif
-  } else {
-    std::memcpy(t.data(), src, n);
-  }
-}
-
 void fill_record(TRec& r, const Tensor& t, size_t name_len) {
   r.name_len = static_cast<uint32_t>(name_len);
   r.dtype    = static_cast<uint8_t>(t.dtype());
@@ -155,19 +92,6 @@ void fill_record(TRec& r, const Tensor& t, size_t name_len) {
   r.reserved1 = 0;
 }
 
-void write_tensor(std::ofstream& f, const std::string& name, const Tensor& t) {
-  TRec r;
-  fill_record(r, t, name.size());
-  write_bytes(f, &r, sizeof(r));
-  write_bytes(f, name.data(), name.size());
-  write_pad_to_8(f, name.size());
-
-  auto host = tensor_to_host(t);
-  write_bytes(f, host.data(), host.size());
-  write_pad_to_8(f, host.size());
-}
-
-// Validate a record against an expected live tensor. Throws on any mismatch.
 void validate_record(const std::string& name, const TRec& r, const Tensor& t) {
   if (r.dtype != static_cast<uint8_t>(t.dtype())) {
     throw std::runtime_error("checkpoint: dtype mismatch for '" + name + "'");
@@ -185,6 +109,55 @@ void validate_record(const std::string& name, const TRec& r, const Tensor& t) {
   }
 }
 
+// Pinned host staging. Two buffers are used as a ping-pong so the D2H (or H2D)
+// on one can overlap the file write (or file read) on the other. On a CPU-only
+// build the buffers are plain malloc'd and the overlap is a no-op — we serve
+// tensor bytes straight from the host pointer.
+struct Pinned {
+  void*  buf[2]  = {nullptr, nullptr};
+  size_t cap     = 0;
+#ifdef USE_CUDA
+  cudaEvent_t evt[2] = {};
+  bool        have_events = false;
+#endif
+
+  void ensure(size_t n) {
+    if (n <= cap) return;
+    free_all();
+#ifdef USE_CUDA
+    cudaMallocHost(&buf[0], n);
+    cudaMallocHost(&buf[1], n);
+#else
+    buf[0] = std::malloc(n);
+    buf[1] = std::malloc(n);
+#endif
+    cap = n;
+  }
+
+  void free_all() {
+    for (int i = 0; i < 2; ++i) {
+      if (!buf[i]) continue;
+#ifdef USE_CUDA
+      cudaFreeHost(buf[i]);
+#else
+      std::free(buf[i]);
+#endif
+      buf[i] = nullptr;
+    }
+    cap = 0;
+  }
+
+  ~Pinned() {
+#ifdef USE_CUDA
+    if (have_events) {
+      cudaEventDestroy(evt[0]);
+      cudaEventDestroy(evt[1]);
+    }
+#endif
+    free_all();
+  }
+};
+
 }  // namespace
 
 void save_checkpoint(const std::string& path,
@@ -195,30 +168,102 @@ void save_checkpoint(const std::string& path,
     throw std::runtime_error("checkpoint: param count / optimizer size mismatch");
   }
 
+  // Flat list of (name, tensor*) in write order: value, .m, .v per param.
+  struct Rec { std::string name; Tensor* t; };
+  std::vector<Rec> recs;
+  recs.reserve(params.size() * 3);
+  for (size_t i = 0; i < params.size(); ++i) {
+    recs.push_back({params[i]->name,        &params[i]->value});
+    recs.push_back({params[i]->name + ".m", &opt.moment_m(i)});
+    recs.push_back({params[i]->name + ".v", &opt.moment_v(i)});
+  }
+  const size_t n = recs.size();
+
+  size_t max_bytes = 0;
+  bool   any_cuda  = false;
+  for (const auto& r : recs) {
+    if (r.t->nbytes() > max_bytes) max_bytes = r.t->nbytes();
+    if (r.t->device().is_cuda())   any_cuda  = true;
+  }
+
   const std::string tmp = path + ".tmp";
-  std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+  std::ofstream f;
+  std::vector<char> file_buf(kStreamBuf);
+  f.rdbuf()->pubsetbuf(file_buf.data(), file_buf.size());
+  f.open(tmp, std::ios::binary | std::ios::trunc);
   if (!f) throw std::runtime_error("checkpoint: cannot open " + tmp);
 
   FileHeader h{};
   std::memcpy(h.magic, kMagic, 8);
   h.version     = kVersion;
-  h.flags       = 0;
   h.step        = meta.step;
   h.data_cursor = meta.data_cursor;
   h.seed        = meta.seed;
-  h.n_records   = static_cast<int32_t>(params.size() * 3);
-  h.pad0        = 0;
+  h.n_records   = static_cast<int32_t>(n);
   h.lr          = meta.lr;
   h.loss        = meta.loss;
-  h.reserved    = 0;
   write_bytes(f, &h, sizeof(h));
 
-  // Three records per param: value, .m, .v
-  for (size_t i = 0; i < params.size(); ++i) {
-    const auto* p = params[i];
-    write_tensor(f, p->name,          p->value);
-    write_tensor(f, p->name + ".m",   opt.moment_m(i));
-    write_tensor(f, p->name + ".v",   opt.moment_v(i));
+  Pinned pin;
+#ifdef USE_CUDA
+  cudaStream_t cs = nullptr;
+  if (any_cuda) {
+    pin.ensure(max_bytes);
+    cudaEventCreateWithFlags(&pin.evt[0], cudaEventDisableTiming);
+    cudaEventCreateWithFlags(&pin.evt[1], cudaEventDisableTiming);
+    pin.have_events = true;
+    cs = reinterpret_cast<cudaStream_t>(
+        compute_stream(recs.front().t->device()).handle);
+  }
+#else
+  (void)any_cuda;
+#endif
+
+  auto kick_d2h = [&](size_t i) {
+    if (i >= n) return;
+#ifdef USE_CUDA
+    if (recs[i].t->device().is_cuda()) {
+      cudaMemcpyAsync(pin.buf[i & 1], recs[i].t->data(),
+                      recs[i].t->nbytes(),
+                      cudaMemcpyDeviceToHost, cs);
+      cudaEventRecord(pin.evt[i & 1], cs);
+    }
+#else
+    (void)i;
+#endif
+  };
+
+  auto ptr_for = [&](size_t i) -> const void* {
+#ifdef USE_CUDA
+    if (recs[i].t->device().is_cuda()) return pin.buf[i & 1];
+#endif
+    return recs[i].t->data();
+  };
+
+  auto wait_d2h = [&](size_t i) {
+#ifdef USE_CUDA
+    if (recs[i].t->device().is_cuda()) {
+      cudaEventSynchronize(pin.evt[i & 1]);
+    }
+#else
+    (void)i;
+#endif
+  };
+
+  if (n > 0) kick_d2h(0);
+  for (size_t i = 0; i < n; ++i) {
+    if (i + 1 < n) kick_d2h(i + 1);
+
+    const auto& r = recs[i];
+    TRec hdr;
+    fill_record(hdr, *r.t, r.name.size());
+    write_bytes(f, &hdr, sizeof(hdr));
+    write_bytes(f, r.name.data(), r.name.size());
+    write_pad_to_8(f, r.name.size());
+
+    wait_d2h(i);
+    write_bytes(f, ptr_for(i), r.t->nbytes());
+    write_pad_to_8(f, r.t->nbytes());
   }
 
   f.close();
@@ -257,7 +302,10 @@ CheckpointMeta load_checkpoint(const std::string& path,
     throw std::runtime_error("checkpoint: param count / optimizer size mismatch");
   }
 
-  std::ifstream f(path, std::ios::binary);
+  std::ifstream f;
+  std::vector<char> file_buf(kStreamBuf);
+  f.rdbuf()->pubsetbuf(file_buf.data(), file_buf.size());
+  f.open(path, std::ios::binary);
   if (!f) throw std::runtime_error("checkpoint: cannot open " + path);
 
   FileHeader h{};
@@ -269,18 +317,24 @@ CheckpointMeta load_checkpoint(const std::string& path,
     throw std::runtime_error("checkpoint: unsupported version");
   }
 
-  // Build a lookup table from param name -> (index, kind).
-  //   kind: 0 = value, 1 = moment m, 2 = moment v
+  // Name -> (param index, kind). kind 0 = value, 1 = moment_m, 2 = moment_v.
   struct Slot { size_t idx; int kind; };
   std::unordered_map<std::string, Slot> table;
   table.reserve(params.size() * 3);
+  size_t max_bytes = 0;
+  bool   any_cuda  = false;
   for (size_t i = 0; i < params.size(); ++i) {
     table[params[i]->name]         = {i, 0};
     table[params[i]->name + ".m"]  = {i, 1};
     table[params[i]->name + ".v"]  = {i, 2};
+    auto consider = [&](const Tensor& t) {
+      if (t.nbytes() > max_bytes) max_bytes = t.nbytes();
+      if (t.device().is_cuda())   any_cuda  = true;
+    };
+    consider(params[i]->value);
+    consider(opt.moment_m(i));
+    consider(opt.moment_v(i));
   }
-
-  std::vector<uint8_t> scratch;
 
   int32_t n_records_expected = static_cast<int32_t>(params.size() * 3);
   if (h.n_records != n_records_expected) {
@@ -289,6 +343,38 @@ CheckpointMeta load_checkpoint(const std::string& path,
                              + std::to_string(n_records_expected) + ")");
   }
 
+  Pinned pin;
+#ifdef USE_CUDA
+  cudaStream_t cs = nullptr;
+  if (any_cuda) {
+    pin.ensure(max_bytes);
+    cudaEventCreateWithFlags(&pin.evt[0], cudaEventDisableTiming);
+    cudaEventCreateWithFlags(&pin.evt[1], cudaEventDisableTiming);
+    pin.have_events = true;
+    cs = reinterpret_cast<cudaStream_t>(
+        compute_stream(params.front()->value.device()).handle);
+  }
+#else
+  (void)any_cuda;
+#endif
+
+  // Track in-flight H2D so we can wait on the opposite slot before reusing.
+#ifdef USE_CUDA
+  bool   inflight[2] = {false, false};
+  size_t cuda_idx = 0;  // counts only cuda tensors, for ping-pong
+#endif
+  auto wait_slot = [&](int slot) {
+#ifdef USE_CUDA
+    if (inflight[slot]) {
+      cudaEventSynchronize(pin.evt[slot]);
+      inflight[slot] = false;
+    }
+#else
+    (void)slot;
+#endif
+  };
+
+  std::vector<char> scratch;  // fallback for CPU tensors / unknown records
   std::vector<char> seen(params.size() * 3, 0);
 
   for (int32_t r = 0; r < h.n_records; ++r) {
@@ -301,7 +387,6 @@ CheckpointMeta load_checkpoint(const std::string& path,
 
     auto it = table.find(name);
     if (it == table.end()) {
-      // Unknown record — skip over its bytes.
       f.seekg(static_cast<std::streamoff>(pad_to_8(rec.nbytes)), std::ios::cur);
       continue;
     }
@@ -314,14 +399,33 @@ CheckpointMeta load_checkpoint(const std::string& path,
     }
     validate_record(name, rec, *target);
 
-    if (scratch.size() < rec.nbytes) scratch.resize(rec.nbytes);
-    read_bytes(f, scratch.data(), rec.nbytes);
-    skip_pad_to_8(f, rec.nbytes);
-    tensor_from_host(*target, scratch.data(), rec.nbytes);
+#ifdef USE_CUDA
+    if (target->device().is_cuda()) {
+      int slot = static_cast<int>(cuda_idx & 1);
+      wait_slot(slot);
+      read_bytes(f, pin.buf[slot], rec.nbytes);
+      skip_pad_to_8(f, rec.nbytes);
+      cudaMemcpyAsync(target->data(), pin.buf[slot], rec.nbytes,
+                      cudaMemcpyHostToDevice, cs);
+      cudaEventRecord(pin.evt[slot], cs);
+      inflight[slot] = true;
+      ++cuda_idx;
+    } else
+#endif
+    {
+      if (scratch.size() < rec.nbytes) scratch.resize(rec.nbytes);
+      read_bytes(f, scratch.data(), rec.nbytes);
+      skip_pad_to_8(f, rec.nbytes);
+      std::memcpy(target->data(), scratch.data(), rec.nbytes);
+    }
 
     size_t slot_idx = it->second.idx * 3 + static_cast<size_t>(it->second.kind);
     seen[slot_idx] = 1;
   }
+
+  // Drain remaining H2Ds before returning.
+  wait_slot(0);
+  wait_slot(1);
 
   for (size_t i = 0; i < seen.size(); ++i) {
     if (!seen[i]) {

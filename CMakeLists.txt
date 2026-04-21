@@ -268,6 +268,7 @@ set(ZWT_CPP_SOURCES
     zwt/src/ops/norm.cpp
     zwt/src/ops/xent.cpp
     zwt/src/ops/attn.cpp
+    zwt/src/ops/flash_attn.cpp
     zwt/src/ops/rope.cpp
     zwt/src/layers/module.cpp
     zwt/src/layers/parameter.cpp
@@ -340,6 +341,10 @@ target_compile_options(zwt_ddp_bucket_tests PRIVATE -O2)
 add_executable(zwt_tp_tests zwt/tests/tp_tests.cpp)
 target_link_libraries(zwt_tp_tests PRIVATE zwt)
 target_compile_options(zwt_tp_tests PRIVATE -O2)
+
+add_executable(zwt_flash_attn_tests zwt/tests/flash_attn_tests.cpp)
+target_link_libraries(zwt_flash_attn_tests PRIVATE zwt)
+target_compile_options(zwt_flash_attn_tests PRIVATE -O2)
 
 add_executable(zwt_graph_bench zwt/tools/graph_bench.cpp)
 target_link_libraries(zwt_graph_bench PRIVATE zwt)

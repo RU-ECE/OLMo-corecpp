@@ -325,6 +325,10 @@ add_executable(zwt_numerical_audit zwt/tools/numerical_audit.cpp)
 target_link_libraries(zwt_numerical_audit PRIVATE zwt)
 target_compile_options(zwt_numerical_audit PRIVATE -O3 -march=native)
 
+add_executable(zwt_kernel_tests zwt/tests/kernel_tests.cpp)
+target_link_libraries(zwt_kernel_tests PRIVATE zwt)
+target_compile_options(zwt_kernel_tests PRIVATE -O2)
+
 # CUDA kernels (auto-enabled when CUDA compiler is found)
 option(OLMO_BUILD_KERNELS "Build custom CUDA kernels" ON)
 if(CMAKE_CUDA_COMPILER AND OLMO_BUILD_KERNELS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/CMakeLists.txt")

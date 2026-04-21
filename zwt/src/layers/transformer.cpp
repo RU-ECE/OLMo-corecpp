@@ -8,14 +8,15 @@ namespace {
 
 TransformerBlock::Config make_block_cfg(const Transformer::Config& c) {
   TransformerBlock::Config b;
-  b.d_model   = c.d_model;
-  b.n_heads   = c.n_heads;
-  b.head_dim  = c.head_dim;
-  b.d_ffn     = c.d_ffn;
-  b.max_seq   = c.max_seq;
-  b.rope_base = c.rope_base;
-  b.norm_eps  = c.norm_eps;
-  b.bias      = c.bias;
+  b.d_model    = c.d_model;
+  b.n_heads    = c.n_heads;
+  b.n_kv_heads = (c.n_kv_heads > 0) ? c.n_kv_heads : c.n_heads;
+  b.head_dim   = c.head_dim;
+  b.d_ffn      = c.d_ffn;
+  b.max_seq    = c.max_seq;
+  b.rope_base  = c.rope_base;
+  b.norm_eps   = c.norm_eps;
+  b.bias       = c.bias;
   return b;
 }
 
@@ -34,6 +35,10 @@ Transformer::Transformer(const Config& cfg, DType dtype, Device device,
   }
   if (cfg.d_model != cfg.n_heads * cfg.head_dim) {
     throw std::runtime_error("Transformer: d_model must equal n_heads * head_dim");
+  }
+  // GQA validity: 0 means "default to MHA"; else must divide n_heads evenly.
+  if (cfg.n_kv_heads > 0 && cfg.n_heads % cfg.n_kv_heads != 0) {
+    throw std::runtime_error("Transformer: n_heads must be a multiple of n_kv_heads");
   }
 
   blocks_.reserve(static_cast<size_t>(cfg.n_layers));

@@ -5,17 +5,21 @@
 #include "zwt/ops/rope.hpp"
 
 #include <stdexcept>
+#include <utility>
 
 namespace zwt {
 
 namespace {
 
-// Project q/k/v independently — three separate GEMMs. Q/K/V share the seed
-// space but use disjoint sub-seeds so their weight tensors differ.
+// Disjoint seed salts for Q / K / V / O so their weights differ at init.
 constexpr uint64_t kSeedSaltQ = 0x17'00'00'00ULL;
 constexpr uint64_t kSeedSaltK = 0x23'00'00'00ULL;
 constexpr uint64_t kSeedSaltV = 0x31'00'00'00ULL;
 constexpr uint64_t kSeedSaltO = 0x47'00'00'00ULL;
+
+int64_t kv_heads(const Attention::Config& c) {
+  return (c.n_kv_heads > 0) ? c.n_kv_heads : c.n_heads;
+}
 
 }  // namespace
 
@@ -24,9 +28,9 @@ Attention::Attention(const Config& cfg, DType dtype, Device device,
     : cfg_(cfg),
       q_proj_(cfg.d_model, cfg.n_heads * cfg.head_dim, cfg.bias, dtype, device,
               init_seed ^ kSeedSaltQ),
-      k_proj_(cfg.d_model, cfg.n_heads * cfg.head_dim, cfg.bias, dtype, device,
+      k_proj_(cfg.d_model, kv_heads(cfg) * cfg.head_dim, cfg.bias, dtype, device,
               init_seed ^ kSeedSaltK),
-      v_proj_(cfg.d_model, cfg.n_heads * cfg.head_dim, cfg.bias, dtype, device,
+      v_proj_(cfg.d_model, kv_heads(cfg) * cfg.head_dim, cfg.bias, dtype, device,
               init_seed ^ kSeedSaltV),
       out_proj_(cfg.n_heads * cfg.head_dim, cfg.d_model, cfg.bias, dtype, device,
                 init_seed ^ kSeedSaltO) {
@@ -34,43 +38,64 @@ Attention::Attention(const Config& cfg, DType dtype, Device device,
     throw std::runtime_error("Attention: invalid config");
   if (cfg.d_model != cfg.n_heads * cfg.head_dim)
     throw std::runtime_error("Attention: d_model must equal n_heads * head_dim");
+  const int64_t Hkv = kv_heads(cfg);
+  if (cfg.n_heads % Hkv != 0)
+    throw std::runtime_error("Attention: n_heads must be a multiple of n_kv_heads");
   rope_table_ = ops::rope_build_table(cfg.max_seq, cfg.head_dim, cfg.rope_base, device);
 }
 
 Tensor Attention::forward(const Tensor& x) {
   if (x.rank() != 3) throw std::runtime_error("Attention::forward: x must be [B,S,d]");
-  const int64_t B = x.dim(0);
-  const int64_t S = x.dim(1);
-  const int64_t H = cfg_.n_heads;
-  const int64_t D = cfg_.head_dim;
+  const int64_t B   = x.dim(0);
+  const int64_t S   = x.dim(1);
+  const int64_t H   = cfg_.n_heads;
+  const int64_t Hkv = kv_heads(cfg_);
+  const int64_t D   = cfg_.head_dim;
+  const int64_t group = H / Hkv;
   saved_input_ = x.view(x.shape());
 
-  // Three separate projections.
-  Tensor q = q_proj_.forward(x);  // [B, S, H*D]
-  Tensor k = k_proj_.forward(x);
-  Tensor v = v_proj_.forward(x);
+  Tensor q = q_proj_.forward(x);  // [B, S, H  *D]
+  Tensor k = k_proj_.forward(x);  // [B, S, Hkv*D]
+  Tensor v = v_proj_.forward(x);  // [B, S, Hkv*D]
 
-  Tensor q4 = q.view({B, S, H, D});
-  Tensor k4 = k.view({B, S, H, D});
-  Tensor v4 = v.view({B, S, H, D});
+  Tensor q4 = q.view({B, S, H,   D});
+  Tensor k4 = k.view({B, S, Hkv, D});
+  Tensor v4 = v.view({B, S, Hkv, D});
 
-  // RoPE on Q and K (not V).
+  // RoPE on Q (full width) and K (compact Hkv width). RoPE is shape-agnostic
+  // on the H axis, so it applies directly at compact width — cheaper than
+  // rotating after expansion.
   ops::rope_apply(q4, rope_table_);
   ops::rope_apply(k4, rope_table_);
 
-  // Transpose to head-major for SDPA: [B,S,H,D] -> [B,H,S,D].
+  // Head-major transpose at compact widths.
   saved_q_bhsd_ = empty_scratch({B, H, S, D}, x.dtype(), x.device());
-  saved_k_bhsd_ = empty_scratch({B, H, S, D}, x.dtype(), x.device());
-  saved_v_bhsd_ = empty_scratch({B, H, S, D}, x.dtype(), x.device());
   ops::transpose_bshd_to_bhsd(q4, saved_q_bhsd_);
-  ops::transpose_bshd_to_bhsd(k4, saved_k_bhsd_);
-  ops::transpose_bshd_to_bhsd(v4, saved_v_bhsd_);
+
+  if (group == 1) {
+    // MHA fast path: Hkv == H. Directly transpose K/V into the saved buffers;
+    // no expansion / extra storage.
+    saved_k_bhsd_ = empty_scratch({B, H, S, D}, x.dtype(), x.device());
+    saved_v_bhsd_ = empty_scratch({B, H, S, D}, x.dtype(), x.device());
+    ops::transpose_bshd_to_bhsd(k4, saved_k_bhsd_);
+    ops::transpose_bshd_to_bhsd(v4, saved_v_bhsd_);
+  } else {
+    // GQA path: transpose into compact head-major buffers, then replicate
+    // across groups into the saved_*_bhsd_ (full H) buffers fed to sdpa().
+    Tensor k_bhsd_kv = empty_scratch({B, Hkv, S, D}, x.dtype(), x.device());
+    Tensor v_bhsd_kv = empty_scratch({B, Hkv, S, D}, x.dtype(), x.device());
+    ops::transpose_bshd_to_bhsd(k4, k_bhsd_kv);
+    ops::transpose_bshd_to_bhsd(v4, v_bhsd_kv);
+    saved_k_bhsd_ = empty_scratch({B, H, S, D}, x.dtype(), x.device());
+    saved_v_bhsd_ = empty_scratch({B, H, S, D}, x.dtype(), x.device());
+    ops::repeat_kv_heads(k_bhsd_kv, saved_k_bhsd_);
+    ops::repeat_kv_heads(v_bhsd_kv, saved_v_bhsd_);
+  }
 
   saved_out_bhsd_ = empty_scratch({B, H, S, D}, x.dtype(), x.device());
   ops::sdpa(saved_q_bhsd_, saved_k_bhsd_, saved_v_bhsd_,
             saved_out_bhsd_, /*is_causal=*/true);
 
-  // Transpose back to [B, S, H, D], flatten last two dims for out_proj.
   Tensor out_bshd = empty_scratch({B, S, H, D}, x.dtype(), x.device());
   ops::transpose_bhsd_to_bshd(saved_out_bhsd_, out_bshd);
   Tensor out_flat = out_bshd.view({B, S, H * D});
@@ -79,46 +104,59 @@ Tensor Attention::forward(const Tensor& x) {
 }
 
 Tensor Attention::backward(const Tensor& grad_y) {
-  const int64_t B = saved_input_.dim(0);
-  const int64_t S = saved_input_.dim(1);
-  const int64_t H = cfg_.n_heads;
-  const int64_t D = cfg_.head_dim;
+  const int64_t B   = saved_input_.dim(0);
+  const int64_t S   = saved_input_.dim(1);
+  const int64_t H   = cfg_.n_heads;
+  const int64_t Hkv = kv_heads(cfg_);
+  const int64_t D   = cfg_.head_dim;
+  const int64_t group = H / Hkv;
 
   // Backward through out_proj.
-  Tensor grad_out_flat = out_proj_.backward(grad_y);                   // [B,S,H*D]
+  Tensor grad_out_flat = out_proj_.backward(grad_y);              // [B,S,H*D]
   Tensor grad_out_bshd = grad_out_flat.view({B, S, H, D});
 
-  // Transpose grad [B,S,H,D] -> [B,H,S,D].
+  // Transpose grad_out [B,S,H,D] -> [B,H,S,D] for SDPA backward.
   Tensor grad_out_bhsd = empty_scratch({B, H, S, D}, grad_y.dtype(), grad_y.device());
   ops::transpose_bshd_to_bhsd(grad_out_bshd, grad_out_bhsd);
 
-  // SDPA backward.
-  Tensor grad_q_bhsd = empty_scratch({B, H, S, D}, grad_y.dtype(), grad_y.device());
-  Tensor grad_k_bhsd = empty_scratch({B, H, S, D}, grad_y.dtype(), grad_y.device());
-  Tensor grad_v_bhsd = empty_scratch({B, H, S, D}, grad_y.dtype(), grad_y.device());
+  // SDPA backward at full H (K/V were replicated to H heads on forward).
+  Tensor grad_q_bhsd      = empty_scratch({B, H, S, D}, grad_y.dtype(), grad_y.device());
+  Tensor grad_k_bhsd_full = empty_scratch({B, H, S, D}, grad_y.dtype(), grad_y.device());
+  Tensor grad_v_bhsd_full = empty_scratch({B, H, S, D}, grad_y.dtype(), grad_y.device());
   ops::sdpa_backward(grad_out_bhsd,
                      saved_q_bhsd_, saved_k_bhsd_, saved_v_bhsd_,
                      saved_out_bhsd_,
-                     grad_q_bhsd, grad_k_bhsd, grad_v_bhsd,
+                     grad_q_bhsd, grad_k_bhsd_full, grad_v_bhsd_full,
                      /*is_causal=*/true);
 
-  // Transpose each grad from [B,H,S,D] back to [B,S,H,D].
-  Tensor grad_q_bshd = empty_scratch({B, S, H, D}, grad_y.dtype(), grad_y.device());
-  Tensor grad_k_bshd = empty_scratch({B, S, H, D}, grad_y.dtype(), grad_y.device());
-  Tensor grad_v_bshd = empty_scratch({B, S, H, D}, grad_y.dtype(), grad_y.device());
+  // Collapse replicated K/V gradients back to compact Hkv via group-sum.
+  Tensor grad_k_bhsd = (group == 1)
+      ? std::move(grad_k_bhsd_full)
+      : empty_scratch({B, Hkv, S, D}, grad_y.dtype(), grad_y.device());
+  Tensor grad_v_bhsd = (group == 1)
+      ? std::move(grad_v_bhsd_full)
+      : empty_scratch({B, Hkv, S, D}, grad_y.dtype(), grad_y.device());
+  if (group != 1) {
+    ops::reduce_kv_heads_sum(grad_k_bhsd_full, grad_k_bhsd);
+    ops::reduce_kv_heads_sum(grad_v_bhsd_full, grad_v_bhsd);
+  }
+
+  // Transpose each grad from [B,*,S,D] -> [B,S,*,D].
+  Tensor grad_q_bshd = empty_scratch({B, S, H,   D}, grad_y.dtype(), grad_y.device());
+  Tensor grad_k_bshd = empty_scratch({B, S, Hkv, D}, grad_y.dtype(), grad_y.device());
+  Tensor grad_v_bshd = empty_scratch({B, S, Hkv, D}, grad_y.dtype(), grad_y.device());
   ops::transpose_bhsd_to_bshd(grad_q_bhsd, grad_q_bshd);
   ops::transpose_bhsd_to_bshd(grad_k_bhsd, grad_k_bshd);
   ops::transpose_bhsd_to_bshd(grad_v_bhsd, grad_v_bshd);
 
-  // RoPE backward on Q and K grads.
+  // RoPE-backward on Q (full H width) and K (compact Hkv width).
   ops::rope_apply_backward(grad_q_bshd, rope_table_);
   ops::rope_apply_backward(grad_k_bshd, rope_table_);
 
-  // Flatten [B,S,H,D] -> [B,S,H*D] and hand to projection backwards. Each
-  // projection writes into grad_x (summed) via a scratch temporary.
-  Tensor gq_flat = grad_q_bshd.view({B, S, H * D});
-  Tensor gk_flat = grad_k_bshd.view({B, S, H * D});
-  Tensor gv_flat = grad_v_bshd.view({B, S, H * D});
+  // Flatten to projection-layout and backprop through q/k/v projections.
+  Tensor gq_flat = grad_q_bshd.view({B, S, H   * D});
+  Tensor gk_flat = grad_k_bshd.view({B, S, Hkv * D});
+  Tensor gv_flat = grad_v_bshd.view({B, S, Hkv * D});
 
   Tensor grad_x_q = q_proj_.backward(gq_flat);   // [B, S, d_model]
   Tensor grad_x_k = k_proj_.backward(gk_flat);
@@ -127,10 +165,7 @@ Tensor Attention::backward(const Tensor& grad_y) {
   // Sum the three upstream grads.
   Tensor grad_x = empty_scratch(saved_input_.shape(), grad_y.dtype(), grad_y.device());
   ops::add(grad_x, grad_x_q, grad_x_k);
-  {
-    // grad_x += grad_x_v  (use axpy with alpha=1).
-    ops::axpy(grad_x, grad_x_v, 1.0f);
-  }
+  ops::axpy(grad_x, grad_x_v, 1.0f);
   return grad_x;
 }
 

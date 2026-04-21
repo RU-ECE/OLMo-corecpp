@@ -108,6 +108,7 @@ TrainConfig load_train_config(const std::string& path) {
         if (k == "vocab_size")     { c.model.vocab_size = parse_i64(v); return true; }
         if (k == "d_model")        { c.model.d_model    = parse_i64(v); return true; }
         if (k == "n_heads")        { c.model.n_heads    = parse_i64(v); return true; }
+        if (k == "n_kv_heads")     { c.model.n_kv_heads = parse_i64(v); return true; }
         if (k == "head_dim")       { c.model.head_dim   = parse_i64(v); return true; }
         if (k == "d_ffn")          { c.model.d_ffn      = parse_i64(v); return true; }
         if (k == "n_layers")       { c.model.n_layers   = parse_i64(v); return true; }
@@ -187,6 +188,7 @@ std::string dump_train_config(const TrainConfig& c) {
      << "vocab_size    = " << c.model.vocab_size    << "\n"
      << "d_model       = " << c.model.d_model       << "\n"
      << "n_heads       = " << c.model.n_heads       << "\n"
+     << "n_kv_heads    = " << c.model.n_kv_heads    << "\n"
      << "head_dim      = " << c.model.head_dim      << "\n"
      << "d_ffn         = " << c.model.d_ffn         << "\n"
      << "n_layers      = " << c.model.n_layers      << "\n"

@@ -195,6 +195,91 @@ void transpose_bhsd_to_bshd(const Tensor& in, Tensor& out) {
   throw std::runtime_error("transpose_bhsd_to_bshd: unsupported dtype on CPU");
 }
 
+void repeat_kv_heads(const Tensor& in, Tensor& out) {
+  if (in.rank() != 4 || out.rank() != 4)
+    throw std::runtime_error("repeat_kv_heads: rank must be 4");
+  const int64_t B   = in.dim(0);
+  const int64_t Hkv = in.dim(1);
+  const int64_t S   = in.dim(2);
+  const int64_t D   = in.dim(3);
+  const int64_t H   = out.dim(1);
+  if (out.dim(0) != B || out.dim(2) != S || out.dim(3) != D)
+    throw std::runtime_error("repeat_kv_heads: out shape must be [B,H,S,D]");
+  if (Hkv == 0 || H % Hkv != 0)
+    throw std::runtime_error("repeat_kv_heads: H must be a multiple of Hkv");
+  const int64_t group = H / Hkv;
+  if (group == 1) { copy(in, out); return; }
+  if (in.device().is_cuda()) {
+#ifdef USE_CUDA
+    k::repeat_kv_heads_bf16(
+        reinterpret_cast<const __nv_bfloat16*>(in.data()),
+        reinterpret_cast<__nv_bfloat16*>(out.data()),
+        B, Hkv, S, D, group,
+        reinterpret_cast<cudaStream_t>(compute_stream(in.device()).handle));
+    return;
+#endif
+  }
+  if (in.dtype() == DType::F32) {
+    const float* x = in.as<float>();
+    float*       y = out.as<float>();
+    const int64_t plane = S * D;
+    for (int64_t b = 0; b < B; ++b)
+      for (int64_t kv = 0; kv < Hkv; ++kv) {
+        const float* src = x + ((b * Hkv) + kv) * plane;
+        for (int64_t g = 0; g < group; ++g) {
+          float* dst = y + ((b * H) + kv * group + g) * plane;
+          std::memcpy(dst, src, sizeof(float) * plane);
+        }
+      }
+    return;
+  }
+  throw std::runtime_error("repeat_kv_heads: unsupported dtype on CPU");
+}
+
+void reduce_kv_heads_sum(const Tensor& in, Tensor& out) {
+  if (in.rank() != 4 || out.rank() != 4)
+    throw std::runtime_error("reduce_kv_heads_sum: rank must be 4");
+  const int64_t B   = in.dim(0);
+  const int64_t H   = in.dim(1);
+  const int64_t S   = in.dim(2);
+  const int64_t D   = in.dim(3);
+  const int64_t Hkv = out.dim(1);
+  if (out.dim(0) != B || out.dim(2) != S || out.dim(3) != D)
+    throw std::runtime_error("reduce_kv_heads_sum: out shape must be [B,Hkv,S,D]");
+  if (Hkv == 0 || H % Hkv != 0)
+    throw std::runtime_error("reduce_kv_heads_sum: H must be a multiple of Hkv");
+  const int64_t group = H / Hkv;
+  if (group == 1) { copy(in, out); return; }
+  if (in.device().is_cuda()) {
+#ifdef USE_CUDA
+    k::reduce_kv_heads_sum_bf16(
+        reinterpret_cast<const __nv_bfloat16*>(in.data()),
+        reinterpret_cast<__nv_bfloat16*>(out.data()),
+        B, Hkv, S, D, group,
+        reinterpret_cast<cudaStream_t>(compute_stream(in.device()).handle));
+    return;
+#endif
+  }
+  if (in.dtype() == DType::F32) {
+    const float* x = in.as<float>();
+    float*       y = out.as<float>();
+    const int64_t plane = S * D;
+    for (int64_t b = 0; b < B; ++b)
+      for (int64_t kv = 0; kv < Hkv; ++kv) {
+        float* dst = y + ((b * Hkv) + kv) * plane;
+        // Init with the first group member, then accumulate the remainder.
+        const float* src0 = x + ((b * H) + kv * group) * plane;
+        std::memcpy(dst, src0, sizeof(float) * plane);
+        for (int64_t g = 1; g < group; ++g) {
+          const float* src = x + ((b * H) + kv * group + g) * plane;
+          for (int64_t i = 0; i < plane; ++i) dst[i] += src[i];
+        }
+      }
+    return;
+  }
+  throw std::runtime_error("reduce_kv_heads_sum: unsupported dtype on CPU");
+}
+
 void bias_backward(const Tensor& grad_y, Tensor& grad_bias) {
   const int64_t cols = grad_bias.numel();
   const int64_t rows = grad_y.numel() / cols;
@@ -242,6 +327,88 @@ void silu_mul(Tensor& out, const Tensor& gate, const Tensor& up) {
     return;
   }
   throw std::runtime_error("silu_mul: unsupported dtype on CPU");
+}
+
+void silu_mul_gated(Tensor& out, const Tensor& combined) {
+  if (combined.rank() < 2 || out.rank() < 2)
+    throw std::runtime_error("silu_mul_gated: rank must be >= 2");
+  const int64_t last_in  = combined.dim(combined.rank() - 1);
+  const int64_t last_out = out.dim(out.rank() - 1);
+  if (last_in != 2 * last_out)
+    throw std::runtime_error("silu_mul_gated: last dim of combined must be 2 * last dim of out");
+  const int64_t H = last_out;
+  const int64_t N = combined.numel() / last_in;
+  if (out.numel() != N * H)
+    throw std::runtime_error("silu_mul_gated: shape mismatch");
+  if (out.device().is_cuda()) {
+#ifdef USE_CUDA
+    k::silu_mul_gated_bf16(reinterpret_cast<__nv_bfloat16*>(out.data()),
+                           reinterpret_cast<const __nv_bfloat16*>(combined.data()),
+                           N, H,
+                           reinterpret_cast<cudaStream_t>(compute_stream(out.device()).handle));
+    return;
+#endif
+  }
+  if (out.dtype() == DType::F32) {
+    const float* c = combined.as<float>();
+    float*       y = out.as<float>();
+    for (int64_t n = 0; n < N; ++n) {
+      const float* row = c + n * 2 * H;
+      float*       orow = y + n * H;
+      for (int64_t i = 0; i < H; ++i) {
+        float g = row[i];
+        float u = row[H + i];
+        orow[i] = (g / (1.0f + std::exp(-g))) * u;
+      }
+    }
+    return;
+  }
+  throw std::runtime_error("silu_mul_gated: unsupported dtype on CPU");
+}
+
+void silu_mul_gated_backward(const Tensor& grad_out, const Tensor& combined,
+                             Tensor& grad_combined) {
+  if (grad_combined.shape() != combined.shape())
+    throw std::runtime_error("silu_mul_gated_backward: grad_combined shape mismatch");
+  const int64_t last_in  = combined.dim(combined.rank() - 1);
+  const int64_t last_out = grad_out.dim(grad_out.rank() - 1);
+  if (last_in != 2 * last_out)
+    throw std::runtime_error("silu_mul_gated_backward: dim mismatch");
+  const int64_t H = last_out;
+  const int64_t N = combined.numel() / last_in;
+  if (grad_out.device().is_cuda()) {
+#ifdef USE_CUDA
+    k::silu_mul_gated_backward_bf16(
+        reinterpret_cast<const __nv_bfloat16*>(grad_out.data()),
+        reinterpret_cast<const __nv_bfloat16*>(combined.data()),
+        reinterpret_cast<__nv_bfloat16*>(grad_combined.data()),
+        N, H,
+        reinterpret_cast<cudaStream_t>(compute_stream(grad_out.device()).handle));
+    return;
+#endif
+  }
+  if (grad_out.dtype() == DType::F32) {
+    const float* go = grad_out.as<float>();
+    const float* c  = combined.as<float>();
+    float*       gc = grad_combined.as<float>();
+    for (int64_t n = 0; n < N; ++n) {
+      const float* row  = c  + n * 2 * H;
+      float*       grow = gc + n * 2 * H;
+      const float* orow = go + n * H;
+      for (int64_t i = 0; i < H; ++i) {
+        float g  = row[i];
+        float u  = row[H + i];
+        float go_i = orow[i];
+        float sig  = 1.0f / (1.0f + std::exp(-g));
+        float silu = g * sig;
+        float dsilu = sig * (1.0f + g * (1.0f - sig));
+        grow[i]     = go_i * u * dsilu;      // grad_gate
+        grow[H + i] = go_i * silu;           // grad_up
+      }
+    }
+    return;
+  }
+  throw std::runtime_error("silu_mul_gated_backward: unsupported dtype on CPU");
 }
 
 void silu_mul_backward(const Tensor& grad_out, const Tensor& gate, const Tensor& up,

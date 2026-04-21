@@ -16,14 +16,15 @@ namespace zwt {
 class TransformerBlock final : public Module {
  public:
   struct Config {
-    int64_t d_model   = 0;
-    int64_t n_heads   = 0;
-    int64_t head_dim  = 0;
-    int64_t d_ffn     = 0;
-    int64_t max_seq   = 0;
-    float   rope_base = 10000.f;
-    float   norm_eps  = 1e-5f;
-    bool    bias      = false;
+    int64_t d_model    = 0;
+    int64_t n_heads    = 0;
+    int64_t n_kv_heads = 0;   // 0 or equal to n_heads means MHA (no GQA).
+    int64_t head_dim   = 0;
+    int64_t d_ffn      = 0;
+    int64_t max_seq    = 0;
+    float   rope_base  = 10000.f;
+    float   norm_eps   = 1e-5f;
+    bool    bias       = false;
   };
 
   TransformerBlock(const Config& cfg, DType dtype, Device device,

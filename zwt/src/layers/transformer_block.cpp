@@ -8,12 +8,13 @@ namespace {
 
 Attention::Config make_attn_cfg(const TransformerBlock::Config& c) {
   Attention::Config a;
-  a.d_model   = c.d_model;
-  a.n_heads   = c.n_heads;
-  a.head_dim  = c.head_dim;
-  a.max_seq   = c.max_seq;
-  a.rope_base = c.rope_base;
-  a.bias      = c.bias;
+  a.d_model    = c.d_model;
+  a.n_heads    = c.n_heads;
+  a.n_kv_heads = (c.n_kv_heads > 0) ? c.n_kv_heads : c.n_heads;
+  a.head_dim   = c.head_dim;
+  a.max_seq    = c.max_seq;
+  a.rope_base  = c.rope_base;
+  a.bias       = c.bias;
   return a;
 }
 

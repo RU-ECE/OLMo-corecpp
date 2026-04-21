@@ -189,4 +189,126 @@ void transpose_bhsd_bshd_bf16(const __nv_bfloat16* in, __nv_bfloat16* out,
   k_transpose_bhsd_bshd<<<blocks, block, 0, s>>>(in, out, B, S, H, D);
 }
 
+// GQA broadcast: write out[b, kv*group + g, s, d] = in[b, kv, s, d].
+// One thread per output element. Input is read `group` times, a pure HBM
+// replication — safe to run on a non-Hopper stream.
+__global__ void k_repeat_kv_heads(const __nv_bfloat16* in, __nv_bfloat16* out,
+                                  int64_t B, int64_t Hkv, int64_t S, int64_t D,
+                                  int64_t group) {
+  int64_t tid = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t H = Hkv * group;
+  int64_t total = B * H * S * D;
+  if (tid >= total) return;
+  int64_t d = tid % D;
+  int64_t s = (tid / D) % S;
+  int64_t h = (tid / (D * S)) % H;
+  int64_t b = tid / (D * S * H);
+  int64_t kv = h / group;
+  int64_t src = (((b * Hkv) + kv) * S + s) * D + d;
+  out[tid] = in[src];
+}
+
+// GQA reduce: out[b, kv, s, d] = sum_{g=0..group-1} in[b, kv*group + g, s, d].
+// One thread per output element. Accumulator is fp32 to preserve precision
+// before the bf16 writeback — matches the rest of zwt's "bf16 storage,
+// fp32 compute" discipline.
+__global__ void k_reduce_kv_heads_sum(const __nv_bfloat16* in, __nv_bfloat16* out,
+                                      int64_t B, int64_t Hkv, int64_t S, int64_t D,
+                                      int64_t group) {
+  int64_t tid = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = B * Hkv * S * D;
+  if (tid >= total) return;
+  int64_t d = tid % D;
+  int64_t s = (tid / D) % S;
+  int64_t kv = (tid / (D * S)) % Hkv;
+  int64_t b = tid / (D * S * Hkv);
+  int64_t H = Hkv * group;
+  float acc = 0.f;
+  int64_t base = ((b * H) + kv * group) * S * D + s * D + d;
+  const int64_t stride = S * D;
+  #pragma unroll 4
+  for (int64_t g = 0; g < group; ++g) acc += __bfloat162float(in[base + g * stride]);
+  out[tid] = __float2bfloat16(acc);
+}
+
+void repeat_kv_heads_bf16(const __nv_bfloat16* in, __nv_bfloat16* out,
+                          int64_t B, int64_t Hkv, int64_t S, int64_t D,
+                          int64_t group, cudaStream_t s) {
+  int64_t total = B * Hkv * group * S * D;
+  int block = 256;
+  unsigned blocks = static_cast<unsigned>((total + block - 1) / block);
+  k_repeat_kv_heads<<<blocks, block, 0, s>>>(in, out, B, Hkv, S, D, group);
+}
+
+void reduce_kv_heads_sum_bf16(const __nv_bfloat16* in, __nv_bfloat16* out,
+                              int64_t B, int64_t Hkv, int64_t S, int64_t D,
+                              int64_t group, cudaStream_t s) {
+  int64_t total = B * Hkv * S * D;
+  int block = 256;
+  unsigned blocks = static_cast<unsigned>((total + block - 1) / block);
+  k_reduce_kv_heads_sum<<<blocks, block, 0, s>>>(in, out, B, Hkv, S, D, group);
+}
+
+// Fused SwiGLU on a combined [N, 2H] GEMM output. One thread per (n, i).
+// gate = combined[n, i], up = combined[n, H + i]; out[n, i] = silu(g) * u.
+// Saves one HBM read per element vs. running two separate silu_mul passes,
+// and keeps the gate/up lanes within the same cache line so the load is
+// coalesced across threads in a warp.
+__global__ void k_silu_mul_gated(__nv_bfloat16* out,
+                                 const __nv_bfloat16* combined,
+                                 int64_t N, int64_t H) {
+  int64_t tid = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = N * H;
+  if (tid >= total) return;
+  int64_t n = tid / H;
+  int64_t i = tid % H;
+  const __nv_bfloat16* row = combined + n * 2 * H;
+  float g = __bfloat162float(row[i]);
+  float u = __bfloat162float(row[H + i]);
+  float silu = g / (1.0f + __expf(-g));
+  out[tid] = __float2bfloat16(silu * u);
+}
+
+// Backward. One thread per (n, i) output element; each thread writes to the
+// two halves of grad_combined at positions (n, i) and (n, H + i).
+__global__ void k_silu_mul_gated_backward(const __nv_bfloat16* grad_out,
+                                          const __nv_bfloat16* combined,
+                                          __nv_bfloat16* grad_combined,
+                                          int64_t N, int64_t H) {
+  int64_t tid = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = N * H;
+  if (tid >= total) return;
+  int64_t n = tid / H;
+  int64_t i = tid % H;
+  const __nv_bfloat16* row = combined + n * 2 * H;
+  float g = __bfloat162float(row[i]);
+  float u = __bfloat162float(row[H + i]);
+  float go = __bfloat162float(grad_out[tid]);
+  float sig  = 1.0f / (1.0f + __expf(-g));
+  float silu = g * sig;
+  float dsilu = sig * (1.0f + g * (1.0f - sig));
+  __nv_bfloat16* grow = grad_combined + n * 2 * H;
+  grow[i]     = __float2bfloat16(go * u * dsilu);    // grad_gate
+  grow[H + i] = __float2bfloat16(go * silu);          // grad_up
+}
+
+void silu_mul_gated_bf16(__nv_bfloat16* out, const __nv_bfloat16* combined,
+                         int64_t N, int64_t H, cudaStream_t s) {
+  int64_t total = N * H;
+  int block = 256;
+  unsigned blocks = static_cast<unsigned>((total + block - 1) / block);
+  k_silu_mul_gated<<<blocks, block, 0, s>>>(out, combined, N, H);
+}
+
+void silu_mul_gated_backward_bf16(const __nv_bfloat16* grad_out,
+                                  const __nv_bfloat16* combined,
+                                  __nv_bfloat16* grad_combined,
+                                  int64_t N, int64_t H, cudaStream_t s) {
+  int64_t total = N * H;
+  int block = 256;
+  unsigned blocks = static_cast<unsigned>((total + block - 1) / block);
+  k_silu_mul_gated_backward<<<blocks, block, 0, s>>>(grad_out, combined,
+                                                     grad_combined, N, H);
+}
+
 }  // namespace zwt::ops::k

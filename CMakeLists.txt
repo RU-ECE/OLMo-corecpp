@@ -261,6 +261,7 @@ set(ZWT_CPP_SOURCES
     zwt/src/core/tensor.cpp
     zwt/src/core/stream.cpp
     zwt/src/dist/ddp.cpp
+    zwt/src/dist/comm.cpp
     zwt/src/ops/gemm.cpp
     zwt/src/ops/elementwise.cpp
     zwt/src/ops/norm.cpp

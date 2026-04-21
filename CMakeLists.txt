@@ -260,6 +260,7 @@ set(ZWT_CPP_SOURCES
     zwt/src/core/graph.cpp
     zwt/src/core/tensor.cpp
     zwt/src/core/stream.cpp
+    zwt/src/dist/ddp.cpp
     zwt/src/ops/gemm.cpp
     zwt/src/ops/elementwise.cpp
     zwt/src/ops/norm.cpp
@@ -329,6 +330,10 @@ target_compile_options(zwt_numerical_audit PRIVATE -O3 -march=native)
 add_executable(zwt_kernel_tests zwt/tests/kernel_tests.cpp)
 target_link_libraries(zwt_kernel_tests PRIVATE zwt)
 target_compile_options(zwt_kernel_tests PRIVATE -O2)
+
+add_executable(zwt_ddp_bucket_tests zwt/tests/ddp_bucket_tests.cpp)
+target_link_libraries(zwt_ddp_bucket_tests PRIVATE zwt)
+target_compile_options(zwt_ddp_bucket_tests PRIVATE -O2)
 
 add_executable(zwt_graph_bench zwt/tools/graph_bench.cpp)
 target_link_libraries(zwt_graph_bench PRIVATE zwt)

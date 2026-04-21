@@ -132,7 +132,7 @@ void run(int M, int N, int K,
   auto status = op.can_implement(args);
   if (status != cutlass::Status::kSuccess) {
     throw std::runtime_error(std::string("gemm_wgmma: can_implement failed: ")
-                             + cutlassGetStatusString(status));
+                             + cutlass::cutlassGetStatusString(status));
   }
 
   size_t workspace_size = Gemm::get_workspace_size(args);
@@ -151,7 +151,7 @@ void run(int M, int N, int K,
   if (workspace) cudaFree(workspace);
   if (status != cutlass::Status::kSuccess) {
     throw std::runtime_error(std::string("gemm_wgmma: run failed: ")
-                             + cutlassGetStatusString(status));
+                             + cutlass::cutlassGetStatusString(status));
   }
 }
 

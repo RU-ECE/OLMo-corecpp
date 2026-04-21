@@ -317,6 +317,10 @@ add_executable(zwt_pretrain zwt/tools/zwt_pretrain.cpp)
 target_link_libraries(zwt_pretrain PRIVATE zwt)
 target_compile_options(zwt_pretrain PRIVATE -O3 -march=native)
 
+add_executable(zwt_export_hf zwt/tools/export_hf.cpp)
+target_link_libraries(zwt_export_hf PRIVATE zwt)
+target_compile_options(zwt_export_hf PRIVATE -O3 -march=native)
+
 # CUDA kernels (auto-enabled when CUDA compiler is found)
 option(OLMO_BUILD_KERNELS "Build custom CUDA kernels" ON)
 if(CMAKE_CUDA_COMPILER AND OLMO_BUILD_KERNELS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/CMakeLists.txt")

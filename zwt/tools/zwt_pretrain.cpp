@@ -51,12 +51,15 @@ namespace {
 struct CliArgs {
   std::string config_path;
   std::string resume_override;
+  std::string metrics_csv;
   bool        dry_run = false;
 };
 
 CliArgs parse_cli(int argc, char** argv) {
   if (argc < 2) {
-    std::fprintf(stderr, "usage: %s <config.ini> [--resume <ckpt.bin>] [--dry-run]\n", argv[0]);
+    std::fprintf(stderr,
+        "usage: %s <config.ini> [--resume <ckpt.bin>] "
+        "[--metrics-csv <path>] [--dry-run]\n", argv[0]);
     std::exit(2);
   }
   CliArgs a;
@@ -65,6 +68,8 @@ CliArgs parse_cli(int argc, char** argv) {
     std::string arg = argv[i];
     if (arg == "--resume" && i + 1 < argc) {
       a.resume_override = argv[++i];
+    } else if (arg == "--metrics-csv" && i + 1 < argc) {
+      a.metrics_csv = argv[++i];
     } else if (arg == "--dry-run") {
       a.dry_run = true;
     } else {
@@ -196,6 +201,25 @@ int main(int argc, char** argv) {
     return 0;
   }
 
+  // Optional machine-readable metrics CSV. Consumed by
+  // zwt/scripts/loss_curve_check.py to verify we track a published
+  // baseline. Columns are stable: step,loss,lr,grad_norm,tokens_seen,
+  // wall_secs,tok_per_s. Append-mode when resuming so the curve is
+  // continuous across restarts.
+  std::FILE* metrics_fp = nullptr;
+  if (!cli.metrics_csv.empty()) {
+    const bool fresh = cli.resume_override.empty();
+    metrics_fp = std::fopen(cli.metrics_csv.c_str(), fresh ? "w" : "a");
+    if (!metrics_fp) {
+      std::fprintf(stderr, "warning: could not open %s for metrics\n",
+                   cli.metrics_csv.c_str());
+    } else if (fresh) {
+      std::fprintf(metrics_fp,
+          "step,loss,lr,grad_norm,tokens_seen,wall_secs,tok_per_s\n");
+      std::fflush(metrics_fp);
+    }
+  }
+
   // Hot loop.
   const int64_t batch = cfg.batch_size;
   const int64_t seq   = cfg.seq_len;
@@ -264,6 +288,13 @@ int main(int argc, char** argv) {
       std::fprintf(stderr,
           "step %6lld  loss %.4f  lr %.2e  |g| %.3f  %.0f tok/s\n",
           (long long)step, last_loss, lr, gnorm, tps);
+      if (metrics_fp) {
+        std::fprintf(metrics_fp,
+            "%lld,%.6f,%.6e,%.6f,%lld,%.3f,%.3f\n",
+            (long long)step, last_loss, lr, gnorm,
+            (long long)tokens_seen, secs, tps);
+        std::fflush(metrics_fp);
+      }
     }
 
     if (cfg.ckpt_interval > 0 && step % cfg.ckpt_interval == 0) {
@@ -294,6 +325,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "writing final ckpt %s\n", cfg.ckpt_path.c_str());
     train::save_checkpoint(cfg.ckpt_path, params, opt, meta);
   }
+  if (metrics_fp) std::fclose(metrics_fp);
   std::fprintf(stderr, "done.\n");
   return 0;
 }

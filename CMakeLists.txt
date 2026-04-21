@@ -257,6 +257,7 @@ target_compile_options(olmo_cpp PRIVATE -O3 -march=native)
 set(ZWT_CPP_SOURCES
     zwt/src/core/allocator.cpp
     zwt/src/core/determinism.cpp
+    zwt/src/core/graph.cpp
     zwt/src/core/tensor.cpp
     zwt/src/core/stream.cpp
     zwt/src/ops/gemm.cpp
@@ -328,6 +329,10 @@ target_compile_options(zwt_numerical_audit PRIVATE -O3 -march=native)
 add_executable(zwt_kernel_tests zwt/tests/kernel_tests.cpp)
 target_link_libraries(zwt_kernel_tests PRIVATE zwt)
 target_compile_options(zwt_kernel_tests PRIVATE -O2)
+
+add_executable(zwt_graph_bench zwt/tools/graph_bench.cpp)
+target_link_libraries(zwt_graph_bench PRIVATE zwt)
+target_compile_options(zwt_graph_bench PRIVATE -O3 -march=native)
 
 # CUDA kernels (auto-enabled when CUDA compiler is found)
 option(OLMO_BUILD_KERNELS "Build custom CUDA kernels" ON)

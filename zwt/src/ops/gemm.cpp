@@ -1,4 +1,5 @@
 #include "zwt/ops/gemm.hpp"
+#include "zwt/core/determinism.hpp"
 #include "zwt/core/stream.hpp"
 
 #include <cstdint>
@@ -109,6 +110,12 @@ void gemm(const Tensor& a, bool transa,
     cublasComputeType_t compute = compute_type_for(DType::F32);
 
     // Swap A,B to convert row-major to column-major.
+    // In determinism mode, pick a fixed, workspace-backed algorithm rather
+    // than cuBLAS's heuristic default. CUBLAS_GEMM_DEFAULT still picks from
+    // the deterministic-algo set when CUBLAS_WORKSPACE_CONFIG=:4096:8 is set.
+    cublasGemmAlgo_t algo = is_deterministic()
+        ? CUBLAS_GEMM_DEFAULT
+        : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
     cublasGemmEx(
         h,
         opB, opA,
@@ -119,7 +126,7 @@ void gemm(const Tensor& a, bool transa,
         &beta,
         c.data(), dtC, ldc,
         compute,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        algo);
     return;
 #else
     throw std::runtime_error("zwt::gemm: cuda path requested on CPU-only build");
@@ -172,6 +179,9 @@ void gemm_batched(const Tensor& a, bool transa,
   long long strideB = (long long)Br * Bc;
   long long strideC = (long long)M * N;
 
+  cublasGemmAlgo_t algo = is_deterministic()
+      ? CUBLAS_GEMM_DEFAULT
+      : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
   cublasGemmStridedBatchedEx(
       h, opB, opA,
       N, M, K,
@@ -182,7 +192,7 @@ void gemm_batched(const Tensor& a, bool transa,
       c.data(), dtC, ldc, strideC,
       static_cast<int>(B_),
       CUBLAS_COMPUTE_32F,
-      CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+      algo);
 #else
   (void)transa; (void)transb; (void)c; (void)alpha; (void)beta;
 #endif

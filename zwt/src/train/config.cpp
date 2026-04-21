@@ -152,6 +152,7 @@ TrainConfig load_train_config(const std::string& path) {
         if (k == "resume_from")   { c.resume_from   = v;            return true; }
         if (k == "init_seed")     { c.init_seed     = parse_u64(v); return true; }
         if (k == "arena_mb")      { c.arena_mb      = parse_i64(v); return true; }
+        if (k == "deterministic") { c.deterministic = parse_bool(v); return true; }
         return false;
       });
     } else if (sect == "global") {
@@ -222,7 +223,8 @@ std::string dump_train_config(const TrainConfig& c) {
      << "ckpt_path     = " << c.ckpt_path           << "\n"
      << "resume_from   = " << c.resume_from         << "\n"
      << "init_seed     = " << c.init_seed           << "\n"
-     << "arena_mb      = " << c.arena_mb            << "\n";
+     << "arena_mb      = " << c.arena_mb            << "\n"
+     << "deterministic = " << (c.deterministic ? 1 : 0) << "\n";
   return os.str();
 }
 

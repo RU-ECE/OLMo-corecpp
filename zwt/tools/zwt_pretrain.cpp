@@ -17,6 +17,7 @@
 // orchestration.
 
 #include "zwt/core/allocator.hpp"
+#include "zwt/core/determinism.hpp"
 #include "zwt/core/stream.hpp"
 #include "zwt/core/tensor.hpp"
 #include "zwt/data/token_loader.hpp"
@@ -108,6 +109,15 @@ int main(int argc, char** argv) {
   train::TrainConfig cfg = train::load_train_config(cli.config_path);
   if (!cli.resume_override.empty()) {
     cfg.resume_from = cli.resume_override;
+  }
+
+  // Must run before the first cuBLAS handle is created — the workspace
+  // config is consulted only at handle creation.
+  if (cfg.deterministic) {
+    set_deterministic(true);
+    init_determinism_env();
+    std::fprintf(stderr, "determinism: ON (cuBLAS workspace :4096:8, "
+                         "atomic-free reductions)\n");
   }
 
 #ifdef USE_CUDA

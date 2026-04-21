@@ -37,6 +37,7 @@ struct TrainConfig {
   std::string resume_from;           // if non-empty, load before training
   uint64_t    init_seed      = 0xC0DEBA5EULL;
   int64_t     arena_mb       = 2048; // activation arena per step
+  bool        deterministic  = false; // reproducible kernels + cuBLAS; slower
 
   // [device]
   // device is selected automatically — CUDA if compiled with USE_CUDA,

@@ -256,6 +256,7 @@ target_compile_options(olmo_cpp PRIVATE -O3 -march=native)
 # ========================================================================
 set(ZWT_CPP_SOURCES
     zwt/src/core/allocator.cpp
+    zwt/src/core/determinism.cpp
     zwt/src/core/tensor.cpp
     zwt/src/core/stream.cpp
     zwt/src/ops/gemm.cpp

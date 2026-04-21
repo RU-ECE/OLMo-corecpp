@@ -1,8 +1,10 @@
 #include "zwt/ops/gemm.hpp"
+#include "zwt/ops/gemm_wgmma.hpp"
 #include "zwt/core/determinism.hpp"
 #include "zwt/core/stream.hpp"
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -89,6 +91,21 @@ void gemm(const Tensor& a, bool transa,
 
   if (a.device().is_cuda()) {
 #ifdef USE_CUDA
+    // Hopper WGMMA path: BF16 tensor-core kernel via CUTLASS 3.x. Opt-in
+    // at build time (ZWT_USE_WGMMA); runtime-checked for sm_90. Shape
+    // constraint is M,N,K % 8 == 0, which every transformer projection
+    // satisfies. Env var ZWT_DISABLE_WGMMA=1 forces the cuBLAS fallback
+    // — re-read per call so bench tools can flip it mid-process.
+    if (std::getenv("ZWT_DISABLE_WGMMA") == nullptr &&
+        wgmma_available() &&
+        a.dtype() == DType::BF16 && b.dtype() == DType::BF16 &&
+        c.dtype() == DType::BF16 &&
+        (M & 7) == 0 && (N & 7) == 0 && (K & 7) == 0 &&
+        !(transa && transb)) {
+      gemm_wgmma(a, transa, b, transb, c, alpha, beta);
+      return;
+    }
+
     cublasHandle_t h = cublas_handle();
     cublasSetStream(h, reinterpret_cast<cudaStream_t>(
                         compute_stream(a.device()).handle));

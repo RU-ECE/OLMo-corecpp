@@ -269,6 +269,7 @@ set(ZWT_CPP_SOURCES
     zwt/src/ops/xent.cpp
     zwt/src/ops/attn.cpp
     zwt/src/ops/flash_attn.cpp
+    zwt/src/ops/gemm_wgmma_stub.cpp
     zwt/src/ops/rope.cpp
     zwt/src/layers/module.cpp
     zwt/src/layers/parameter.cpp
@@ -313,6 +314,66 @@ if(CMAKE_CUDA_COMPILER)
     target_compile_definitions(zwt PUBLIC USE_CUDA=1)
 endif()
 
+# --------------------------------------------------------------------------
+# Hopper WGMMA GEMM via CUTLASS 3.x — opt-in for sm_90 hosts.
+#
+# We build this as a *separate* static lib (zwt_wgmma) so we can target
+# sm_90a in isolation — WGMMA instructions are only emitted under the
+# `a` arch suffix, and the main `zwt` lib stays portable across
+# sm_80..sm_90. CUTLASS is fetched on demand; without the flag it is
+# never downloaded and the stub TU in zwt/src/ops/gemm_wgmma_stub.cpp
+# provides the symbols.
+# --------------------------------------------------------------------------
+option(ZWT_USE_WGMMA "Build Hopper WGMMA GEMM via CUTLASS 3.x" OFF)
+if(ZWT_USE_WGMMA)
+    if(NOT CMAKE_CUDA_COMPILER)
+        message(FATAL_ERROR "ZWT_USE_WGMMA requires CUDA.")
+    endif()
+
+    include(FetchContent)
+    FetchContent_Declare(cutlass
+        GIT_REPOSITORY https://github.com/NVIDIA/cutlass.git
+        GIT_TAG        v3.5.1
+        GIT_SHALLOW    TRUE
+    )
+    # We only need the headers — do not invoke CUTLASS's CMake (it builds
+    # many profilers / tests we don't want).
+    FetchContent_GetProperties(cutlass)
+    if(NOT cutlass_POPULATED)
+        FetchContent_Populate(cutlass)
+    endif()
+
+    add_library(zwt_wgmma STATIC zwt/src/ops/gemm_wgmma.cu)
+    # Plain "90" compiles for sm_90 (no WGMMA). We need sm_90a. Disable
+    # the CMake-managed arch list for this target and emit the gencode
+    # flag by hand.
+    set_target_properties(zwt_wgmma PROPERTIES
+        CUDA_ARCHITECTURES OFF
+        CUDA_SEPARABLE_COMPILATION ON
+        POSITION_INDEPENDENT_CODE ON)
+    target_compile_options(zwt_wgmma PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_90a,code=sm_90a>
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+        $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
+    target_include_directories(zwt_wgmma PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/zwt/include
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${cutlass_SOURCE_DIR}/include
+        ${cutlass_SOURCE_DIR}/tools/util/include)
+    target_compile_definitions(zwt_wgmma PRIVATE
+        ZWT_USE_WGMMA=1 USE_CUDA=1)
+    find_package(CUDAToolkit REQUIRED)
+    target_link_libraries(zwt_wgmma PRIVATE CUDA::cudart)
+
+    # Tell the main library it can call into gemm_wgmma() unconditionally.
+    # (The stub TU self-disables when the macro is set so we don't get
+    # duplicate symbols.)
+    target_compile_definitions(zwt PRIVATE ZWT_USE_WGMMA=1)
+    target_link_libraries(zwt PUBLIC zwt_wgmma)
+    message(STATUS "ZWT_USE_WGMMA: Hopper WGMMA path enabled (sm_90a, "
+                   "CUTLASS @ ${cutlass_SOURCE_DIR})")
+endif()
+
 # ZWT end-to-end training demo binary — exercises every path of the framework.
 add_executable(zwt_train zwt/tools/zwt_train.cpp)
 target_link_libraries(zwt_train PRIVATE zwt)
@@ -345,6 +406,18 @@ target_compile_options(zwt_tp_tests PRIVATE -O2)
 add_executable(zwt_flash_attn_tests zwt/tests/flash_attn_tests.cpp)
 target_link_libraries(zwt_flash_attn_tests PRIVATE zwt)
 target_compile_options(zwt_flash_attn_tests PRIVATE -O2)
+
+# Hopper WGMMA bench + numerical test — only buildable on CUDA hosts, and
+# really meaningful only with -DZWT_USE_WGMMA=ON on sm_90.
+if(CMAKE_CUDA_COMPILER)
+    add_executable(zwt_wgmma_bench zwt/tools/wgmma_bench.cpp)
+    target_link_libraries(zwt_wgmma_bench PRIVATE zwt)
+    target_compile_options(zwt_wgmma_bench PRIVATE -O3 -march=native)
+
+    add_executable(zwt_wgmma_tests zwt/tests/wgmma_tests.cpp)
+    target_link_libraries(zwt_wgmma_tests PRIVATE zwt)
+    target_compile_options(zwt_wgmma_tests PRIVATE -O2)
+endif()
 
 add_executable(zwt_graph_bench zwt/tools/graph_bench.cpp)
 target_link_libraries(zwt_graph_bench PRIVATE zwt)

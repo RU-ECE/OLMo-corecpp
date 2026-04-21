@@ -84,20 +84,54 @@ ArenaAllocator::~ArenaAllocator() {
 }
 
 void* ArenaAllocator::alloc(size_t bytes, size_t alignment) {
+  if (bytes == 0) return nullptr;
+  // Best-fit scan over the free-list. Entries store the raw (offset, size)
+  // pair as returned by a prior free(); the caller-requested alignment may
+  // raise offset within the slot, so the usable bytes shrink correspondingly.
+  int best = -1;
+  size_t best_waste = static_cast<size_t>(-1);
+  for (size_t i = 0; i < free_list_.size(); ++i) {
+    const FreeEntry& e = free_list_[i];
+    size_t aligned = align_up(e.offset, alignment);
+    size_t head = aligned - e.offset;
+    if (head >= e.size) continue;
+    size_t usable = e.size - head;
+    if (usable < bytes) continue;
+    size_t waste = usable - bytes;
+    if (waste < best_waste) { best = static_cast<int>(i); best_waste = waste; }
+    if (waste == 0) break;
+  }
+  if (best >= 0) {
+    FreeEntry e = free_list_[best];
+    free_list_.erase(free_list_.begin() + best);
+    free_bytes_ -= e.size;
+    size_t aligned = align_up(e.offset, alignment);
+    return static_cast<char*>(base_) + aligned;
+  }
+  // Bump path.
   size_t start = align_up(offset_, alignment);
   size_t end = start + bytes;
   if (end > capacity_) {
     std::fprintf(stderr,
-        "zwt: arena OOM on %s (wanted %zu, have %zu/%zu). "
+        "zwt: arena OOM on %s (wanted %zu, have %zu/%zu, free-listed %zu). "
         "Raise capacity via set_activation_arena_capacity().\n",
-        device_.is_cuda() ? "cuda" : "cpu", bytes, capacity_ - offset_, capacity_);
+        device_.is_cuda() ? "cuda" : "cpu", bytes, capacity_ - offset_,
+        capacity_, free_bytes_);
     throw std::bad_alloc{};
   }
   offset_ = end;
+  if (offset_ > peak_) peak_ = offset_;
   return static_cast<char*>(base_) + start;
 }
 
-void ArenaAllocator::free(void*, size_t) { /* reset() drops everything */ }
+void ArenaAllocator::free(void* p, size_t bytes) {
+  if (!p || bytes == 0) return;
+  size_t off = static_cast<char*>(p) - static_cast<char*>(base_);
+  // LIFO fast path: freeing the topmost allocation retracts the bump pointer.
+  if (off + bytes == offset_) { offset_ = off; return; }
+  free_list_.push_back({off, bytes});
+  free_bytes_ += bytes;
+}
 
 // ---------------------------------------------------------------------------
 // PoolAllocator

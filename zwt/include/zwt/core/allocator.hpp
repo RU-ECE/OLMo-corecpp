@@ -23,28 +23,46 @@ class Allocator {
   virtual Device device() const = 0;
 };
 
-// Bump-pointer arena. Perfect for activations: allocate during forward,
-// reset() at end of step. Zero per-alloc bookkeeping, zero fragmentation.
+// Bump-pointer arena with an optional in-step free-list. Forward-pass
+// activations get allocated by bump; when an activation is dropped mid-step
+// (e.g. a saved tensor consumed by its op's backward), its slot returns to
+// the free-list and can be reused by later allocations within the same step.
+// reset() still clears everything at step end.
+//
+// Two paths for free():
+//   * LIFO rewind fast path — if the freed slot is exactly the top of the
+//     bump pointer, retract offset_ in place. No list entry needed.
+//   * Best-fit scan — for out-of-order frees, (offset, size) is pushed onto
+//     free_list_; alloc() picks the smallest fitting entry. Entries are
+//     consumed whole (no split) so accounting stays trivial; the cost is a
+//     little overallocation vs. a splitting allocator.
 class ArenaAllocator final : public Allocator {
  public:
   ArenaAllocator(Device dev, size_t capacity_bytes);
   ~ArenaAllocator() override;
 
   void* alloc(size_t bytes, size_t alignment = 256) override;
-  void  free(void* ptr, size_t bytes) override;  // no-op; reset drops everything
+  void  free(void* ptr, size_t bytes) override;
   Device device() const override { return device_; }
 
-  void   reset()      { offset_ = 0; }
+  void   reset()      { offset_ = 0; free_list_.clear(); free_bytes_ = 0; }
   size_t mark() const { return offset_; }
   void   rewind(size_t m) { offset_ = m; }
   size_t used() const { return offset_; }
   size_t capacity() const { return capacity_; }
+  size_t free_listed_bytes() const { return free_bytes_; }
+  size_t peak() const { return peak_; }
 
  private:
+  struct FreeEntry { size_t offset; size_t size; };
+
   Device device_;
   void*  base_     = nullptr;
   size_t capacity_ = 0;
   size_t offset_   = 0;
+  size_t peak_     = 0;
+  std::vector<FreeEntry> free_list_;
+  size_t free_bytes_ = 0;
 };
 
 // Size-bucketed pool. Parameters, gradients, optimizer state live here —

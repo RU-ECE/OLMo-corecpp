@@ -14,6 +14,14 @@ data/*.tok
 checkpoints/
 *.pt
 *.ckpt
+*.bin
+*.safetensors
+
+# Local model artifacts (raw .bin pulled off the volume,
+# converted HF dir, anything else big living next to the repo)
+downloads/
+exports/
+ckpts/
 
 # IDE
 .vscode/

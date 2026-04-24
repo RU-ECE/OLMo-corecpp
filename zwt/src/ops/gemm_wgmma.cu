@@ -81,12 +81,30 @@ struct Builder {
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 };
 
-// NN: A row-major, B row-major (grad_X = grad_Y @ W)
-using GemmNN = Builder<cutlass::layout::RowMajor,    cutlass::layout::RowMajor   >::Gemm;
-// NT: A row-major, B col-major == (N,K) row-major treated as B^T (Y = X @ W^T)
-using GemmNT = Builder<cutlass::layout::RowMajor,    cutlass::layout::ColumnMajor>::Gemm;
-// TN: A col-major == (K,M) row-major treated as A^T (grad_W = grad_Y^T @ X)
-using GemmTN = Builder<cutlass::layout::ColumnMajor, cutlass::layout::RowMajor   >::Gemm;
+// CUTLASS 3.x GEMM convention: C[m,n] = sum_k A[m,k] * B[n,k]
+// i.e. the kernel iterates B as N×K (B^T in textbook notation), with the
+// stride built from shape (N, K, 1). The LayoutB selection therefore
+// describes the *N×K* indexing, not the user's logical (K,N) view:
+//
+//   LayoutB = RowMajor   → kernel reads base + n*K + k → matches a
+//                          buffer stored as (N, K) row-major
+//   LayoutB = ColumnMajor → kernel reads base + n + k*N → matches a
+//                          buffer stored as (K, N) row-major
+//
+// Our `transb=false` (NN) means the user passed B as (K, N) row-major
+// → ColumnMajor. Our `transb=true` (NT) means the user passed B as
+// (N, K) row-major → RowMajor.
+//
+// LayoutA follows the textbook convention: RowMajor for transa=false
+// (user buffer is M×K), ColumnMajor for transa=true (user buffer is
+// (K, M) row-major == M×K col-major).
+
+// NN: C = A @ B.  A=(M,K) row-major, B=(K,N) row-major.
+using GemmNN = Builder<cutlass::layout::RowMajor,    cutlass::layout::ColumnMajor>::Gemm;
+// NT: C = A @ B^T. A=(M,K) row-major, B=(N,K) row-major.
+using GemmNT = Builder<cutlass::layout::RowMajor,    cutlass::layout::RowMajor   >::Gemm;
+// TN: C = A^T @ B. A=(K,M) row-major (col-major M×K), B=(K,N) row-major.
+using GemmTN = Builder<cutlass::layout::ColumnMajor, cutlass::layout::ColumnMajor>::Gemm;
 
 bool check_sm90_once() {
   int dev = 0;

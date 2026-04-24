@@ -50,7 +50,7 @@ opt_seq=()
 echo "stack,dtype,ms_per_step,tok_per_sec,notes"
 
 # ---- PyTorch eager ----
-PT_EAGER=$(python3 "$BIN_PT" --config "$CONFIG" --warmup "$WARMUP" --iters "$ITERS" \
+PT_EAGER=$(python3 "$BIN_PT" --config "$CONFIG" --warmup "$WARMUP" --steps "$ITERS" \
                    --dtype bf16 "${opt_batch[@]}" "${opt_seq[@]}" | tail -1)
 # PT line format: "  B=.. S=.. steps=.. dt=..s tok/s=... ms/step=.."
 ms=$(echo "$PT_EAGER" | sed -n 's/.*ms\/step=\([0-9.]*\).*/\1/p')
@@ -58,7 +58,7 @@ tps=$(echo "$PT_EAGER" | sed -n 's/.*tok\/s=\([0-9,]*\).*/\1/p' | tr -d ,)
 echo "pytorch_eager,bf16,$ms,$tps,"
 
 # ---- torch.compile ----
-PT_COMP=$(python3 "$BIN_PT" --config "$CONFIG" --warmup "$WARMUP" --iters "$ITERS" \
+PT_COMP=$(python3 "$BIN_PT" --config "$CONFIG" --warmup "$WARMUP" --steps "$ITERS" \
                   --dtype bf16 --compile "${opt_batch[@]}" "${opt_seq[@]}" | tail -1)
 ms=$(echo "$PT_COMP"  | sed -n 's/.*ms\/step=\([0-9.]*\).*/\1/p')
 tps=$(echo "$PT_COMP" | sed -n 's/.*tok\/s=\([0-9,]*\).*/\1/p' | tr -d ,)

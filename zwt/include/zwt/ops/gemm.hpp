@@ -28,4 +28,10 @@ void gemm_batched(const Tensor& a, bool transa,
 // One-time global init. Safe to call from multiple threads; first caller wins.
 void gemm_init();
 
+// Re-read ZWT_DISABLE_WGMMA from the environment. The dispatch caches this
+// flag at first use to avoid a per-call getenv (which takes a global mutex
+// in glibc). The bench tool A/Bs cuBLAS vs WGMMA in-process by toggling the
+// env var and calling this between phases. Production code never needs it.
+void reset_wgmma_disable_cache();
+
 }  // namespace zwt::ops

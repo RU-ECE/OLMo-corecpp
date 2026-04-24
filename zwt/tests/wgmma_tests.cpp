@@ -87,8 +87,10 @@ void case_layout(const char* label, bool transa, bool transb,
     fill_random_bf16(B, seed ^ 0xBEEF);
 
     setenv("ZWT_DISABLE_WGMMA", "1", 1);
+    ops::reset_wgmma_disable_cache();
     ops::gemm(A, transa, B, transb, C_cublas, 1.f, 0.f);
     unsetenv("ZWT_DISABLE_WGMMA");
+    ops::reset_wgmma_disable_cache();
     ops::gemm_wgmma(A, transa, B, transb, C_wgmma, 1.f, 0.f);
     cudaDeviceSynchronize();
 
@@ -151,6 +153,7 @@ int main() {
         fill_random_bf16(X, 0x1234);
         fill_random_bf16(W, 0x5678);
         unsetenv("ZWT_DISABLE_WGMMA");
+        ops::reset_wgmma_disable_cache();
         ops::gemm(X, false, W, true, C_dispatch, 1.f, 0.f);
         ops::gemm_wgmma(X, false, W, true, C_direct, 1.f, 0.f);
         cudaDeviceSynchronize();

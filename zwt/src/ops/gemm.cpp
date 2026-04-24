@@ -3,6 +3,7 @@
 #include "zwt/core/determinism.hpp"
 #include "zwt/core/stream.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -10,6 +11,7 @@
 #include <stdexcept>
 
 #ifdef USE_CUDA
+#include "zwt/core/cuda_check.hpp"
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -25,7 +27,7 @@ cublasHandle_t& cublas_handle() {
   static cublasHandle_t h = nullptr;
   static std::once_flag flag;
   std::call_once(flag, []() {
-    cublasCreate(&h);
+    ZWT_CUBLAS(cublasCreate(&h));
     // No math-mode override: BF16 gemms already run on tensor cores regardless,
     // and forcing TF32 would only affect F32 gemms we don't issue.
   });
@@ -42,8 +44,33 @@ cudaDataType cuda_dt(DType t) {
   }
 }
 
-cublasComputeType_t compute_type_for(DType acc) {
-  return (acc == DType::F32) ? CUBLAS_COMPUTE_32F : CUBLAS_COMPUTE_32F;
+// ZWT_DISABLE_WGMMA is consulted on every gemm call. getenv() takes a process-
+// scope lock and walks the env block — measurable on small projection gemms
+// at high TPS. Cache it. The bench tool flips the var between phases and
+// calls reset_wgmma_disable_cache() to invalidate. We use a relaxed atomic
+// because the value only ever moves uninit → cached and a torn read can't
+// produce an invalid bool.
+std::atomic<int> g_wgmma_disabled_cache{-1};  // -1 unknown, 0 enabled, 1 disabled
+
+bool wgmma_disabled_cached() {
+  int v = g_wgmma_disabled_cache.load(std::memory_order_relaxed);
+  if (v < 0) {
+    v = (std::getenv("ZWT_DISABLE_WGMMA") != nullptr) ? 1 : 0;
+    g_wgmma_disabled_cache.store(v, std::memory_order_relaxed);
+  }
+  return v != 0;
+}
+
+// cublasSetStream is a no-op when the stream hasn't changed, but the call
+// itself takes a handle-mutex. We issue thousands of gemms per step on the
+// same compute stream — skip the call when the stream matches the last one
+// we set on this thread.
+inline void set_stream_if_changed(cublasHandle_t h, cudaStream_t s) {
+  thread_local cudaStream_t last = nullptr;
+  if (s != last) {
+    ZWT_CUBLAS(cublasSetStream(h, s));
+    last = s;
+  }
 }
 #endif
 
@@ -71,6 +98,12 @@ void gemm_init() {
 #endif
 }
 
+void reset_wgmma_disable_cache() {
+#ifdef USE_CUDA
+  g_wgmma_disabled_cache.store(-1, std::memory_order_relaxed);
+#endif
+}
+
 void gemm(const Tensor& a, bool transa,
           const Tensor& b, bool transb,
           Tensor& c,
@@ -94,9 +127,9 @@ void gemm(const Tensor& a, bool transa,
     // Hopper WGMMA path: BF16 tensor-core kernel via CUTLASS 3.x. Opt-in
     // at build time (ZWT_USE_WGMMA); runtime-checked for sm_90. Shape
     // constraint is M,N,K % 8 == 0, which every transformer projection
-    // satisfies. Env var ZWT_DISABLE_WGMMA=1 forces the cuBLAS fallback
-    // — re-read per call so bench tools can flip it mid-process.
-    if (std::getenv("ZWT_DISABLE_WGMMA") == nullptr &&
+    // satisfies. Env var ZWT_DISABLE_WGMMA=1 forces the cuBLAS fallback —
+    // cached at first call (see wgmma_disabled_cached).
+    if (!wgmma_disabled_cached() &&
         wgmma_available() &&
         a.dtype() == DType::BF16 && b.dtype() == DType::BF16 &&
         c.dtype() == DType::BF16 &&
@@ -107,8 +140,8 @@ void gemm(const Tensor& a, bool transa,
     }
 
     cublasHandle_t h = cublas_handle();
-    cublasSetStream(h, reinterpret_cast<cudaStream_t>(
-                        compute_stream(a.device()).handle));
+    set_stream_if_changed(h, reinterpret_cast<cudaStream_t>(
+                                 compute_stream(a.device()).handle));
 
     // cuBLAS is column-major; we have row-major matrices. Use the identity
     //   C_row = A_row @ B_row  ==  C_col^T = (A_row @ B_row)^T = B_col @ A_col
@@ -124,7 +157,6 @@ void gemm(const Tensor& a, bool transa,
     cudaDataType dtA = cuda_dt(a.dtype());
     cudaDataType dtB = cuda_dt(b.dtype());
     cudaDataType dtC = cuda_dt(c.dtype());
-    cublasComputeType_t compute = compute_type_for(DType::F32);
 
     // Swap A,B to convert row-major to column-major.
     // In determinism mode, pick a fixed, workspace-backed algorithm rather
@@ -133,7 +165,7 @@ void gemm(const Tensor& a, bool transa,
     cublasGemmAlgo_t algo = is_deterministic()
         ? CUBLAS_GEMM_DEFAULT
         : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
-    cublasGemmEx(
+    ZWT_CUBLAS(cublasGemmEx(
         h,
         opB, opA,
         N, M, K,
@@ -142,8 +174,8 @@ void gemm(const Tensor& a, bool transa,
         a.data(), dtA, lda,
         &beta,
         c.data(), dtC, ldc,
-        compute,
-        algo);
+        CUBLAS_COMPUTE_32F,
+        algo));
     return;
 #else
     throw std::runtime_error("zwt::gemm: cuda path requested on CPU-only build");
@@ -181,8 +213,8 @@ void gemm_batched(const Tensor& a, bool transa,
   if (K != Kb) throw std::runtime_error("zwt::gemm_batched: inner dim mismatch");
 
   cublasHandle_t h = cublas_handle();
-  cublasSetStream(h, reinterpret_cast<cudaStream_t>(
-                      compute_stream(a.device()).handle));
+  set_stream_if_changed(h, reinterpret_cast<cudaStream_t>(
+                               compute_stream(a.device()).handle));
   int lda = transa ? M : K;
   int ldb = transb ? K : N;
   int ldc = N;
@@ -199,7 +231,7 @@ void gemm_batched(const Tensor& a, bool transa,
   cublasGemmAlgo_t algo = is_deterministic()
       ? CUBLAS_GEMM_DEFAULT
       : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
-  cublasGemmStridedBatchedEx(
+  ZWT_CUBLAS(cublasGemmStridedBatchedEx(
       h, opB, opA,
       N, M, K,
       &alpha,
@@ -209,7 +241,7 @@ void gemm_batched(const Tensor& a, bool transa,
       c.data(), dtC, ldc, strideC,
       static_cast<int>(B_),
       CUBLAS_COMPUTE_32F,
-      algo);
+      algo));
 #else
   (void)transa; (void)transb; (void)c; (void)alpha; (void)beta;
 #endif

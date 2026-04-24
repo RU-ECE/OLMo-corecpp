@@ -1,8 +1,9 @@
 // zwt_wgmma_bench — cuBLAS vs CUTLASS-WGMMA at typical Linear shapes.
 //
-// Both paths go through ops::gemm. The dispatch reads ZWT_DISABLE_WGMMA
-// on every call, so we A/B in-process by toggling the env var between
-// measurement phases. No dependence on cuBLAS internals.
+// Both paths go through ops::gemm. The dispatch caches ZWT_DISABLE_WGMMA on
+// first use; we A/B in-process by toggling the env var between measurement
+// phases AND calling ops::reset_wgmma_disable_cache(). No dependence on
+// cuBLAS internals.
 //
 // Output CSV to stdout:
 //   shape,m,n,k,cublas_ms,wgmma_ms,cublas_tflops,wgmma_tflops,speedup
@@ -124,11 +125,13 @@ int main(int argc, char** argv) {
         Tensor Y = empty({s.m, s.n}, DType::BF16, dev);
 
         setenv("ZWT_DISABLE_WGMMA", "1", 1);
+        ops::reset_wgmma_disable_cache();
         double cublas_ms = time_path(X, W, Y, args.iters, args.warmup);
 
         double wgmma_ms = 0.0;
         if (have_wgmma) {
             unsetenv("ZWT_DISABLE_WGMMA");
+            ops::reset_wgmma_disable_cache();
             wgmma_ms = time_path(X, W, Y, args.iters, args.warmup);
         }
 

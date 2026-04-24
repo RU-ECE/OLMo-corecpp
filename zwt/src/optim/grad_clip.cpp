@@ -3,8 +3,12 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <stdexcept>
+#include <utility>
 
 #ifdef USE_CUDA
+#include "zwt/core/cuda_check.hpp"
 #include <cuda_runtime.h>
 #endif
 
@@ -12,79 +16,156 @@ namespace zwt::optim {
 
 #ifdef USE_CUDA
 namespace k {
+void zero_scalar_fp32(float* p, cudaStream_t s);
 void sumsq_fp32_many(float** ptrs, const int64_t* sizes, int n_tensors,
                      float* out, cudaStream_t s);
 void scale_fp32_many(float** ptrs, const int64_t* sizes, int n_tensors,
                      float alpha, cudaStream_t s);
+void scale_fp32_many_dev(float** ptrs, const int64_t* sizes, int n_tensors,
+                         const float* alpha_dev, cudaStream_t s);
+void compute_clip_scale(const float* sumsq_dev, float max_norm,
+                        float* scale_dev, float* norm_out_dev,
+                        cudaStream_t s);
 }  // namespace k
 #endif
 
-float clip_grad_norm(const std::vector<Parameter*>& params, float max_norm) {
-  if (params.empty()) return 0.f;
-  bool on_cuda = params.front()->value.device().is_cuda();
+// ---------------------------------------------------------------------------
+// GradClipper
+// ---------------------------------------------------------------------------
 
-  if (on_cuda) {
+GradClipper::GradClipper(const std::vector<Parameter*>& params) {
+  if (params.empty()) return;
+  device_ = params.front()->value.device();
+  n_ = static_cast<int>(params.size());
+
+  if (!device_.is_cuda()) {
+    cpu_params_ = params;
+    return;
+  }
+
 #ifdef USE_CUDA
-    // Build pointer + size arrays on host, upload once, reduce once, scale once.
-    const int n = static_cast<int>(params.size());
-    std::vector<float*>  p_h(n);
-    std::vector<int64_t> s_h(n);
-    for (int i = 0; i < n; ++i) {
-      p_h[i] = params[i]->grad.as<float>();
-      s_h[i] = params[i]->value.numel();
+  std::vector<float*>  p_h(n_);
+  std::vector<int64_t> s_h(n_);
+  for (int i = 0; i < n_; ++i) {
+    p_h[i] = params[i]->grad.as<float>();
+    s_h[i] = params[i]->value.numel();
+  }
+
+  // One-time setup. The pool allocator never moves param storage, so these
+  // pointers are stable for the trainer's lifetime.
+  ZWT_CUDA(cudaMalloc(&d_ptrs_,  sizeof(float*)  * n_));
+  ZWT_CUDA(cudaMalloc(&d_sizes_, sizeof(int64_t) * n_));
+  ZWT_CUDA(cudaMalloc(&d_sumsq_, sizeof(float)));
+  ZWT_CUDA(cudaMalloc(&d_scale_, sizeof(float)));
+  ZWT_CUDA(cudaMalloc(&d_norm_,  sizeof(float)));
+  ZWT_CUDA(cudaMemcpy(d_ptrs_,  p_h.data(), sizeof(float*)  * n_,
+                      cudaMemcpyHostToDevice));
+  ZWT_CUDA(cudaMemcpy(d_sizes_, s_h.data(), sizeof(int64_t) * n_,
+                      cudaMemcpyHostToDevice));
+  // Initialize scale=1, norm=0 so that an early pull_last_norm before the
+  // first clip() returns sensible defaults.
+  float one = 1.f;
+  float zero = 0.f;
+  ZWT_CUDA(cudaMemcpy(d_scale_, &one,  sizeof(float), cudaMemcpyHostToDevice));
+  ZWT_CUDA(cudaMemcpy(d_norm_,  &zero, sizeof(float), cudaMemcpyHostToDevice));
+#endif
+}
+
+GradClipper::GradClipper(GradClipper&& o) noexcept {
+  *this = std::move(o);
+}
+
+GradClipper& GradClipper::operator=(GradClipper&& o) noexcept {
+  if (this != &o) {
+    release_();
+    n_       = o.n_;       o.n_       = 0;
+    device_  = o.device_;
+    d_ptrs_  = o.d_ptrs_;  o.d_ptrs_  = nullptr;
+    d_sizes_ = o.d_sizes_; o.d_sizes_ = nullptr;
+    d_sumsq_ = o.d_sumsq_; o.d_sumsq_ = nullptr;
+    d_scale_ = o.d_scale_; o.d_scale_ = nullptr;
+    d_norm_  = o.d_norm_;  o.d_norm_  = nullptr;
+    cpu_params_ = std::move(o.cpu_params_);
+    cpu_norm_   = o.cpu_norm_;
+  }
+  return *this;
+}
+
+GradClipper::~GradClipper() { release_(); }
+
+void GradClipper::release_() {
+#ifdef USE_CUDA
+  if (d_ptrs_)  cudaFree(d_ptrs_);
+  if (d_sizes_) cudaFree(d_sizes_);
+  if (d_sumsq_) cudaFree(d_sumsq_);
+  if (d_scale_) cudaFree(d_scale_);
+  if (d_norm_)  cudaFree(d_norm_);
+#endif
+  d_ptrs_ = nullptr; d_sizes_ = nullptr;
+  d_sumsq_ = nullptr; d_scale_ = nullptr; d_norm_ = nullptr;
+  n_ = 0;
+}
+
+void GradClipper::clip(float max_norm) {
+  if (n_ == 0) return;
+
+  if (device_.is_cuda()) {
+#ifdef USE_CUDA
+    cudaStream_t s = reinterpret_cast<cudaStream_t>(
+        compute_stream(device_).handle);
+    // Three-kernel sequence, capture-safe (no host syncs, no async malloc).
+    k::zero_scalar_fp32(d_sumsq_, s);
+    k::sumsq_fp32_many(d_ptrs_, d_sizes_, n_, d_sumsq_, s);
+    k::compute_clip_scale(d_sumsq_, max_norm, d_scale_, d_norm_, s);
+    if (max_norm > 0.f) {
+      k::scale_fp32_many_dev(d_ptrs_, d_sizes_, n_, d_scale_, s);
     }
-    Device dev = params.front()->value.device();
-    cudaStream_t stream =
-        reinterpret_cast<cudaStream_t>(compute_stream(dev).handle);
-
-    // Allocate device scratch: pointer array + size array + scalar result.
-    float**  d_ptrs = nullptr;
-    int64_t* d_sizes = nullptr;
-    float*   d_result = nullptr;
-    cudaMallocAsync(&d_ptrs,   sizeof(float*)  * n, stream);
-    cudaMallocAsync(&d_sizes,  sizeof(int64_t) * n, stream);
-    cudaMallocAsync(&d_result, sizeof(float), stream);
-    cudaMemcpyAsync(d_ptrs,  p_h.data(), sizeof(float*)  * n, cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_sizes, s_h.data(), sizeof(int64_t) * n, cudaMemcpyHostToDevice, stream);
-    cudaMemsetAsync(d_result, 0, sizeof(float), stream);
-
-    k::sumsq_fp32_many(d_ptrs, d_sizes, n, d_result, stream);
-
-    // Pull the norm to host (sync point — one per step, ~5us).
-    float sumsq = 0.f;
-    cudaMemcpyAsync(&sumsq, d_result, sizeof(float), cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
-    float norm = std::sqrt(sumsq);
-
-    if (max_norm > 0.f && norm > max_norm) {
-      float scale = max_norm / (norm + 1e-6f);
-      k::scale_fp32_many(d_ptrs, d_sizes, n, scale, stream);
-    }
-
-    cudaFreeAsync(d_ptrs,   stream);
-    cudaFreeAsync(d_sizes,  stream);
-    cudaFreeAsync(d_result, stream);
-    return norm;
+    return;
 #endif
   }
 
   // CPU reference.
   double sumsq = 0.0;
-  for (auto* p : params) {
+  for (auto* p : cpu_params_) {
     const float* g = p->grad.as<float>();
     const int64_t n = p->value.numel();
     for (int64_t i = 0; i < n; ++i) sumsq += double(g[i]) * double(g[i]);
   }
-  float norm = std::sqrt(float(sumsq));
+  float norm = std::sqrt(static_cast<float>(sumsq));
   if (max_norm > 0.f && norm > max_norm) {
     float scale = max_norm / (norm + 1e-6f);
-    for (auto* p : params) {
+    for (auto* p : cpu_params_) {
       float* g = p->grad.as<float>();
       const int64_t n = p->value.numel();
       for (int64_t i = 0; i < n; ++i) g[i] *= scale;
     }
   }
-  return norm;
+  cpu_norm_ = norm;
+}
+
+float GradClipper::pull_last_norm() const {
+  if (n_ == 0) return 0.f;
+  if (device_.is_cuda()) {
+#ifdef USE_CUDA
+    float h = 0.f;
+    ZWT_CUDA(cudaMemcpy(&h, d_norm_, sizeof(float), cudaMemcpyDeviceToHost));
+    return h;
+#else
+    return 0.f;
+#endif
+  }
+  return cpu_norm_;
+}
+
+// ---------------------------------------------------------------------------
+// Free-function wrapper
+// ---------------------------------------------------------------------------
+
+float clip_grad_norm(const std::vector<Parameter*>& params, float max_norm) {
+  if (params.empty()) return 0.f;
+  GradClipper c(params);
+  c.clip(max_norm);
+  return c.pull_last_norm();
 }
 
 }  // namespace zwt::optim

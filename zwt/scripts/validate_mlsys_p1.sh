@@ -163,7 +163,8 @@ pass "wgmma_bench (CSV: $WGMMA_CSV)"
 # ── 4. graph bench ──────────────────────────────────────────────────────
 stage "CUDA graph capture bench"
 GRAPH_CSV="$OUT_DIR/graph_bench.csv"
-./build/zwt_graph_bench >"$GRAPH_CSV" 2>>"$TESTS_LOG" || fail "zwt_graph_bench" "$GRAPH_CSV"
+./build/zwt_graph_bench --config="$SMOKE_CONF" >"$GRAPH_CSV" 2>>"$TESTS_LOG" \
+  || fail "zwt_graph_bench" "$GRAPH_CSV"
 awk 'NR>1 { print "    "$0 }' "$GRAPH_CSV" | head -5 | tee -a "$SUMMARY"
 pass "graph_bench (CSV: $GRAPH_CSV)"
 

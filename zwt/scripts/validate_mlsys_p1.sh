@@ -48,14 +48,16 @@ SMOKE_STEPS=50                            # must match [runtime] max_steps in SM
 DO_BUILD=1
 DO_PRETRAIN=1
 TOKENS=""
-for a in "$@"; do
-  case "$a" in
-    --skip-build)   DO_BUILD=0 ;;
-    --no-pretrain)  DO_PRETRAIN=0 ;;
-    --tokens)       TOKENS="$2"; shift ;;
-    --tokens=*)     TOKENS="${a#--tokens=}" ;;
-    -h|--help)      sed -n '2,30p' "$0"; exit 0 ;;
-    *)              echo "unknown arg: $a" >&2; exit 2 ;;
+# while-loop with shift, so `--tokens PATH` actually consumes PATH.
+# The earlier for-loop swallowed PATH as its own iteration → "unknown arg".
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --skip-build)   DO_BUILD=0 ; shift ;;
+    --no-pretrain)  DO_PRETRAIN=0 ; shift ;;
+    --tokens)       TOKENS="$2" ; shift 2 ;;
+    --tokens=*)     TOKENS="${1#--tokens=}" ; shift ;;
+    -h|--help)      sed -n '2,30p' "$0" ; exit 0 ;;
+    *)              echo "unknown arg: $1" >&2 ; exit 2 ;;
   esac
 done
 

@@ -43,7 +43,7 @@ set -euo pipefail
 # ── Config ──────────────────────────────────────────────────────────────
 VOLUME_DEFAULT="/media/volume/Prep_and_Voice_Training"
 SMOKE_CONF="zwt/conf/owt_1B_prof.conf"   # 50 steps, no ckpt, same shape as real run
-SMOKE_STEPS=50                            # must match [runtime] max_steps in SMOKE_CONF
+SMOKE_STEPS=35                            # must match [runtime] max_steps in SMOKE_CONF
 
 DO_BUILD=1
 DO_PRETRAIN=1

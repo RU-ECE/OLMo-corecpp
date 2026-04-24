@@ -65,19 +65,17 @@ tps=$(echo "$PT_COMP" | sed -n 's/.*tok\/s=\([0-9,]*\).*/\1/p' | tr -d ,)
 echo "pytorch_compile,bf16,$ms,$tps,"
 
 # ---- zwt ----
-# zwt_pretrain has no --iters flag — we run for WARMUP+ITERS steps and time
-# the whole thing with `time`, then back out ms/step. Its step log emits
-# "step   N  loss ...  <tps> tok/s", grep that instead for a direct read.
+# Run zwt_pretrain on the conf, parse every "step N ... <tps> tok/s" line.
+# Drop the first 2 logged samples (graph-capture warmup + early ramp), then
+# average the remainder. Sampling the last single step is too noisy on
+# graph-captured runs because the per-step tok/s reflects whatever's
+# happening at that exact instant, not steady state.
 TMP=$(mktemp)
 trap 'rm -f $TMP' EXIT
-# Build a tiny override config if iters/warmup differ from config's
-# max_steps? Keep it simple: run for WARMUP+ITERS steps and parse the
-# step-log tok/s from stderr.
-STEPS=$(( WARMUP + ITERS ))
-# Point max_steps via env — zwt_pretrain reads it from the INI, but we can
-# just run and stop by sending SIGTERM. For a clean measurement, the user
-# should duplicate the config with max_steps set. Document that here.
-echo "# NOTE: zwt_pretrain bench needs a config with max_steps=$STEPS and log_interval=$ITERS for one-shot timing" >&2
 "$BIN_ZWT" "$CONFIG" 2>"$TMP" >/dev/null || true
-ZWT_LAST=$(grep -E "^step " "$TMP" | tail -1 | awk '{ for (i=1;i<=NF;i++) if ($i ~ /tok\/s/) print $(i-1) }')
-echo "zwt,bf16,,$ZWT_LAST,see $TMP for step log"
+
+ZWT_TPS=$(grep -E "^step " "$TMP" \
+          | awk '{ for (i=1;i<=NF;i++) if ($i ~ /tok\/s/) { print $(i-1); break } }' \
+          | awk 'NR>2 { s+=$1; n++ } END { if (n) printf "%.0f", s/n; else print "" }')
+ZWT_NOTE=$(grep -cE "^step " "$TMP")  # how many step lines we got
+echo "zwt,bf16,,$ZWT_TPS,steady-state mean over $((ZWT_NOTE-2)) samples (see $TMP)"

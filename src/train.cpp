@@ -176,16 +176,7 @@ void train_epoch(
   for (int64_t step = 0; step < num_steps; ++step) {
     auto step_start = std::chrono::steady_clock::now();
     double step_lr = cosine_warmup_lr(step, warmup_steps, lr, num_steps);
-    // Set LR on the optimizer's param group
-    if (optimizer_name == "muon") {
-      static_cast<MuonOptions&>(optimizer.param_groups()[0].options()).lr(step_lr);
-    } else if (optimizer_name == "lion") {
-      static_cast<LionOptions&>(optimizer.param_groups()[0].options()).lr(step_lr);
-    } else if (optimizer_name == "dion") {
-      static_cast<DIONOptions&>(optimizer.param_groups()[0].options()).lr(step_lr);
-    } else {
-      static_cast<ForeachAdamWOptions&>(optimizer.param_groups()[0].options()).lr(step_lr);
-    }
+    optimizer.param_groups()[0].options().set_lr(step_lr);
 
     // Epoch boundary detection
     int64_t new_epoch = dataset ? (step / steps_per_epoch) : 0;

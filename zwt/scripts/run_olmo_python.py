@@ -108,6 +108,12 @@ def main() -> int:
         print("olmo_python: CUDA not available", file=sys.stderr)
         return 2
 
+    # Pre-empt cuDNN SDPA "No valid execution plans built" — same issue
+    # that bites pt_baseline.py on GQA + is_causal. Let torch fall through
+    # to Flash / mem-efficient.
+    if hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
+        torch.backends.cuda.enable_cudnn_sdp(False)
+
     rank, local_rank, world, ddp_active = init_dist()
     is_rank0 = (rank == 0)
     torch.cuda.set_device(local_rank)

@@ -255,6 +255,15 @@ def main() -> int:
               file=sys.stderr)
         return 2
 
+    # cuDNN's SDPA backend in recent PyTorch sometimes fails to build a
+    # valid execution plan for our GQA + is_causal shape ("No valid
+    # execution plans built"). Disable cuDNN SDPA and let torch fall
+    # through to Flash / mem-efficient / math. Flash-attn is what tuned-
+    # PyTorch users actually run anyway, so this also makes the bench
+    # more representative.
+    if hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
+        torch.backends.cuda.enable_cudnn_sdp(False)
+
     rank, local_rank, world_size, ddp_active = _ddp_init()
     device = f"cuda:{local_rank}"
     torch.cuda.set_device(local_rank)

@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-VOLUME="/media/volume/Prep_and_Voice_Training"
+# Token data resolved by zwt/scripts/find_tokens.sh; see launcher header.
 CONF="zwt/conf/owt_1B_2xh100.conf"
 LAUNCHER="zwt/scripts/launch_ddp.sh"
 TMUX_SESSION="zwt_1b_2x"
@@ -201,24 +201,12 @@ echo "=== GPUs ==="
 nvidia-smi --query-gpu=name,driver_version,memory.total,memory.used --format=csv
 echo
 
-# ── locate tokens (same logic as launch_1b_h100.sh) ──
-if [[ ! -d "$VOLUME" ]]; then
-  echo "volume $VOLUME not mounted" >&2
-  exit 1
-fi
-echo "=== Searching volume for tokenized data ==="
-CANDIDATES=$(find "$VOLUME" -maxdepth 6 -type f -name '*.npy' 2>/dev/null \
-  | awk 'tolower($0) ~ /(owt|openwebtext|tokens)/' || true)
-if [[ -z "$CANDIDATES" ]]; then
-  CANDIDATES=$(find "$VOLUME" -maxdepth 6 -type f -name '*.npy' -size +1G 2>/dev/null || true)
-fi
-if [[ -n "${ZWT_TOKENS:-}" ]]; then
-  TOKENS="$ZWT_TOKENS"
-else
-  TOKENS=$(echo "$CANDIDATES" | xargs -I{} stat -c '%s %n' {} | sort -n | tail -1 | cut -d' ' -f2-)
-fi
-if [[ ! -f "$TOKENS" ]]; then
-  echo "tokens file $TOKENS does not exist" >&2
+# ── locate tokens (delegated to find_tokens.sh) ──
+# Honors ZWT_TOKENS (direct path) > ZWT_VOLUME (search root) > defaults
+# (/media/volume/Prep_and_Voice_Training, $HOME/data, /data, ./downloads,
+# ./data). Works whether the data lives on a mounted volume or on a
+# roomy root disk.
+if ! TOKENS=$(bash "$(dirname "$0")/find_tokens.sh"); then
   exit 1
 fi
 echo "using tokens: $TOKENS"
@@ -235,12 +223,17 @@ else
 fi
 echo "symlink: $LINK -> $(readlink -f "$LINK")"
 
-CKPT_DIR_VOL="$VOLUME/zwt_ckpts"
-mkdir -p "$CKPT_DIR_VOL"
-if [[ -e ckpts && ! -L ckpts ]]; then
-  echo "ckpts/ already exists as a real dir — leaving it alone." >&2
+# ckpts/ is local by default; override with ZWT_CKPT_DIR if you want a
+# specific location (mounted volume, etc.).
+if [[ -n "${ZWT_CKPT_DIR:-}" ]]; then
+  mkdir -p "$ZWT_CKPT_DIR"
+  if [[ -e ckpts && ! -L ckpts ]]; then
+    echo "ckpts/ already exists as a real dir — leaving it alone." >&2
+  else
+    rm -f ckpts; ln -s "$ZWT_CKPT_DIR" ckpts
+  fi
 else
-  rm -f ckpts; ln -s "$CKPT_DIR_VOL" ckpts
+  mkdir -p ckpts
 fi
 echo "ckpts dir: $(readlink -f ckpts)"
 echo

@@ -41,7 +41,11 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────────────────────
-VOLUME_DEFAULT="/media/volume/Prep_and_Voice_Training"
+# Token resolution is delegated to zwt/scripts/find_tokens.sh:
+#   --tokens PATH         (CLI; wins)
+#   ZWT_TOKENS=...        (env; direct file)
+#   ZWT_VOLUME=...        (env; search root)
+#   default candidate dirs (Jetstream volume, $HOME/data, /data, ./downloads, ./data)
 SMOKE_CONF="zwt/conf/owt_1B_prof.conf"   # 50 steps, no ckpt, same shape as real run
 SMOKE_STEPS=35                            # must match [runtime] max_steps in SMOKE_CONF
 
@@ -100,13 +104,13 @@ pass "preflight"
 # expects data/owt/owt_tokens.npy. Set the symlink up once, here, before
 # either stage runs. Same lookup style as launch_1b_h100.sh.
 stage "tokens"
-if [[ -z "$TOKENS" && -n "${ZWT_TOKENS:-}" ]]; then
-  TOKENS="$ZWT_TOKENS"
-fi
-if [[ -z "$TOKENS" && -d "$VOLUME_DEFAULT" ]]; then
-  TOKENS=$(find "$VOLUME_DEFAULT" -maxdepth 6 -type f -name '*.npy' -size +1G 2>/dev/null \
-           | xargs -I{} stat -c '%s %n' {} 2>/dev/null \
-           | sort -n | tail -1 | cut -d' ' -f2-)
+# --tokens PATH on the CLI wins; otherwise delegate to find_tokens.sh which
+# honors ZWT_TOKENS, ZWT_VOLUME, then a list of default candidate dirs that
+# work both on Jetstream's mounted volume and on a roomy root disk.
+if [[ -z "$TOKENS" ]]; then
+  if found=$(bash zwt/scripts/find_tokens.sh 2>/dev/null); then
+    TOKENS="$found"
+  fi
 fi
 if [[ -z "$TOKENS" || ! -f "$TOKENS" ]]; then
   log "  WARN  no tokenized .npy found — bench_threeway zwt leg + smoke pretrain will skip"
@@ -246,15 +250,10 @@ pass "numerical_audit (see $NA_TXT)"
 if [[ "$DO_PRETRAIN" -eq 1 ]]; then
   stage "smoke pretrain ($SMOKE_STEPS steps)"
 
-  # Locate tokens. Same lookup style as launch_1b_h100.sh.
-  if [[ -z "$TOKENS" && -n "${ZWT_TOKENS:-}" ]]; then
-    TOKENS="$ZWT_TOKENS"
-  fi
+  # Locate tokens (same lookup as the earlier "tokens" stage).
   if [[ -z "$TOKENS" ]]; then
-    if [[ -d "$VOLUME_DEFAULT" ]]; then
-      TOKENS=$(find "$VOLUME_DEFAULT" -maxdepth 6 -type f -name '*.npy' -size +1G 2>/dev/null \
-               | xargs -I{} stat -c '%s %n' {} 2>/dev/null \
-               | sort -n | tail -1 | cut -d' ' -f2-)
+    if found=$(bash zwt/scripts/find_tokens.sh 2>/dev/null); then
+      TOKENS="$found"
     fi
   fi
   if [[ -z "$TOKENS" || ! -f "$TOKENS" ]]; then

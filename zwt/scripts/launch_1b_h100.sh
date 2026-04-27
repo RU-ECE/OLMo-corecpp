@@ -27,7 +27,11 @@
 set -euo pipefail
 
 # ── Defaults ──
-VOLUME="/media/volume/Prep_and_Voice_Training"
+# Token data is located via zwt/scripts/find_tokens.sh:
+#   ZWT_TOKENS=/abs/path/tokens.npy  (highest priority — direct file)
+#   ZWT_VOLUME=/some/dir              (search this dir first)
+#   default candidate dirs: /media/volume/Prep_and_Voice_Training,
+#     $HOME/data, /data, ./downloads, ./data
 CONF="zwt/conf/owt_1B_h100.conf"
 BIN="./build/zwt_pretrain"
 TMUX_SESSION="zwt_1b"
@@ -236,40 +240,21 @@ echo "=== GPU ==="
 nvidia-smi --query-gpu=name,driver_version,memory.total,memory.used --format=csv
 echo
 
-# ---- 1. locate the tokenized .npy on the volume ----------------------------
-if [[ ! -d "$VOLUME" ]]; then
-  echo "volume $VOLUME not mounted" >&2
+# ---- 1. locate the tokenized .npy ------------------------------------------
+# find_tokens.sh handles the resolution: ZWT_TOKENS direct path > ZWT_VOLUME
+# search root > default candidate dirs (Jetstream volume, $HOME/data, /data,
+# ./downloads, ./data). On a server with a roomy root disk you don't need
+# any mounted volume — drop the tokens under $HOME/data or ./downloads and
+# this script finds them.
+if ! TOKENS=$(bash "$(dirname "$0")/find_tokens.sh"); then
   exit 1
 fi
-
-echo "=== Searching volume for tokenized data ==="
-CANDIDATES=$(find "$VOLUME" -maxdepth 6 -type f -name '*.npy' 2>/dev/null \
-  | awk 'tolower($0) ~ /(owt|openwebtext|tokens)/' || true)
-if [[ -z "$CANDIDATES" ]]; then
-  CANDIDATES=$(find "$VOLUME" -maxdepth 6 -type f -name '*.npy' -size +1G 2>/dev/null || true)
-fi
-
-if [[ -z "$CANDIDATES" ]]; then
-  echo "no .npy found under $VOLUME — pass the path explicitly:" >&2
-  echo "  export ZWT_TOKENS=/media/volume/.../your_tokens.npy" >&2
-  echo "  bash $0" >&2
-  exit 1
-fi
-
-if [[ -n "${ZWT_TOKENS:-}" ]]; then
-  TOKENS="$ZWT_TOKENS"
+if command -v du >/dev/null && du -BG "$TOKENS" >/dev/null 2>&1; then
+  SIZE_HUMAN=$(du -BG "$TOKENS" | cut -f1)
 else
-  TOKENS=$(echo "$CANDIDATES" \
-    | xargs -I{} stat -c '%s %n' {} \
-    | sort -n | tail -1 | cut -d' ' -f2-)
+  SIZE_HUMAN=$(du -h "$TOKENS" | cut -f1)
 fi
-
-if [[ ! -f "$TOKENS" ]]; then
-  echo "tokens file $TOKENS does not exist" >&2
-  exit 1
-fi
-SIZE_GB=$(du -BG "$TOKENS" | cut -f1)
-echo "using tokens: $TOKENS ($SIZE_GB)"
+echo "using tokens: $TOKENS ($SIZE_HUMAN)"
 echo
 
 # ---- 2. wire the data path to what the config expects ----------------------
@@ -286,16 +271,21 @@ else
 fi
 echo "symlink: $LINK -> $(readlink -f "$LINK")"
 
-# ---- 3. checkpoints on the volume ------------------------------------------
-CKPT_DIR_VOL="$VOLUME/zwt_ckpts"
-mkdir -p "$CKPT_DIR_VOL"
-if [[ -e ckpts && ! -L ckpts ]]; then
-  echo "ckpts/ already exists as a real dir — leaving it alone." >&2
-  echo "move it first if you want checkpoints on the volume:" >&2
-  echo "  mv ckpts $CKPT_DIR_VOL/local && ln -s $CKPT_DIR_VOL ckpts" >&2
+# ---- 3. checkpoints --------------------------------------------------------
+# By default ckpts/ is a plain dir on the root disk. Override with
+#   ZWT_CKPT_DIR=/path/to/ckpts   (e.g. on a mounted volume)
+# and the script will symlink ckpts/ -> that dir. On a roomy root disk
+# (e.g. 400 GB) leave ZWT_CKPT_DIR unset.
+if [[ -n "${ZWT_CKPT_DIR:-}" ]]; then
+  mkdir -p "$ZWT_CKPT_DIR"
+  if [[ -e ckpts && ! -L ckpts ]]; then
+    echo "ckpts/ already exists as a real dir — leaving it alone." >&2
+  else
+    rm -f ckpts
+    ln -s "$ZWT_CKPT_DIR" ckpts
+  fi
 else
-  rm -f ckpts
-  ln -s "$CKPT_DIR_VOL" ckpts
+  mkdir -p ckpts
 fi
 echo "ckpts dir: $(readlink -f ckpts)"
 echo

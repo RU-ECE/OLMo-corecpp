@@ -298,17 +298,44 @@ set(ZWT_CUDA_SOURCES
     zwt/src/layers/embedding.cu
 )
 
-# NCCL: needed only for real multi-GPU DDP. Pip's torch wheel ships
-# libnccl.so.2 + nccl.h under TORCH_INSTALL_PREFIX/{lib,include}; system CUDA
-# install puts them under /usr/local/cuda. If we can't find both, world_size>1
-# will error at runtime — the rest of the build is unaffected.
+# NCCL: needed only for real multi-GPU DDP.
+#
+# Modern PyTorch wheels (cu12+) DON'T ship nccl directly under
+# torch/{lib,include}; instead they pull `nvidia-nccl-cu12` as a pip
+# sub-dep and that lands at  <site-packages>/nvidia/nccl/{lib,include}/.
+# So we ask Python where that package lives and add it to the search
+# hints. Falls back to the classic system locations (/usr/local/cuda,
+# Debian's libnccl-dev) when the pip layout isn't in use.
+#
+# If we can't find both header + library, world_size>1 errors at runtime
+# with a clear message — the rest of the build is unaffected.
 if(CMAKE_CUDA_COMPILER)
+    # Probe Python for the pip-installed nvidia-nccl-cu12 location. Quiet
+    # on failure (the fallback HINTS still cover system installs).
+    set(_PIP_NCCL_DIR "")
+    find_program(PYTHON3_EXE NAMES python3 python)
+    if(PYTHON3_EXE)
+        execute_process(
+            COMMAND ${PYTHON3_EXE} -c
+                "import os; import nvidia.nccl as n; print(os.path.dirname(n.__file__))"
+            OUTPUT_VARIABLE _PIP_NCCL_DIR
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+            RESULT_VARIABLE _PIP_NCCL_RC)
+        if(_PIP_NCCL_RC EQUAL 0 AND _PIP_NCCL_DIR)
+            message(STATUS "NCCL pip package: ${_PIP_NCCL_DIR}")
+        endif()
+    endif()
+
     find_path(NCCL_INCLUDE_DIR nccl.h
-        HINTS ${TORCH_INSTALL_PREFIX}/include
+        HINTS ${_PIP_NCCL_DIR}/include
+              ${TORCH_INSTALL_PREFIX}/include
               /usr/local/cuda/include
               /usr/include)
-    find_library(NCCL_LIBRARY nccl
-        HINTS ${TORCH_INSTALL_PREFIX}/lib
+    find_library(NCCL_LIBRARY
+        NAMES nccl libnccl.so.2 libnccl.so
+        HINTS ${_PIP_NCCL_DIR}/lib
+              ${TORCH_INSTALL_PREFIX}/lib
               /usr/local/cuda/lib64
               /usr/lib/x86_64-linux-gnu)
     if(NCCL_INCLUDE_DIR AND NCCL_LIBRARY)
@@ -316,7 +343,9 @@ if(CMAKE_CUDA_COMPILER)
         list(APPEND ZWT_CUDA_SOURCES zwt/src/dist/nccl_backend.cu)
         set(ZWT_HAVE_NCCL TRUE)
     else()
-        message(STATUS "NCCL: not found — multi-GPU DDP will be disabled at runtime")
+        message(STATUS "NCCL: not found — multi-GPU DDP will be disabled at runtime.")
+        message(STATUS "  hints tried: pip=${_PIP_NCCL_DIR}, torch=${TORCH_INSTALL_PREFIX}, /usr/local/cuda, /usr/{include,lib}")
+        message(STATUS "  to fix: pip install nvidia-nccl-cu12   (or apt install libnccl-dev)")
         set(ZWT_HAVE_NCCL FALSE)
     endif()
 else()

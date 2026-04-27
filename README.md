@@ -1,6 +1,6 @@
-# OLMo-corecpp
+# llm-cpp
 
-C++ reimplementation of [AI2 OLMo-core](https://github.com/allenai/OLMo-core) transformer training framework built on LibTorch.
+C++ reimplementation of [AI2 OLMo-core](https://github.com/allenai/OLMo-core) transformer training framework built on LibTorch. The upstream Python OLMo-core is vendored under `olmo-python/` as the reference comparison stack.
 
 ## Features
 

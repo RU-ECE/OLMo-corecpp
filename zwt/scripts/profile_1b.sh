@@ -14,7 +14,7 @@
 #   bash zwt/scripts/profile_1b.sh --dmon       # skip nsys, watch nvidia-smi
 #
 # To open the .nsys-rep locally:
-#   scp jetstream:.../OLMo-corecpp/prof/zwt_1b_*.nsys-rep .
+#   scp jetstream:.../olmo-python/prof/zwt_1b_*.nsys-rep .
 #   nsight-sys zwt_1b_*.nsys-rep
 # (install Nsight Systems: https://developer.nvidia.com/nsight-systems)
 

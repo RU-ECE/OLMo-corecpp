@@ -669,7 +669,7 @@ generate_report() {
     REPORT="$RESULTS_DIR/REPORT.txt"
     cat > "$REPORT" << 'HEADER'
 ═══════════════════════════════════════════════════════════════
-  OLMo-corecpp Benchmark Report
+  llm-cpp Benchmark Report
   3-Way Comparison: Python OLMo-core vs cpp-llm vs llm-cpp
   Target: NVIDIA RTX 3060 (12GB VRAM)
 ═══════════════════════════════════════════════════════════════
@@ -728,7 +728,7 @@ HEADER
 main() {
     echo -e "${BOLD}"
     echo "  ╔═══════════════════════════════════════════════════╗"
-    echo "  ║  OLMo-corecpp: Full Benchmark Suite (RTX 3060)   ║"
+    echo "  ║  llm-cpp: Full Benchmark Suite (RTX 3060)        ║"
     echo "  ║  Python OLMo-core × cpp-llm × llm-cpp            ║"
     echo "  ╚═══════════════════════════════════════════════════╝"
     echo -e "${NC}"

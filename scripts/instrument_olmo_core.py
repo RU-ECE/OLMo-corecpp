@@ -35,9 +35,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-# Add OLMo-corecpp to path
+# Add olmo-python to path
 ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(ROOT / "OLMo-corecpp" / "src"))
+sys.path.insert(0, str(ROOT / "olmo-python" / "src"))
 
 import numpy as np
 

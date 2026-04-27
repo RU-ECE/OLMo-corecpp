@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 ROOT = Path(__file__).parent.parent
-OLMO_CORE_DIR = ROOT / "OLMo-corecpp"
+OLMO_CORE_DIR = ROOT / "olmo-python"
 BUILD_DIR = ROOT / "build"
 VENV_DIR = ROOT / ".bench_venv"
 

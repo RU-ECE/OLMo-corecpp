@@ -598,7 +598,7 @@ generate_report() {
     REPORT="$RESULTS_DIR/REPORT.txt"
     cat > "$REPORT" << 'HEADER'
 ═══════════════════════════════════════════════════════════════
-  OLMo-corecpp Benchmark Report
+  llm-cpp Benchmark Report
   3-Way Comparison: Python OLMo-core vs cpp-llm vs llm-cpp
 ═══════════════════════════════════════════════════════════════
 HEADER
@@ -654,7 +654,7 @@ HEADER
 main() {
     echo -e "${BOLD}"
     echo "  ╔═══════════════════════════════════════════════════╗"
-    echo "  ║  OLMo-corecpp: Full Benchmark Suite (H100)       ║"
+    echo "  ║  llm-cpp: Full Benchmark Suite (H100)            ║"
     echo "  ║  Python OLMo-core × cpp-llm × llm-cpp            ║"
     echo "  ╚═══════════════════════════════════════════════════╝"
     echo -e "${NC}"

@@ -35,8 +35,16 @@ for arg in "$@"; do
     --clean)  CLEAN=1 ;;
     --debug)  BUILD_TYPE="Debug" ;;
     --ddp)    EXTRA_CMAKE_ARGS="$EXTRA_CMAKE_ARGS -DOLMO_USE_DDP=ON" ;;
+    --wgmma)  EXTRA_CMAKE_ARGS="$EXTRA_CMAKE_ARGS -DZWT_USE_WGMMA=ON" ;;
     --help|-h)
-      echo "Usage: $0 [--cuda|--cpu|--clean|--debug|--ddp]"
+      echo "Usage: $0 [--cuda|--cpu|--clean|--debug|--ddp|--wgmma]"
+      echo ""
+      echo "  --cuda    Force CUDA build (H100 etc.)"
+      echo "  --cpu     CPU-only build"
+      echo "  --clean   Wipe build/ before configuring"
+      echo "  --debug   -DCMAKE_BUILD_TYPE=Debug"
+      echo "  --ddp     Build legacy olmo_cpp DDP path (Gloo)"
+      echo "  --wgmma   Enable Hopper WGMMA GEMM in zwt (sm_90a, requires CUDA 12+)"
       exit 0
       ;;
   esac
@@ -166,7 +174,11 @@ echo ""
 echo "=== Build Complete ==="
 echo ""
 echo "Binaries in $BUILD_DIR/:"
-for bin in olmo_train chat prepare_data convert_checkpoint convert_hf inspect_tokens mine_patterns benchmark_tokenizer dump_params; do
+for bin in olmo_train chat prepare_data convert_checkpoint convert_hf inspect_tokens mine_patterns benchmark_tokenizer dump_params \
+           zwt_pretrain zwt_train zwt_export_hf zwt_numerical_audit \
+           zwt_kernel_tests zwt_ddp_bucket_tests zwt_ddp_loopback_tests \
+           zwt_tp_tests zwt_flash_attn_tests zwt_graph_bench \
+           zwt_wgmma_bench zwt_wgmma_tests; do
   if [ -f "$BUILD_DIR/$bin" ]; then
     SIZE=$(du -h "$BUILD_DIR/$bin" | cut -f1)
     echo "  $bin  ($SIZE)"

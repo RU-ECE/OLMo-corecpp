@@ -48,6 +48,9 @@ def main() -> int:
                          "Default: *.tmp.npy")
     ap.add_argument("--pattern", default="*.npy",
                     help="shard file glob (default: *.npy)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="inspect shards (count, dtype, total tokens, GB) "
+                         "and exit without writing the output file")
     args = ap.parse_args()
 
     shards_dir = os.path.abspath(args.shards_dir)
@@ -93,6 +96,10 @@ def main() -> int:
     print(f"  dtype: {dtype}")
     print(f"  total: {total_elems:,} tokens, {total_bytes/1e9:.2f} GB")
     print(f"  out:   {args.out_path}")
+
+    if args.dry_run:
+        print("--dry-run: not writing. Drop the flag to actually concat.")
+        return 0
 
     # Pre-flight free-space check on the output dir. Don't start a
     # multi-minute copy that will fail half-way.

@@ -45,6 +45,20 @@ stage() { echo; echo "── $1 ──"; }
 fail()  { echo "  FAIL  $1 — see $2" >&2; exit 1; }
 pass()  { echo "  PASS  $1"; }
 
+# ── 0. data symlink ─────────────────────────────────────────────────────
+# zwt_pretrain reads data/owt/owt_tokens.npy from the .conf; we materialize
+# that symlink here via find_tokens.sh so neither rank crashes with
+# 'TokenLoader: cannot open ...' at startup.
+stage "0. tokens"
+if TOKENS=$(bash "$(dirname "$0")/find_tokens.sh" 2>/dev/null); then
+  mkdir -p data/owt
+  ln -sfn "$TOKENS" data/owt/owt_tokens.npy
+  echo "  tokens: $TOKENS"
+  pass "symlink data/owt/owt_tokens.npy → $TOKENS"
+else
+  echo "  WARN: no tokens found — pt_baseline (synthetic ids) will still run, but the zwt leg will skip" >&2
+fi
+
 # ── 1. loopback test ────────────────────────────────────────────────────
 stage "1. zwt_ddp_loopback_tests"
 LOOP_LOG="$OUT/loopback.log"

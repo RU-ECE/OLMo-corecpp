@@ -50,6 +50,17 @@ fi
 GPU=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
 echo "# bench_threeway on $GPU  config=$CONFIG  warmup=$WARMUP iters=$ITERS world=$WORLD" >&2
 
+# zwt_pretrain reads data/owt/owt_tokens.npy from the .conf. Make sure the
+# symlink is in place via find_tokens.sh — the long-run launchers do this
+# but the bench script invokes the binary directly via launch_ddp.sh which
+# does not. Skipped silently if find_tokens.sh fails (zwt leg will then
+# error with a clear "TokenLoader: cannot open ..." which we tee through).
+if TOKENS=$(bash "$REPO/zwt/scripts/find_tokens.sh" 2>/dev/null); then
+  mkdir -p "$REPO/data/owt"
+  ln -sfn "$TOKENS" "$REPO/data/owt/owt_tokens.npy"
+  echo "# tokens: $TOKENS" >&2
+fi
+
 opt_batch=()
 opt_seq=()
 [[ -n $BATCH ]] && opt_batch=(--batch "$BATCH")

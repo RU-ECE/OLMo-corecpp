@@ -281,14 +281,21 @@ def main() -> int:
     model = OLMo2(cfg).to(device=device, dtype=dtype)
 
     # DDP wrapping happens BEFORE torch.compile so the compile sees the DDP
-    # graph (single backward pass, static set of grads). static_graph=True
-    # is the closest analog to zwt's fixed bucketing — it lets DDP skip
-    # rebuild logic on every step. gradient_as_bucket_view=True elides the
-    # extra grad copy.
+    # graph. gradient_as_bucket_view=True elides the extra grad copy.
+    #
+    # NOTE: we deliberately DO NOT pass static_graph=True. PyTorch's DDP
+    # `static_graph` mode is incompatible with `model.no_sync()` over a
+    # grad_accum window — the first backward inside no_sync() doesn't
+    # register the autograd hooks static_graph expects to be invariant,
+    # and you get:
+    #   RuntimeError: expect_autograd_hooks_ INTERNAL ASSERT FAILED at
+    #     "torch/csrc/distributed/c10d/reducer.cpp":1705
+    # Without static_graph, DDP rebuilds its bucket map per step (small
+    # overhead) but `no_sync()` semantics work — that's the fair-comparison
+    # contract against zwt's "one allreduce per opt_step."
     if ddp_active:
         from torch.nn.parallel import DistributedDataParallel as DDP
         model = DDP(model, device_ids=[local_rank],
-                    static_graph=True,
                     gradient_as_bucket_view=True)
 
     if args.compile:

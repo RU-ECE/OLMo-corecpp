@@ -258,6 +258,7 @@ set(ZWT_CPP_SOURCES
     zwt/src/core/allocator.cpp
     zwt/src/core/determinism.cpp
     zwt/src/core/graph.cpp
+    zwt/src/core/profiler.cpp
     zwt/src/core/tensor.cpp
     zwt/src/core/stream.cpp
     zwt/src/dist/ddp.cpp
@@ -296,6 +297,32 @@ set(ZWT_CUDA_SOURCES
     zwt/src/optim/grad_clip.cu
     zwt/src/layers/embedding.cu
 )
+
+# NCCL: needed only for real multi-GPU DDP. Pip's torch wheel ships
+# libnccl.so.2 + nccl.h under TORCH_INSTALL_PREFIX/{lib,include}; system CUDA
+# install puts them under /usr/local/cuda. If we can't find both, world_size>1
+# will error at runtime — the rest of the build is unaffected.
+if(CMAKE_CUDA_COMPILER)
+    find_path(NCCL_INCLUDE_DIR nccl.h
+        HINTS ${TORCH_INSTALL_PREFIX}/include
+              /usr/local/cuda/include
+              /usr/include)
+    find_library(NCCL_LIBRARY nccl
+        HINTS ${TORCH_INSTALL_PREFIX}/lib
+              /usr/local/cuda/lib64
+              /usr/lib/x86_64-linux-gnu)
+    if(NCCL_INCLUDE_DIR AND NCCL_LIBRARY)
+        message(STATUS "NCCL: ${NCCL_LIBRARY} (headers: ${NCCL_INCLUDE_DIR})")
+        list(APPEND ZWT_CUDA_SOURCES zwt/src/dist/nccl_backend.cu)
+        set(ZWT_HAVE_NCCL TRUE)
+    else()
+        message(STATUS "NCCL: not found — multi-GPU DDP will be disabled at runtime")
+        set(ZWT_HAVE_NCCL FALSE)
+    endif()
+else()
+    set(ZWT_HAVE_NCCL FALSE)
+endif()
+
 if(CMAKE_CUDA_COMPILER)
     add_library(zwt STATIC ${ZWT_CPP_SOURCES} ${ZWT_CUDA_SOURCES})
     set_target_properties(zwt PROPERTIES
@@ -303,6 +330,11 @@ if(CMAKE_CUDA_COMPILER)
         POSITION_INDEPENDENT_CODE ON)
     find_package(CUDAToolkit REQUIRED)
     target_link_libraries(zwt PUBLIC CUDA::cublas CUDA::cudart)
+    if(ZWT_HAVE_NCCL)
+        target_include_directories(zwt PRIVATE ${NCCL_INCLUDE_DIR})
+        target_link_libraries(zwt PUBLIC ${NCCL_LIBRARY})
+        target_compile_definitions(zwt PUBLIC ZWT_HAVE_NCCL=1)
+    endif()
 else()
     add_library(zwt STATIC ${ZWT_CPP_SOURCES})
 endif()
@@ -398,6 +430,10 @@ target_compile_options(zwt_kernel_tests PRIVATE -O2)
 add_executable(zwt_ddp_bucket_tests zwt/tests/ddp_bucket_tests.cpp)
 target_link_libraries(zwt_ddp_bucket_tests PRIVATE zwt)
 target_compile_options(zwt_ddp_bucket_tests PRIVATE -O2)
+
+add_executable(zwt_ddp_loopback_tests zwt/tests/ddp_loopback_tests.cpp)
+target_link_libraries(zwt_ddp_loopback_tests PRIVATE zwt)
+target_compile_options(zwt_ddp_loopback_tests PRIVATE -O2)
 
 add_executable(zwt_tp_tests zwt/tests/tp_tests.cpp)
 target_link_libraries(zwt_tp_tests PRIVATE zwt)

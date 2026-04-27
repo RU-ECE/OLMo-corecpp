@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace zwt::dist {
@@ -71,5 +72,21 @@ class OverlapHookup {
 // Thin no-op backend for CPU builds and unit tests — satisfies the contract
 // but performs no reduction. Returns a CommContext whose `backend` is null.
 CommContext make_loopback_ctx(Device dev);
+
+// Real NCCL backend. Performs a TCP rendezvous with rank 0 listening on
+// master_addr:master_port, exchanges an ncclUniqueId, then ncclCommInitRank.
+// Throws std::runtime_error on any failure (NCCL absent, rendezvous timeout,
+// CUDA failure, NCCL init failure).
+//
+// Caller must invoke nccl_destroy(ctx) at process exit. SIGTERM-driven aborts
+// can call nccl_abort(ctx) to interrupt in-flight allreduces.
+//
+// On builds compiled without NCCL, this throws unconditionally.
+CommContext make_nccl_ctx(int rank, int world_size,
+                          const std::string& master_addr, int master_port,
+                          int device_index, Device dev);
+
+void nccl_destroy(CommContext& ctx);
+void nccl_abort(CommContext& ctx);
 
 }  // namespace zwt::dist

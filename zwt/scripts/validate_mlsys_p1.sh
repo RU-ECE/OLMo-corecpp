@@ -194,7 +194,7 @@ awk 'NR>1 { print "    "$0 }' "$GRAPH_CSV" | head -5 | tee -a "$SUMMARY"
 pass "graph_bench (CSV: $GRAPH_CSV)"
 
 # ── 5. three-way bench (only if PyTorch importable) ────────────────────
-stage "three-way bench (pytorch eager / torch.compile / zwt)"
+stage "three-way bench (pytorch eager / torch.compile / zwt) — single GPU"
 THREEWAY_CSV="$OUT_DIR/bench_threeway.csv"
 if [[ -z "$TOKENS" ]]; then
   echo "  SKIP: no tokens available (bench_threeway's zwt leg needs them)" | tee -a "$SUMMARY"
@@ -206,6 +206,32 @@ elif python3 -c 'import torch' 2>/dev/null; then
   pass "bench_threeway (CSV: $THREEWAY_CSV)"
 else
   echo "  SKIP: python3 -c 'import torch' failed — install torch to enable" | tee -a "$SUMMARY"
+fi
+
+# ── 5b. 2-GPU three-way bench (only if 2+ GPUs are visible) ────────────
+stage "three-way bench — 2-GPU DDP"
+N_GPU=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l | tr -d ' ')
+THREEWAY_2X_CSV="$OUT_DIR/bench_threeway_2x.csv"
+if [[ "$N_GPU" -lt 2 ]]; then
+  echo "  SKIP: only $N_GPU GPU visible" | tee -a "$SUMMARY"
+elif [[ -z "$TOKENS" ]]; then
+  echo "  SKIP: no tokens (zwt leg of 2-GPU bench needs them)" | tee -a "$SUMMARY"
+elif ! python3 -c 'import torch' 2>/dev/null; then
+  echo "  SKIP: torch not importable" | tee -a "$SUMMARY"
+else
+  # verify_ddp.sh is the gate: NCCL TCP rendezvous, scatter correctness, both
+  # ranks logging. If it fails, don't run the bench — the numbers would be
+  # meaningless. SUMMARY still records the failure.
+  if ! bash zwt/scripts/verify_ddp.sh zwt/conf/owt_1B_2xh100.conf \
+        > "$OUT_DIR/verify_ddp.log" 2>&1; then
+    log "  WARN  verify_ddp.sh failed; skipping 2-GPU bench (see verify_ddp.log)"
+  else
+    bash zwt/scripts/bench_threeway.sh zwt/conf/owt_1B_2xh100.conf 30 5 "" "" 2 \
+         >"$THREEWAY_2X_CSV" 2>>"$TESTS_LOG" \
+         || log "  WARN  bench_threeway 2-GPU partial — see $THREEWAY_2X_CSV"
+    cat "$THREEWAY_2X_CSV" | tee -a "$SUMMARY"
+    pass "bench_threeway 2-GPU (CSV: $THREEWAY_2X_CSV)"
+  fi
 fi
 
 # ── 6. numerical audit (bf16 vs fp32 from fresh init; no ckpt needed) ──

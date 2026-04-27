@@ -155,6 +155,16 @@ TrainConfig load_train_config(const std::string& path) {
         if (k == "deterministic") { c.deterministic = parse_bool(v); return true; }
         return false;
       });
+    } else if (sect == "dist") {
+      apply_section(sect, kv, [&](const std::string& k, const std::string& v) {
+        if (k == "rank")        { c.rank        = static_cast<int>(parse_i64(v)); return true; }
+        if (k == "local_rank")  { c.local_rank  = static_cast<int>(parse_i64(v)); return true; }
+        if (k == "world_size")  { c.world_size  = static_cast<int>(parse_i64(v)); return true; }
+        if (k == "master_addr") { c.master_addr = v;                              return true; }
+        if (k == "master_port") { c.master_port = static_cast<int>(parse_i64(v)); return true; }
+        if (k == "bucket_mb")   { c.bucket_mb   = parse_i64(v);                   return true; }
+        return false;
+      });
     } else if (sect == "global") {
       if (kv.empty()) continue;
       throw std::runtime_error("config: keys outside any section");
@@ -224,7 +234,14 @@ std::string dump_train_config(const TrainConfig& c) {
      << "resume_from   = " << c.resume_from         << "\n"
      << "init_seed     = " << c.init_seed           << "\n"
      << "arena_mb      = " << c.arena_mb            << "\n"
-     << "deterministic = " << (c.deterministic ? 1 : 0) << "\n";
+     << "deterministic = " << (c.deterministic ? 1 : 0) << "\n"
+     << "\n[dist]\n"
+     << "rank          = " << c.rank                << "\n"
+     << "local_rank    = " << c.local_rank          << "\n"
+     << "world_size    = " << c.world_size          << "\n"
+     << "master_addr   = " << c.master_addr         << "\n"
+     << "master_port   = " << c.master_port         << "\n"
+     << "bucket_mb     = " << c.bucket_mb           << "\n";
   return os.str();
 }
 

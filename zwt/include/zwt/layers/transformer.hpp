@@ -1,5 +1,6 @@
 #pragma once
 
+#include "zwt/core/stream.hpp"
 #include "zwt/layers/embedding.hpp"
 #include "zwt/layers/linear.hpp"
 #include "zwt/layers/rmsnorm.hpp"
@@ -7,6 +8,8 @@
 
 #include <memory>
 #include <vector>
+
+namespace zwt::dist { class BucketManager; }
 
 namespace zwt {
 
@@ -42,6 +45,16 @@ class Transformer final : public Module {
   Tensor forward(const Tensor& tokens) override;
   // grad_logits: [B, S, vocab]. Returns an empty tensor (no input grad).
   Tensor backward(const Tensor& grad_logits) override;
+
+  // DDP-aware backward. After each layer's backward returns, walks that
+  // layer's parameters and calls mgr.mark_ready(...) — letting the bucket
+  // manager fire allreduces on the side stream as soon as a bucket fills.
+  // Pass the compute stream's handle so the gather copies (D2D) and the
+  // allreduce see the right ordering. Used only when world_size > 1; the
+  // single-GPU path uses the override above.
+  Tensor backward(const Tensor& grad_logits,
+                  dist::BucketManager& mgr,
+                  StreamHandle compute_s);
   void   collect_params(std::vector<Parameter*>& out) override;
 
   const Config& config() const { return cfg_; }

@@ -1,4 +1,5 @@
 #include "zwt/layers/ffn.hpp"
+#include "zwt/core/profiler.hpp"
 #include "zwt/ops/elementwise.hpp"
 
 namespace zwt {
@@ -15,23 +16,47 @@ FFN::FFN(int64_t d_model, int64_t hidden, DType dtype, Device device,
                init_seed ^ 0xF00'0003ULL) {}
 
 Tensor FFN::forward(const Tensor& x) {
-  saved_combined_ = gate_up_.forward(x);                 // [..., 2*hidden]
-  // Output of silu_mul_gated is [..., hidden] — reshape from combined.
+  Device dev = x.device();
+  {
+    ZWT_PROFILE_GPU("ffn.gate_up.fwd", dev);
+    saved_combined_ = gate_up_.forward(x);               // [..., 2*hidden]
+  }
   Shape out_shape = saved_combined_.shape();
   out_shape.dims[out_shape.rank - 1] /= 2;
   saved_silu_mul_ = empty_scratch(out_shape, saved_combined_.dtype(),
                                   saved_combined_.device());
-  ops::silu_mul_gated(saved_silu_mul_, saved_combined_);
-  return down_.forward(saved_silu_mul_);
+  {
+    ZWT_PROFILE_GPU("ffn.silu_mul.fwd", dev);
+    ops::silu_mul_gated(saved_silu_mul_, saved_combined_);
+  }
+  Tensor out;
+  {
+    ZWT_PROFILE_GPU("ffn.down.fwd", dev);
+    out = down_.forward(saved_silu_mul_);
+  }
+  return out;
 }
 
 Tensor FFN::backward(const Tensor& grad_y) {
-  Tensor grad_h = down_.backward(grad_y);                // [..., hidden]
+  Device dev = grad_y.device();
+  Tensor grad_h;
+  {
+    ZWT_PROFILE_GPU("ffn.down.bwd", dev);
+    grad_h = down_.backward(grad_y);                     // [..., hidden]
+  }
   Tensor grad_combined = empty_scratch(saved_combined_.shape(),
                                        saved_combined_.dtype(),
                                        saved_combined_.device());
-  ops::silu_mul_gated_backward(grad_h, saved_combined_, grad_combined);
-  return gate_up_.backward(grad_combined);               // [..., d_model]
+  {
+    ZWT_PROFILE_GPU("ffn.silu_mul.bwd", dev);
+    ops::silu_mul_gated_backward(grad_h, saved_combined_, grad_combined);
+  }
+  Tensor out;
+  {
+    ZWT_PROFILE_GPU("ffn.gate_up.bwd", dev);
+    out = gate_up_.backward(grad_combined);              // [..., d_model]
+  }
+  return out;
 }
 
 void FFN::collect_params(std::vector<Parameter*>& out) {

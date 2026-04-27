@@ -42,6 +42,19 @@ struct TrainConfig {
   // [device]
   // device is selected automatically — CUDA if compiled with USE_CUDA,
   // else CPU. No knob needed.
+
+  // [dist] — multi-GPU data-parallel knobs.
+  // world_size == 1 disables every DDP code path; the trainer behaves
+  // bit-identically to the single-GPU baseline.
+  int         rank          = 0;
+  int         local_rank    = 0;
+  int         world_size    = 1;
+  std::string master_addr   = "127.0.0.1";
+  int         master_port   = 29500;
+  // Per-bucket byte budget for gradient allreduce. 256 MiB is right at
+  // 2-GPU NVLink scale: bandwidth-bound, so smaller buckets just add ring
+  // trips. Lower for unit tests / single-host smoke.
+  int64_t     bucket_mb     = 256;
 };
 
 // Load a TrainConfig from an INI-style file. Unknown keys are errors; missing

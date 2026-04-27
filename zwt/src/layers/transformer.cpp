@@ -1,5 +1,7 @@
 #include "zwt/layers/transformer.hpp"
 
+#include "zwt/dist/ddp.hpp"
+
 #include <stdexcept>
 
 namespace zwt {
@@ -73,6 +75,32 @@ Tensor Transformer::backward(const Tensor& grad_logits) {
     g = (*it)->backward(g);
   }
   return tok_emb_.backward(g);
+}
+
+Tensor Transformer::backward(const Tensor& grad_logits,
+                             dist::BucketManager& mgr,
+                             StreamHandle s) {
+  // Same shape as the eager backward, but after each layer's backward we
+  // signal mark_ready on every parameter that layer owns. Bucket manager
+  // gathers + fires allreduce on the side stream as soon as a bucket fills.
+  std::vector<Parameter*> tmp;
+  auto signal = [&](Module& m) {
+    tmp.clear();
+    m.collect_params(tmp);
+    dist::signal_params_ready(tmp, mgr, s);
+  };
+
+  Tensor g = lm_head_.backward(grad_logits);
+  signal(lm_head_);
+  g = final_norm_.backward(g);
+  signal(final_norm_);
+  for (auto it = blocks_.rbegin(); it != blocks_.rend(); ++it) {
+    g = (*it)->backward(g);
+    signal(**it);
+  }
+  Tensor out = tok_emb_.backward(g);
+  signal(tok_emb_);
+  return out;
 }
 
 void Transformer::collect_params(std::vector<Parameter*>& out) {

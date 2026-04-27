@@ -213,6 +213,26 @@ class OLMo2(nn.Module):
 # -----------------------------------------------------------------------------
 # Bench loop
 # -----------------------------------------------------------------------------
+def _ddp_init():
+    """Initialize torch.distributed if launched under torchrun.
+
+    torchrun sets RANK / LOCAL_RANK / WORLD_SIZE / MASTER_ADDR / MASTER_PORT.
+    If none are present we run single-rank (the original code path).
+    Returns (rank, local_rank, world_size, ddp_active).
+    """
+    import torch.distributed as dist
+    if "WORLD_SIZE" not in os.environ:
+        return 0, 0, 1, False
+    world_size = int(os.environ["WORLD_SIZE"])
+    if world_size <= 1:
+        return 0, 0, 1, False
+    rank       = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl", init_method="env://")
+    return rank, local_rank, world_size, True
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
@@ -220,6 +240,12 @@ def main() -> int:
     ap.add_argument("--steps",  type=int, default=50)
     ap.add_argument("--batch",  type=int, default=0, help="override cfg.batch_size")
     ap.add_argument("--seq",    type=int, default=0, help="override cfg.seq_len")
+    ap.add_argument("--grad-accum", type=int, default=0,
+                    help="override cfg.grad_accum (default: read from .conf)")
+    ap.add_argument("--grad-clip", type=float, default=1.0,
+                    help="grad clipping threshold; pass 0 to disable. Default 1.0 "
+                         "matches zwt's default; set 0 if you want pure speed and "
+                         "the comparison happens to be the unclipped regime.")
     ap.add_argument("--dtype",  default="bf16", choices=["bf16", "fp16", "fp32"])
     ap.add_argument("--compile", action="store_true", help="torch.compile the model")
     args = ap.parse_args()
@@ -228,18 +254,37 @@ def main() -> int:
         print("pt_baseline: CUDA not available — numbers would be meaningless",
               file=sys.stderr)
         return 2
-    device = "cuda"
+
+    rank, local_rank, world_size, ddp_active = _ddp_init()
+    device = f"cuda:{local_rank}"
+    torch.cuda.set_device(local_rank)
+    is_rank0 = (rank == 0)
+
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16,
              "fp32": torch.float32}[args.dtype]
 
     cfg, data = load_cfg(args.config)
-    B = args.batch if args.batch > 0 else data["batch_size"]
-    S = args.seq   if args.seq   > 0 else data["seq_len"]
+    B  = args.batch      if args.batch      > 0 else data["batch_size"]
+    S  = args.seq        if args.seq        > 0 else data["seq_len"]
+    GA = args.grad_accum if args.grad_accum > 0 else data.get("grad_accum", 1)
 
-    torch.manual_seed(0xC0DEBA5E)
+    torch.manual_seed(0xC0DEBA5E + rank)
     model = OLMo2(cfg).to(device=device, dtype=dtype)
+
+    # DDP wrapping happens BEFORE torch.compile so the compile sees the DDP
+    # graph (single backward pass, static set of grads). static_graph=True
+    # is the closest analog to zwt's fixed bucketing — it lets DDP skip
+    # rebuild logic on every step. gradient_as_bucket_view=True elides the
+    # extra grad copy.
+    if ddp_active:
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        model = DDP(model, device_ids=[local_rank],
+                    static_graph=True,
+                    gradient_as_bucket_view=True)
+
     if args.compile:
         model = torch.compile(model)
+
     opt = torch.optim.AdamW(model.parameters(), lr=3e-4,
                             betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1,
                             fused=True)
@@ -251,31 +296,60 @@ def main() -> int:
     ids = torch.randint(0, cfg.vocab_size, (B, S), device=device)
     tgt = torch.randint(0, cfg.vocab_size, (B, S), device=device)
 
-    def step() -> float:
+    inv_ga = 1.0 / float(GA)
+
+    # Inner closure: one micro-batch fwd+bwd. `sync_grads` controls whether
+    # DDP fires its allreduce on this backward. We pass sync_grads=False
+    # for accum micro-batches 0..GA-2 (via model.no_sync()) and True for
+    # the last one — matching zwt's design of one allreduce per optimizer
+    # step. Without no_sync(), DDP fires N allreduces per step which is a
+    # different (and unfair) host-overhead profile.
+    def micro_batch(sync_grads: bool):
+        if ddp_active and not sync_grads:
+            ctx = model.no_sync()
+        else:
+            import contextlib
+            ctx = contextlib.nullcontext()
+        with ctx:
+            logits = model(ids, cos, sin)
+            loss = F.cross_entropy(logits.reshape(-1, cfg.vocab_size),
+                                   tgt.reshape(-1))
+            (loss * inv_ga).backward()
+        return loss
+
+    def opt_step():
         opt.zero_grad(set_to_none=True)
-        logits = model(ids, cos, sin)
-        loss = F.cross_entropy(logits.reshape(-1, cfg.vocab_size),
-                               tgt.reshape(-1))
-        loss.backward()
+        for i in range(GA):
+            micro_batch(sync_grads=(i == GA - 1))
+        if args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         opt.step()
-        return loss.item()
 
     # Warmup.
     for _ in range(args.warmup):
-        step()
+        opt_step()
     torch.cuda.synchronize()
 
     t0 = time.perf_counter()
     for _ in range(args.steps):
-        step()
+        opt_step()
     torch.cuda.synchronize()
     dt = time.perf_counter() - t0
 
-    toks = B * S * args.steps
+    # Tokens-per-second across ALL ranks: B * S * GA * world_size * steps / dt.
+    # This is the headline benchmark figure; rank 0 is the only one that
+    # prints it.
+    toks = B * S * GA * world_size * args.steps
     tps  = toks / dt
-    print(f"pt_baseline: config={args.config} dtype={args.dtype} compile={args.compile}")
-    print(f"  B={B} S={S} steps={args.steps} "
-          f"dt={dt:.3f}s tok/s={tps:,.0f} ms/step={dt*1000/args.steps:.2f}")
+    if is_rank0:
+        print(f"pt_baseline: config={args.config} dtype={args.dtype} "
+              f"compile={args.compile} world_size={world_size}")
+        print(f"  B={B} S={S} grad_accum={GA} steps={args.steps} "
+              f"dt={dt:.3f}s tok/s={tps:,.0f} ms/step={dt*1000/args.steps:.2f}")
+
+    if ddp_active:
+        import torch.distributed as dist
+        dist.destroy_process_group()
     return 0
 
 

@@ -1,9 +1,37 @@
+/**
+ * src/model/attention.cpp
+ *
+ * Implementation of the un-fused multi-head / grouped-query self-attention
+ * module (AttentionImpl). Constructs Q, K, V, output linear projections,
+ * optional QK-RMSNorm, and RoPE, then computes attention via ATen's
+ * scaled_dot_product_attention (which dispatches to FlashAttention on
+ * CUDA where supported). Sliding-window masks are built lazily and cached
+ * across forwards while their dimensions stay constant.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/model/attention.hpp: own header (declares AttentionImpl,
+ *     RoPE, RMSNorm, KVCache types)
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/model/block.cpp: ReorderedNormTransformerBlockImpl::forward
+ *     calls Attention(...) — i.e., this forward — once per layer
+ *   - src/model/block_variants.cpp: PeriNorm/LayerNormScaled/Normalized
+ *     /MoE block forwards likewise dispatch through Attention(...)
+ *
+ * --- Role in training pipeline ---
+ *   On the un-fused training path, this is the per-layer attention
+ *   compute. One call per layer per forward; gradients flow back through
+ *   ATen's autograd over the SDPA op and the linear layers.
+ */
 #include "olmo_cpp/model/attention.hpp"
 #include <ATen/ops/scaled_dot_product_attention.h>
 #include <limits>
 
 namespace olmo_cpp {
 
+/// Construct Q/K/V/output linears, optional QK-norms, and RoPE module.
+/// The K/V projections are sized for n_kv_heads (GQA-aware), while the
+/// Q and output projections use the full n_heads count.
 AttentionImpl::AttentionImpl(const TransformerConfig& cfg, int64_t /*layer_idx*/)
     : w_q_(register_module("w_q", torch::nn::Linear(torch::nn::LinearOptions(cfg.d_model, cfg.n_heads * cfg.get_head_dim()).bias(false)))),
       w_k_(register_module("w_k", torch::nn::Linear(torch::nn::LinearOptions(cfg.d_model, cfg.get_n_kv_heads() * cfg.get_head_dim()).bias(false)))),
@@ -15,17 +43,23 @@ AttentionImpl::AttentionImpl(const TransformerConfig& cfg, int64_t /*layer_idx*/
       n_heads_rep_(cfg.n_heads / cfg.get_n_kv_heads()),
       use_head_qk_norm_(cfg.use_head_qk_norm),
       sliding_window_size_(cfg.sliding_window_size) {
+  // Optional QK-norm: stabilizes attention scores at large depths/widths.
   if (cfg.use_qk_norm) {
     if (cfg.use_head_qk_norm) {
+      // Per-head RMSNorm: parameter vector has length head_dim.
       q_norm_ = RMSNorm(cfg.get_head_dim(), cfg.layer_norm_eps);
       k_norm_ = RMSNorm(cfg.get_head_dim(), cfg.layer_norm_eps);
     } else {
+      // Per-tensor RMSNorm: applied before head reshape over the full
+      // n_heads*head_dim (Q) or n_kv_heads*head_dim (K) feature width.
       q_norm_ = RMSNorm(cfg.n_heads * cfg.get_head_dim(), cfg.layer_norm_eps);
       k_norm_ = RMSNorm(cfg.get_n_kv_heads() * cfg.get_head_dim(), cfg.layer_norm_eps);
     }
+    // Register so they get serialized with the module hierarchy.
     register_module("q_norm", q_norm_.value());
     register_module("k_norm", k_norm_.value());
   }
+  // RoPE module is always created (gated at forward by rope_bufs != null).
   rope_ = RotaryEmbedding(cfg.get_head_dim(), cfg.rope_theta);
   register_module("rope", rope_.value());
 }

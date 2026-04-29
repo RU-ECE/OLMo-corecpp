@@ -1,4 +1,27 @@
 #pragma once
+/**
+ * include/olmo_cpp/train/callback.hpp
+ *
+ * The Callback abstract base class plus the CallbackManager that
+ * the train loop walks at every lifecycle hook (begin run, before
+ * step, after step, eval, checkpoint, end run). Concrete callbacks
+ * live in include/olmo_cpp/train/callbacks/all_callbacks.hpp.
+ *
+ * Same pattern as Keras / PyTorch Lightning callbacks: a way to add
+ * cross-cutting features (metric logging, gradient inspection, early
+ * stopping, GC, etc.) without growing the core train loop.
+ *
+ * --- Includes from this project ---
+ *   (none — torch + stdlib only.)
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - include/olmo_cpp/train/callbacks/all_callbacks.hpp : concrete
+ *     callbacks subclass Callback.
+ *   - src/train.cpp : walks the CallbackManager at each hook.
+ *
+ * --- Role in training pipeline ---
+ *   Optional cross-cutting plumbing.
+ */
 #include <torch/torch.h>
 #include <string>
 #include <vector>

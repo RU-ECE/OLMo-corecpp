@@ -1,3 +1,61 @@
+/**
+ * src/model/fused_attention.cpp
+ *
+ * ─── What "attention" is ────────────────────────────────────────────
+ *
+ * Self-attention is the operation that lets every token in the
+ * sequence look at every other token. Three projections of the same
+ * input compete:
+ *
+ *     Q = X · W_q    (queries:  "what am I looking for?")
+ *     K = X · W_k    (keys:     "what do I have to offer?")
+ *     V = X · W_v    (values:   "what should I broadcast if you pick me?")
+ *
+ * Then each query computes a softmax-weighted sum of values, where
+ * the weights are dot-products with all keys (scaled by 1/sqrt(d_k)
+ * for stability):
+ *
+ *     attn(Q, K, V) = softmax( Q K^T / sqrt(d_k) ) · V
+ *
+ * In multi-head attention you split D = head_dim · n_heads and run
+ * the operation n_heads times in parallel on different sub-vectors.
+ *
+ * GQA (Grouped-Query Attention): n_kv_heads < n_heads — Q has more
+ * heads than K/V. K and V are repeated across query-head groups.
+ * Saves KV cache memory at inference time with negligible quality loss.
+ *
+ * ─── What "fused" means here ────────────────────────────────────────
+ *
+ * Plain `Attention` (in attention.cpp) has THREE separate Linear
+ * layers for Q, K, V. Each is a separate matmul kernel launch. When
+ * the input is the same X for all three, you can concat their weight
+ * matrices into a single [D, q_size + 2·kv_size] Linear and do ONE
+ * matmul, then split the output. That's what FusedAttention does.
+ *
+ * The math is identical; the only difference is fewer launches and
+ * better memory locality. Net effect: a few percent faster training
+ * step on small models, more on large ones (where launch overhead
+ * dominates short kernels).
+ *
+ * After QKV: this file applies optional QK-RMSNorm (a stability
+ * trick — normalising Q and K before the dot product), then RoPE
+ * (rotary position embedding via the kernel in kernels/rope.cu),
+ * then ATen's scaled_dot_product_attention which itself dispatches
+ * to FlashAttention on CUDA.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/model/fused_attention.hpp : own class declaration.
+ *   - olmo_cpp/profiler.hpp              : ProfileScope around the
+ *                                           SDPA call when profile=1.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/model/fused_block.cpp: FusedTransformerBlock instantiates a
+ *     FusedAttention and calls forward each microbatch.
+ *
+ * --- Role in training pipeline ---
+ *   Half of every transformer block in the FusedTransformer variant.
+ *   The other half is the FFN (feed_forward.cpp).
+ */
 #include "olmo_cpp/model/fused_attention.hpp"
 #include "olmo_cpp/profiler.hpp"
 #include <ATen/ops/scaled_dot_product_attention.h>

@@ -1,4 +1,35 @@
 #pragma once
+/**
+ * include/olmo_cpp/model/lm_head.hpp
+ *
+ * ─── What the "LM head" is ──────────────────────────────────────────
+ *
+ * The very last operation of the transformer's forward pass turns
+ * the d_model-wide hidden vector for each position into a
+ * vocab_size-wide vector of "logits" — one score per possible next
+ * token. Softmax over those gives the next-token probability
+ * distribution.
+ *
+ *     logits = lm_head( final_norm( h ) )       // [B, S, vocab_size]
+ *
+ * `LMHead` is just an optional final RMSNorm followed by a Linear
+ * projection D -> vocab_size. The Linear has no bias by default
+ * (matches LLaMA / OLMo). Some configs tie the LM head's weight to
+ * the embedding matrix to save parameters; this implementation does
+ * NOT tie them (the lm_head has its own learnable W).
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/model/layer_norm.hpp : RMSNorm prefix.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/model/lm_head.cpp : implementation.
+ *   - src/model/transformer.cpp / fused_transformer.cpp : the LMHead
+ *     is the very last submodule in the forward path.
+ *
+ * --- Role in training pipeline ---
+ *   Foundational. One forward call per microbatch produces the
+ *   logits the loss is computed against.
+ */
 
 #include "olmo_cpp/model/layer_norm.hpp"
 #include <torch/torch.h>

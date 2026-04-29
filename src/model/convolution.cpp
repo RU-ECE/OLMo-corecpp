@@ -1,3 +1,29 @@
+/**
+ * src/model/convolution.cpp
+ *
+ * Causal depthwise 1-D convolution. Used as a pre-attention
+ * "shift register" in some research configurations to give the
+ * attention layer a bit of explicit local structure.
+ *
+ * "Causal" means a token can only see itself and earlier tokens —
+ * we left-pad by (kernel_size − 1) so the convolution doesn't peek
+ * at the future. "Depthwise" means each channel is convolved with
+ * its own filter and channels don't mix — this is much cheaper than
+ * a full Conv1d (groups=1). The intended use is purely local context
+ * mixing; the heavy cross-token mixing still happens in attention.
+ *
+ * Off by default; enabled with cfg.use_conv=1.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/model/convolution.hpp : CausalConv1d declaration.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/model/block_variants.cpp: some block topologies insert a
+ *     CausalConv1d before the attention sublayer.
+ *
+ * --- Role in training pipeline ---
+ *   Optional. Off in the quickstart conf.
+ */
 #include "olmo_cpp/model/convolution.hpp"
 
 namespace olmo_cpp {

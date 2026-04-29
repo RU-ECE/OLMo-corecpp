@@ -1,4 +1,31 @@
 #pragma once
+/**
+ * include/olmo_cpp/train/grad_scaler.hpp
+ *
+ * GradScaler declaration. In mixed-precision (FP16) training,
+ * gradients can be too small to represent in 16-bit float. The
+ * scaler multiplies the loss by a large factor S before backward,
+ * lifting the gradients into FP16's representable range, then
+ * divides them by S before the optimizer step.
+ *
+ * S is dynamic: auto-grows when training is calm, halves when an
+ * Inf/NaN appears. See src/train/grad_scaler.cpp for the longer
+ * pedagogical explanation.
+ *
+ * BF16 doesn't underflow as easily, so this is mostly a no-op for
+ * BF16 runs — use_grad_scaler=0 in the BF16 path.
+ *
+ * --- Includes from this project ---
+ *   (none — torch only.)
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/train/grad_scaler.cpp : implementation.
+ *   - src/train.cpp             : wraps loss.backward / optim.step
+ *                                  when train_cfg.use_grad_scaler=1.
+ *
+ * --- Role in training pipeline ---
+ *   FP16 plumbing. Off by default in the quickstart flow.
+ */
 
 #include <torch/torch.h>
 

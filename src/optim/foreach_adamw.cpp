@@ -1,3 +1,37 @@
+/**
+ * src/optim/foreach_adamw.cpp
+ *
+ * Batched AdamW. Implements the standard Loshchilov-Hutter update via
+ * _foreach_* fused tensor-list ops so the optimizer step is O(1) kernel
+ * launches in the number of parameters instead of O(N).
+ *
+ * Update (per parameter, per step):
+ *     p     ← (1 - lr*wd) * p              (decoupled weight decay first)
+ *     m     ← beta1 * m + (1 - beta1) * g
+ *     v     ← beta2 * v + (1 - beta2) * g^2
+ *     denom ← sqrt(v) + eps * sqrt(1-beta2^t)
+ *     p    -= (lr * sqrt(1-beta2^t) / (1 - beta1^t)) * m / denom
+ * The bias-correction factor sqrt(1-beta2^t) is folded into both step_size
+ * and eps to remove one launch.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/optim/foreach_adamw.hpp: declares ForeachAdamW, options, and
+ *     scratch-vector members reused here.
+ *
+ * --- ATen foreach ops ---
+ *   - _foreach_add / _foreach_mul / _foreach_addcmul / _foreach_addcdiv /
+ *     _foreach_sqrt: tensor-list versions of the elementwise ops; each
+ *     issues a single fused CUDA kernel that processes all tensors in the
+ *     list concurrently.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/train.cpp: instantiated when cfg.optimizer == "adamw" (default).
+ *
+ * --- Role in training pipeline ---
+ *   The default optimizer for OLMo C++ training. Constructed once after
+ *   model init by train_loop; .step() is called each microbatch after
+ *   backward + optional grad clip.
+ */
 #include "olmo_cpp/optim/foreach_adamw.hpp"
 #include <ATen/ops/_foreach_add.h>
 #include <ATen/ops/_foreach_mul.h>
@@ -10,17 +44,21 @@ namespace olmo_cpp {
 
 namespace {
 
-/// Per-parameter state for ForeachAdamW
+/// Per-parameter state for ForeachAdamW. Only the two moments live here;
+/// the step counter is global (step_count_) because the bias correction
+/// is identical for every parameter under AdamW.
 struct ForeachAdamWParamState
     : public torch::optim::OptimizerCloneableParamState<ForeachAdamWParamState> {
-  TORCH_ARG(torch::Tensor, exp_avg);
-  TORCH_ARG(torch::Tensor, exp_avg_sq);
+  TORCH_ARG(torch::Tensor, exp_avg);     ///< First moment m, same shape as param.
+  TORCH_ARG(torch::Tensor, exp_avg_sq);  ///< Second moment v, same shape as param.
 
+  /// Save state to a checkpoint archive.
   void serialize(torch::serialize::OutputArchive& archive) const override {
     if (exp_avg().defined()) archive.write("exp_avg", exp_avg());
     if (exp_avg_sq().defined()) archive.write("exp_avg_sq", exp_avg_sq());
   }
 
+  /// Load state from a checkpoint archive (tolerant of missing keys).
   void serialize(torch::serialize::InputArchive& archive) override {
     torch::Tensor t;
     if (archive.try_read("exp_avg", t)) exp_avg(t);
@@ -41,14 +79,19 @@ ForeachAdamW::ForeachAdamW(std::vector<torch::optim::OptimizerParamGroup> param_
           std::move(param_groups),
           std::make_unique<ForeachAdamWOptions>(defaults)) {}
 
+/// One batched AdamW update across all param groups.
 torch::Tensor ForeachAdamW::step(LossClosure closure) {
+  // Optimizer body runs without autograd tracking — none of these tensor
+  // mutations should appear in the autograd graph.
   torch::NoGradGuard no_grad;
   torch::Tensor loss = {};
   if (closure) {
+    // The optional closure may want gradients (re-running fwd+loss).
     at::AutoGradMode enable_grad(true);
     loss = closure();
   }
 
+  // Pre-increment so step_count_ holds the t value we are about to apply.
   step_count_++;
 
   // Collect all params, grads, and state tensors into parallel vectors

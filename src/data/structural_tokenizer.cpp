@@ -1,3 +1,32 @@
+/**
+ * src/data/structural_tokenizer.cpp
+ *
+ * ─── What a "structural tokenizer" is ───────────────────────────────
+ *
+ * A plain BPE tokenizer (bpe_tokenizer.cpp) just splits text into
+ * sub-word pieces and assigns each an integer id. The structural
+ * tokenizer wraps that with extra **role tags** that encode the
+ * syntactic role each token plays — noun, verb, punctuation, etc.
+ * Those role tags become an extra "stream" the model can attend to,
+ * which is what the DC-MRE multi-resolution embedding consumes (see
+ * src/nn/multi_res_embedding.cpp).
+ *
+ * Roles are derived from a lightweight set of heuristics over the
+ * token string (uppercase / digits / common stop-words / punctuation).
+ * Cheap to compute, no external dep on a real POS tagger.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/data/structural_tokenizer.hpp : declarations.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/nn/multi_res_embedding.cpp: queries roles at construction
+ *     time to populate the role-stream codebook.
+ *   - tools/prepare_data.cpp: optional augmentation when --structural
+ *     is passed.
+ *
+ * --- Role in training pipeline ---
+ *   Only used when DC-MRE is on (cfg.use_multi_res=1).
+ */
 #include "olmo_cpp/data/structural_tokenizer.hpp"
 
 #include <algorithm>

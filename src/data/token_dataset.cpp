@@ -1,3 +1,46 @@
+/**
+ * src/data/token_dataset.cpp
+ *
+ * ─── What a "token dataset" is ──────────────────────────────────────
+ *
+ * A language model's training data is just a giant 1-D array of
+ * integer token ids. For TinyStories with a GPT-2 BPE tokenizer
+ * that's roughly 600 million ints — about 1.2 GB in uint16. The
+ * model wants to see batches of sequences of length S, but those
+ * sequences are just contiguous chunks of the giant array.
+ *
+ * Storing the array on disk as a NumPy `.npy` file (produced by
+ * `prepare_data`) and **memory-mapping** it gives us:
+ *
+ *   1. zero-copy load — the kernel maps the file into virtual memory
+ *      so we don't read 1.2 GB up-front;
+ *   2. lazy, page-fault-driven loading;
+ *   3. shared between processes if multiple ranks point at the same
+ *      file.
+ *
+ * This file (`TokenDataset`) is exactly that thin wrapper. It owns
+ * the .npy load (via the vendored cnpy library), exposes batch
+ * accessors that the DataLoader iterates over, and optionally pins
+ * the entire array on the GPU when train_cfg.gpu_resident_data=1
+ * (saves the host->device copy on every batch).
+ *
+ * Supported dtypes for the .npy file: uint16 / uint32 / int32 / int64.
+ * Internally we always upcast to int64 because that's what
+ * torch::nn::Embedding's index path expects.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/data/token_dataset.hpp : the class declaration.
+ *   - olmo_cpp/seed.hpp               : RNG for shuffle order.
+ *   - third_party/cnpy/cnpy.h         : .npy reader.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/train.cpp: constructed once at the top of train(), then
+ *     stepped each microbatch inside the "data_loading" ProfileScope.
+ *
+ * --- Role in training pipeline ---
+ *   The source of every input batch. A misconfigured data_path here
+ *   is the most common reason a fresh setup fails to train.
+ */
 #include "olmo_cpp/data/token_dataset.hpp"
 #include "olmo_cpp/seed.hpp"
 #include <cnpy.h>

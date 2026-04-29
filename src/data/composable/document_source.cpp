@@ -1,3 +1,40 @@
+/**
+ * src/data/composable/document_source.cpp
+ *
+ * ─── What the "composable" data pipeline is ─────────────────────────
+ *
+ * The classic TokenDataset (in src/data/token_dataset.cpp) is fine
+ * for simple "one big corpus, fixed-length windows" training, but it
+ * couples three concerns: where the bytes come from (file), what
+ * counts as a "document" (boundary information), and how documents
+ * become training instances (windowing + packing).
+ *
+ * The "composable" pipeline splits those concerns into three abstract
+ * sources composed in series:
+ *
+ *   DocumentSource   → emits raw token streams with doc boundaries
+ *   InstanceSource   → consumes a DocumentSource, yields per-sample
+ *                       token sequences (with windowing / shuffling /
+ *                       cross-doc packing)
+ *   ComposableDataLoader → batches InstanceSource samples into tensors
+ *
+ * THIS file implements the topmost layer: DocumentSource. It reads
+ * the .npy token file plus an optional document-offsets file (a
+ * companion .npy where each entry is the start index of one document
+ * inside the token stream).
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/data/composable/document_source.hpp : declaration.
+ *   - third_party/cnpy/cnpy.h : .npy reader.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/data/composable/instance_source.cpp: instance sources wrap
+ *     a DocumentSource and slice it into training instances.
+ *
+ * --- Role in training pipeline ---
+ *   Lowest layer of the optional composable data path. Inactive in
+ *   the quickstart flow (which uses the simpler TokenDataset).
+ */
 #include "olmo_cpp/data/composable/document_source.hpp"
 #include <cnpy.h>
 #include <algorithm>

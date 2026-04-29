@@ -1,4 +1,35 @@
 #pragma once
+/**
+ * include/olmo_cpp/train/checkpoint.hpp
+ *
+ * Declares CheckpointManager + CheckpointMetadata. A checkpoint is a
+ * snapshot of every parameter and buffer in the model, plus enough
+ * metadata (step number, optimizer state) to resume training.
+ *
+ *   manager.save(tag, model, optimizer, meta)        // sync
+ *   manager.save_async(tag, model, optimizer, meta)  // returns future
+ *   manager.load(tag, model, optimizer)              // restores state
+ *   manager.latest()                                  // most recent tag
+ *   manager.prune(keep_n)                             // retention
+ *
+ * Each save writes per-rank shards to <base>/<tag>/rank_<R>/ with
+ * model parameters split into chunks (saved by a thread pool so
+ * wall-clock time tracks disk bandwidth, not single-threaded I/O).
+ *
+ * See src/train/checkpoint.cpp for the longer description.
+ *
+ * --- Includes from this project ---
+ *   (none — torch + stdlib only.)
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/train/checkpoint.cpp : implementation.
+ *   - src/train.cpp           : emplaces a manager when
+ *     checkpoint_dir is set, then calls .save() every
+ *     checkpoint_interval steps.
+ *
+ * --- Role in training pipeline ---
+ *   Periodic during training. Lets long runs survive crashes.
+ */
 
 #include <torch/torch.h>
 #include <string>

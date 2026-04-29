@@ -1,3 +1,31 @@
+/**
+ * src/data/vsl_dataset.cpp
+ *
+ * ─── What "VSL" stands for ──────────────────────────────────────────
+ *
+ * VSL = **V**ariable-**S**equence-**L**ength.  Plain TokenDataset
+ * always returns sequences of exactly `seq_len` tokens by chopping
+ * the corpus into uniform chunks.  That wastes capacity when natural
+ * documents are shorter than seq_len (you pad) or longer (you split
+ * across artificial boundaries that destroy mid-document context).
+ *
+ * VslDataset reads document boundaries from the corpus and produces
+ * variable-length sequences that respect document structure, then
+ * packs them into mini-batches via a length-bucketing scheme.
+ * Sequences of similar length are batched together so padding is
+ * minimal.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/data/vsl_dataset.hpp : VslDataset declaration.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/train.cpp: alternative to TokenDataset for runs that need
+ *     document-aware sequence packing. Off by default.
+ *
+ * --- Role in training pipeline ---
+ *   Used only by configurations that want document-respecting
+ *   training. The quickstart's TinyStories run uses TokenDataset.
+ */
 #include "olmo_cpp/data/vsl_dataset.hpp"
 #include <algorithm>
 #include <cmath>

@@ -1,3 +1,32 @@
+/**
+ * src/model/attention_config.cpp
+ *
+ * Thin shim around ATen's scaled_dot_product_attention. Centralises
+ * the choice of "attention backend" (sdpa, flash2, flash3,
+ * transformer_engine) so the various attention modules don't each
+ * duplicate the dispatch logic.
+ *
+ * "SDPA" = scaled-dot-product attention. ATen's sdpa op is itself a
+ * dispatcher that picks the fastest available implementation under
+ * the hood: FlashAttention-2 if the input shapes are supported and
+ * the GPU has the right tensor-core arch, mem-efficient attention
+ * otherwise, with a math-only fallback as the last resort. We just
+ * lean on that and pick a hint via the math/efficient/flash backend
+ * flags exposed at the global ATen context.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/model/attention_config.hpp : compute_attention() decl.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/model/attention.cpp / fused_attention.cpp:
+ *     compute_attention(q, k, v, is_causal, ...) is the call inside
+ *     the attention forward pass.
+ *
+ * --- Role in training pipeline ---
+ *   The dispatch boundary between "our attention module" and "the
+ *   actual SDPA kernel". On the 3060 quickstart the SDPA fallback
+ *   is mem-efficient; FlashAttention-2 needs Ada / Hopper.
+ */
 #include "olmo_cpp/model/attention_config.hpp"
 #include <ATen/ops/scaled_dot_product_attention.h>
 

@@ -1,3 +1,32 @@
+/**
+ * src/data/composable/data_loader.cpp
+ *
+ * Top layer of the composable data pipeline (see
+ * document_source.cpp's docblock for the full architecture).
+ *
+ * ComposableDataLoader takes an InstanceSource and assembles batches
+ * for the training loop:
+ *
+ *   - pulls `batch_size` instances from the underlying InstanceSource,
+ *   - delegates to a DataCollator to pack them into a tensor,
+ *   - moves the tensor to device (with optional pinned memory for
+ *     faster H2D copies).
+ *
+ * The interface mirrors what src/train.cpp expects from any data
+ * loader, so the composable path is a drop-in replacement for the
+ * simpler TokenDataset+sampler combo.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/data/composable/data_loader.hpp : declaration.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/train.cpp: instantiated when the configuration calls for
+ *     the composable pipeline.
+ *
+ * --- Role in training pipeline ---
+ *   Active only in the composable data path. The quickstart's flow
+ *   uses the simpler TokenDataset path.
+ */
 #include "olmo_cpp/data/composable/data_loader.hpp"
 #include <cstring>
 #include <stdexcept>

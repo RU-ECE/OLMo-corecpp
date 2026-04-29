@@ -1,3 +1,46 @@
+/**
+ * src/train/callbacks/all_callbacks.cpp
+ *
+ * ─── What "callbacks" are ───────────────────────────────────────────
+ *
+ * Callbacks are objects the train loop calls at well-defined moments
+ * (start of run, before microbatch, after backward, after step, end
+ * of run, etc.) so optional behaviour can be plugged in without
+ * cluttering the core loop. Same idea as Keras/Lightning callbacks.
+ *
+ * This file implements every callback shipped with the framework:
+ *
+ *   - **GradientStatsCallback** : every N steps, sample per-parameter
+ *     gradient norms and write them to a TSV file. Used for
+ *     diagnosing training instabilities (catastrophic NaN, exploding
+ *     gradients, vanishing gradients).
+ *
+ *   - **WandbCallback / TensorBoardCallback** : forward training
+ *     metrics to Weights & Biases or TensorBoard.
+ *
+ *   - **EarlyStopCallback** : abort training when validation loss
+ *     stops improving.
+ *
+ *   - **GoodbyeCallback** : log a final summary at run end.
+ *
+ *   - **GarbageCollectorCallback** : explicit GC every N steps to
+ *     keep CPU side memory bounded on long runs.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/train/callbacks/all_callbacks.hpp : decls of every
+ *     callback class.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/main.cpp: instantiates the GradientStatsCallback when
+ *     train_cfg.grad_stats_path is set, then passes it to
+ *     olmo_cpp::train(...).
+ *   - src/train.cpp: walks the callback list at every lifecycle hook.
+ *
+ * --- Role in training pipeline ---
+ *   Optional cross-cutting features. The core loop runs fine with
+ *   zero callbacks. The quickstart's conf doesn't enable any, so this
+ *   file is mostly inert during the demo run.
+ */
 #include "olmo_cpp/train/callbacks/all_callbacks.hpp"
 
 #include <algorithm>

@@ -1,4 +1,32 @@
 #pragma once
+/**
+ * include/olmo_cpp/model/rope.hpp
+ *
+ * Host-side RoPE. Owns:
+ *   - the precomputed cos/sin tables (RoPEBuffers struct), and
+ *   - the public apply(q, k) helper that calls into the fused
+ *     CUDA / SIMD kernels via get_backend().apply_rope_qk().
+ *
+ * The tables are computed ONCE at model construction from
+ * cfg.rope_theta + cfg.head_dim + max sequence length, possibly
+ * post-processed by a scaler from rope_scaling.hpp.
+ *
+ * For the math behind rotary position embeddings, see
+ * kernels/rope.cu's docblock — that's the most pedagogical
+ * description in the codebase.
+ *
+ * --- Includes from this project ---
+ *   (none — torch only.)
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/model/rope.cpp : implementation.
+ *   - src/model/attention.cpp / fused_attention.cpp : pull
+ *     RoPEBuffers from the parent model and apply them to Q and K
+ *     just before the SDPA call.
+ *
+ * --- Role in training pipeline ---
+ *   Foundational — every attention block needs this on every forward.
+ */
 
 #include <torch/torch.h>
 #include <optional>

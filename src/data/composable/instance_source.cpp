@@ -1,3 +1,30 @@
+/**
+ * src/data/composable/instance_source.cpp
+ *
+ * Middle layer of the composable data pipeline (see
+ * document_source.cpp's docblock for the full architecture). An
+ * InstanceSource consumes a DocumentSource and emits per-sample
+ * sequences ready to be batched, applying:
+ *
+ *   - windowing            (slice each document into seq_len chunks),
+ *   - cross-document packing (stitch short docs together to fill
+ *                              a window — saves padding),
+ *   - per-epoch shuffling.
+ *
+ * Several variants implement different windowing policies (fixed
+ * window, document-respecting, span-corrupt for masked-LM, etc.).
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/data/composable/instance_source.hpp : declaration.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/data/composable/data_loader.cpp: ComposableDataLoader wraps
+ *     an InstanceSource and produces batched tensors.
+ *
+ * --- Role in training pipeline ---
+ *   Active only in the composable data path. Inactive in the
+ *   quickstart's flow.
+ */
 #include "olmo_cpp/data/composable/instance_source.hpp"
 #include <algorithm>
 #include <numeric>

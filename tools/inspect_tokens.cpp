@@ -1,18 +1,53 @@
 /**
- * Token Stream Inspection Tool
+ * tools/inspect_tokens.cpp
  *
- * Visualizes how BPE tokenization works: shows pre-tokenization chunks,
- * token IDs, decoded tokens, and compression metrics.
+ * Single-tokenizer (GPT-2 BPE) introspection CLI. Given a string, a
+ * file, or a directory tree, it shows the GPT-2 pre-tokenization
+ * chunks, the token IDs, the decoded textual form of each token, and
+ * compression metrics (bytes/token, tokens/line, vocab utilization,
+ * top-50 most frequent tokens). Output is purely stdout — no files
+ * written.
  *
- * Usage:
+ * Examples:
+ *   # Single string
  *   ./build/inspect_tokens --text "for (int i = 0; i < n; i++)" \
  *     --vocab-file data/gpt2/vocab.json --merges-file data/gpt2/merges.txt
  *
+ *   # Single file with aggregate stats
  *   ./build/inspect_tokens --file src/train.cpp \
  *     --vocab-file data/gpt2/vocab.json --merges-file data/gpt2/merges.txt --stats
  *
+ *   # Whole directory tree, aggregate only
  *   ./build/inspect_tokens --dir data/tinystories_raw/ \
  *     --vocab-file data/gpt2/vocab.json --merges-file data/gpt2/merges.txt --stats
+ *
+ * --- Flags ---
+ *   --text <s>       inspect this exact string
+ *   --file <p>       inspect this single file
+ *   --dir <p>        recurse into directory; only aggregate stats printed
+ *   --vocab-file     GPT-2 vocab.json (REQUIRED)
+ *   --merges-file    GPT-2 merges.txt (REQUIRED)
+ *   --stats          print aggregate stats (always on for --dir)
+ *   --max-files <n>  cap on files when using --dir (default 100)
+ *
+ * --- Build target ---
+ *   inspect_tokens (CMakeLists.txt:557). Standalone executable — does
+ *   not link LibTorch. Compiles tools/inspect_tokens.cpp +
+ *   src/data/bpe_tokenizer.cpp directly. -O3 -march=native.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/data/bpe_tokenizer.hpp: GPT-2 BPE tokenizer used here.
+ *
+ * --- Reads / Writes ---
+ *   - reads:  vocab.json, merges.txt, plus whatever --text/--file/--dir
+ *             points at.
+ *   - writes: nothing — all output is stdout.
+ *
+ * --- Role in workflow ---
+ *   Diagnostic aid for sanity-checking tokenization behaviour before
+ *   running `prepare_data` or training. Especially useful when
+ *   debugging tokenizer regressions or evaluating BPE compression on
+ *   a new corpus.
  */
 
 #include "olmo_cpp/data/bpe_tokenizer.hpp"
@@ -28,6 +63,9 @@
 
 namespace fs = std::filesystem;
 
+/// Running aggregate of tokenization stats across one or many files.
+/// `token_freq` is used to compute vocabulary utilization and the
+/// "top-N most frequent tokens" table.
 struct CompressionStats {
   int64_t total_bytes = 0;
   int64_t total_tokens = 0;
@@ -43,6 +81,7 @@ struct CompressionStats {
   }
 };
 
+/// Read whole file into memory; empty string on open failure.
 static std::string read_file(const std::string& path) {
   std::ifstream f(path);
   if (!f) return "";
@@ -51,6 +90,10 @@ static std::string read_file(const std::string& path) {
   return ss.str();
 }
 
+/// Tokenize one piece of text. If `verbose` is true, dumps the
+/// pre-tokenized chunks, token IDs, decoded tokens, and bytes/token to
+/// stdout (capped at first 50 chunks/IDs to keep output readable).
+/// If `stats` is non-null, accumulates aggregates into it.
 static void inspect_text(olmo_cpp::BPETokenizer& tok, const std::string& text,
                           bool verbose, CompressionStats* stats) {
   auto chunks = tok.get_pre_tokenized_chunks(text);
@@ -119,6 +162,8 @@ static void inspect_text(olmo_cpp::BPETokenizer& tok, const std::string& text,
   }
 }
 
+/// Pretty-print the aggregate stats table: totals, ratios, vocab usage,
+/// and the top-50 token-frequency leaderboard.
 static void print_stats(const CompressionStats& stats, const olmo_cpp::BPETokenizer& tok) {
   std::cout << "\n=== Compression Statistics ===\n";
   std::cout << "  Files processed: " << stats.files_processed << "\n";
@@ -174,6 +219,10 @@ static void print_stats(const CompressionStats& stats, const olmo_cpp::BPETokeni
 }
 
 int main(int argc, char** argv) {
+  // -----------------------------------------------------------------
+  // Phase 1: parse CLI flags. Exactly one of --text/--file/--dir must
+  // be supplied; vocab-file and merges-file are always required.
+  // -----------------------------------------------------------------
   std::string text_input;
   std::string file_path;
   std::string dir_path;
@@ -220,6 +269,9 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  // -----------------------------------------------------------------
+  // Phase 2: load the GPT-2 BPE tokenizer once.
+  // -----------------------------------------------------------------
   olmo_cpp::BPETokenizer tok;
   if (!tok.load(vocab_file, merges_file)) {
     std::cerr << "Error: failed to load tokenizer from " << vocab_file << " + " << merges_file << "\n";
@@ -230,6 +282,9 @@ int main(int argc, char** argv) {
 
   CompressionStats stats;
 
+  // -----------------------------------------------------------------
+  // Phase 3: dispatch on input mode (--text / --file / --dir).
+  // -----------------------------------------------------------------
   if (!text_input.empty()) {
     inspect_text(tok, text_input, true, &stats);
     if (show_stats) print_stats(stats, tok);

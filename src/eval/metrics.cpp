@@ -1,3 +1,30 @@
+/**
+ * src/eval/metrics.cpp
+ *
+ * Standard language-model evaluation metrics.
+ *
+ *   - perplexity(ce_loss) = exp(ce_loss). Cross-entropy is the
+ *     average negative log-likelihood per token; perplexity is its
+ *     exponential and equals "the effective number of equally-likely
+ *     next-token choices the model is uncertain among". Lower is
+ *     better. A bigram baseline on English text gives perplexity
+ *     ~100; a well-trained 7B LM gets to ~5 on natural-language data.
+ *
+ *   - other metrics: accuracy, top-k accuracy, etc., depending on
+ *     the task. Computed from raw logits + labels.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/eval/metrics.hpp : metric function declarations.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/eval/lm_evaluator.cpp / evaluator.cpp: report perplexity
+ *     and accuracy after each eval pass.
+ *   - src/train.cpp: mid-training eval calls these to log progress.
+ *
+ * --- Role in training pipeline ---
+ *   Pure functions. Run during the periodic eval pass when
+ *   eval_data_path is set in the .conf.
+ */
 #include "olmo_cpp/eval/metrics.hpp"
 #include <cmath>
 

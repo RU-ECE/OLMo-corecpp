@@ -1,3 +1,28 @@
+/**
+ * src/data/bpe_tokenizer.cpp
+ *
+ * Implementation of the GPT-2 byte-level BPE tokenizer declared in
+ * include/olmo_cpp/data/bpe_tokenizer.hpp. The encoding pipeline is:
+ *
+ *   text -> pre_tokenize() -> chunks
+ *   for each chunk: byte->unicode mapping -> bpe_encode_chunk() -> ids
+ *
+ * The decoding pipeline reverses both steps: ids -> unicode token strings
+ * -> raw bytes via unicode_to_byte_.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/data/bpe_tokenizer.hpp: class declaration and member layout.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/data/structural_tokenizer.cpp: uses BPETokenizer as fallback.
+ *   - tools/prepare_data.cpp, tools/chat.cpp, tools/inspect_tokens.cpp.
+ *
+ * --- Role in training pipeline ---
+ *   Off-line tokenization (prepare_data) and inference-time decoding.
+ *   Not on the training-loop critical path: by the time training starts,
+ *   text has already been turned into a token .npy file.
+ */
+
 #include "olmo_cpp/data/bpe_tokenizer.hpp"
 #include <fstream>
 #include <sstream>
@@ -8,6 +33,9 @@
 #include <queue>
 #include <climits>
 
+// nlohmann/json is auto-fetched by CMake (see top-level CMakeLists.txt).
+// If unavailable at build time the `load()` path returns false and the
+// tokenizer can still be used for in-memory test cases.
 #ifdef HAS_NLOHMANN_JSON
 #include <nlohmann/json.hpp>
 #endif

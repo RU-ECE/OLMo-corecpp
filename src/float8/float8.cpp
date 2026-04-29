@@ -1,3 +1,42 @@
+/**
+ * src/float8/float8.cpp
+ *
+ * ─── What FP8 is ────────────────────────────────────────────────────
+ *
+ * FP8 = a family of 8-bit floating-point formats introduced for
+ * Hopper-class GPUs (sm_90+). 16-bit BF16 is half the memory of FP32;
+ * FP8 is half the memory of BF16 — so a Linear layer's weights and
+ * activations both shrink, and the matmul itself runs through
+ * Hopper's tensor cores at roughly 2x the BF16 rate.
+ *
+ * Two variants exist:
+ *   - **E4M3**: 1 sign bit, 4 exponent bits, 3 mantissa bits.
+ *               Wider mantissa, smaller dynamic range. Good for
+ *               activations (sit closer to zero).
+ *   - **E5M2**: 1 sign bit, 5 exponent bits, 2 mantissa bits.
+ *               Smaller mantissa, FP16-like dynamic range. Good for
+ *               gradients (tails matter more).
+ *
+ * Because FP8 has so few mantissa bits, naive use destroys accuracy.
+ * The trick is per-tensor (or per-block) **scaling**: divide the
+ * tensor by a runtime-tracked scale factor before casting to FP8 so
+ * the values land in the representable range, then multiply the
+ * matmul result by the inverse scale on the output. This file
+ * implements the scale-tracking + cast-and-back glue around cuBLASLt's
+ * FP8 matmul on Hopper, with a software fake-quant fallback elsewhere.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/float8/float8.hpp : Float8Linear + scale-tracking helpers.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/model/feed_forward.cpp / attention.cpp: when cfg.use_float8,
+ *     Linear modules are replaced with the Float8 variant declared in
+ *     the header.
+ *
+ * --- Role in training pipeline ---
+ *   Disabled by default and disabled on the 3060 (sm_86 has no native
+ *   FP8 hardware). Present here for parity with the H100 perf path.
+ */
 #include "olmo_cpp/float8/float8.hpp"
 #include <cmath>
 #include <algorithm>

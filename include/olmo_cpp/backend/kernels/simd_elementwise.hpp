@@ -1,5 +1,28 @@
 #pragma once
 
+/**
+ * include/olmo_cpp/backend/kernels/simd_elementwise.hpp
+ *
+ * Pure-C-style entry points for the CPU SIMD elementwise kernels. The
+ * three free functions all take raw float* pointers and dimensions —
+ * no std::vector, no torch::Tensor — so the SIMD code stays simple,
+ * inlinable, and free of LibTorch include dependencies. The .cpp file
+ * picks NEON, AVX2 or scalar fallback at compile time via macros.
+ *
+ * --- Includes from this project ---
+ *   - (none — leaf header)
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/backend/simd_backend.cpp: SIMDBackend::rms_norm,
+ *     SIMDBackend::silu_mul, SIMDBackend::apply_rope each unwrap their
+ *     torch::Tensor arguments and call the matching f32 kernel here.
+ *
+ * --- Role in training pipeline ---
+ *   The "fast inner loop" for the CPU path. Everything above this
+ *   layer is bookkeeping (shape checks, contiguity, fallback); the
+ *   actual FLOPs happen here.
+ */
+
 #include <cstdint>
 
 namespace olmo_cpp {

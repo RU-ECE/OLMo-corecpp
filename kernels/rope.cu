@@ -1,5 +1,88 @@
-// Fused RoPE CUDA kernels — FP32 and BF16
-// BF16: reads __nv_bfloat16, rotates in FP32, writes __nv_bfloat16
+/**
+ * kernels/rope.cu
+ *
+ * ─── What RoPE is ────────────────────────────────────────────────────
+ *
+ * "RoPE" = **Ro**tary **P**osition **E**mbedding (Su et al. 2021).
+ * It's how this transformer tells the attention mechanism *where* in
+ * the sequence each token sits.
+ *
+ * Older models used additive sinusoidal position embeddings: you
+ * compute a fixed vector for each position and add it to the token
+ * embedding before feeding it into the network.  RoPE takes a very
+ * different approach: it leaves the token embeddings alone and instead
+ * **rotates** the query and key vectors in attention by an angle that
+ * depends on the token's position.
+ *
+ * Concretely: pair up the head_dim D into D/2 disjoint 2-D pairs
+ * (x_0, x_{D/2}), (x_1, x_{D/2+1}), ... and rotate each pair by an
+ * angle theta_p = position * base^{-2j/D}, where j indexes the pair.
+ * In matrix form, for one pair:
+ *
+ *     [ x'_a ]   [  cos θ   -sin θ ] [ x_a ]
+ *     [ x'_b ] = [  sin θ    cos θ ] [ x_b ]
+ *
+ * Each pair is rotated by a different frequency — high-frequency pairs
+ * carry fine positional information, low-frequency pairs carry coarse
+ * sequence-position information.
+ *
+ * Why this is nice:
+ *   - The dot product Q·K depends only on the *relative* offset
+ *     between the two tokens, not their absolute positions. That's
+ *     exactly what attention should care about.
+ *   - It extrapolates to longer sequences than were seen at training
+ *     better than additive position embeddings, especially with the
+ *     scaling tricks in src/model/rope_scaling.cpp (YaRN, ABF, etc.).
+ *
+ * The cos/sin tables are precomputed once in src/model/rope.cpp and
+ * passed in as `cos_buf` / `sin_buf`.  This kernel just consumes them.
+ *
+ * ─── How the in-place rotation is implemented here ───────────────────
+ *
+ * Reading the kernel body it looks weird: we do
+ *
+ *     if col < D/2:  x_rot = -x[row, col + D/2]
+ *     else:          x_rot =  x[row, col - D/2]
+ *     out[col] = x[col]*cos[col] + x_rot * sin[col]
+ *
+ * This is the standard "interleaved-pair" formulation.  Splitting the
+ * D-dim vector into a "first half" and "second half", you can show
+ * that (x_a, x_b) -> (x_a cos - x_b sin, x_a sin + x_b cos) is
+ * equivalent to writing each output element as
+ *     out_i = x_i * cos_i + rot_i * sin_i
+ * where rot_i is "the partner element with a sign depending on which
+ * half of the vector you're in".  This avoids the conditional pair
+ * indexing you'd otherwise need.
+ *
+ * ─── Launch geometry ─────────────────────────────────────────────────
+ *
+ * One thread per element (Q is shape [B*S*H, D]).  Grid-stride loop so
+ * the same kernel handles small sequences and 32k-context sequences.
+ * The "qk" variant fuses Q and K into the same launch — saves the
+ * second kernel launch's overhead, which can dominate for short seqs.
+ *
+ * ─── Precision ───────────────────────────────────────────────────────
+ *
+ * BF16 inputs are upcast to FP32 for the trig multiplies because
+ * sin/cos of tiny angles in BF16 carry ~7 mantissa bits — enough to
+ * hurt long-context attention accuracy.  Outputs are written back as
+ * BF16 so the dtype contract with downstream attention is preserved.
+ *
+ * --- Includes from this project ---
+ *   (none — pure CUDA kernel.)
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/backend/cuda_backend.cpp: CUDABackend::apply_rope() and
+ *     ::apply_rope_qk() forward to these implementations.
+ *   - src/model/attention.cpp / fused_attention.cpp:
+ *     get_backend().apply_rope(q, k, ...) is called right before the
+ *     SDPA call inside every attention block.
+ *
+ * --- Role in training pipeline ---
+ *   Q and K each get one RoPE invocation per attention block per
+ *   microbatch. Fusing the rotation into a single kernel halves the
+ *   memory traffic compared to ATen's "two multiplies + an add" recipe.
+ */
 #include <torch/torch.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
@@ -7,34 +90,47 @@
 
 namespace {
 
-// ---- FP32 single-tensor RoPE ----
+// ---- FP32 single-tensor RoPE -----------------------------------------
+//
+// Treat the input as a flat array of shape [..., D] where D is head_dim
+// (always even). For each element at column `col`, find its pair
+// partner at col±D/2, and apply the 2-D rotation matrix entry-by-entry.
 
 __global__ void apply_rope_f32_kernel(
-    const float* __restrict__ x,
-    const float* __restrict__ cos_buf,
-    const float* __restrict__ sin_buf,
-    float* __restrict__ out,
-    int64_t total_elements,
-    int64_t dim) {
-  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const float* __restrict__ x,         // [..., D] queries or keys, contiguous
+    const float* __restrict__ cos_buf,   // [D]   precomputed cosines
+    const float* __restrict__ sin_buf,   // [D]   precomputed sines
+    float* __restrict__ out,             // [..., D] rotated output
+    int64_t total_elements,              // numel(x)
+    int64_t dim) {                       // D (head_dim)
+  int64_t idx    = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-  int64_t half = dim / 2;
+  int64_t half   = dim / 2;              // boundary between "first half" and "second half"
 
+  // Grid-stride loop: every thread processes one element per iteration.
   for (int64_t i = idx; i < total_elements; i += stride) {
-    int64_t col = i % dim;
-    int64_t row = i / dim;
+    int64_t col = i % dim;     // position within the head-dim
+    int64_t row = i / dim;     // which (batch, seq, head) row we're in
     float x_val = x[i];
     float x_rot;
+    // Find the rotation partner. The sign flip in the "first half"
+    // branch is exactly the -sin term of the 2x2 rotation matrix.
     if (col < half) {
       x_rot = -x[row * dim + col + half];
     } else {
       x_rot = x[row * dim + col - half];
     }
+    // Apply the rotation.  cos_buf[col] and sin_buf[col] together
+    // encode the position-dependent angle for this dim slot.
     out[i] = x_val * cos_buf[col] + x_rot * sin_buf[col];
   }
 }
 
-// ---- BF16 single-tensor RoPE with FP32 compute ----
+// ---- BF16 single-tensor RoPE with FP32 compute -----------------------
+//
+// Same algorithm as the FP32 path, but inputs/outputs are 16-bit and
+// the trig multiplies happen in FP32 to keep the cos/sin precision.
+// __bfloat162float / __float2bfloat16 are single-PTX-op intrinsics.
 
 __global__ void apply_rope_bf16_kernel(
     const __nv_bfloat16* __restrict__ x,
@@ -63,7 +159,16 @@ __global__ void apply_rope_bf16_kernel(
   }
 }
 
-// ---- FP32 fused Q+K RoPE ----
+// ---- FP32 fused Q+K RoPE -------------------------------------------
+//
+// Q and K both need RoPE before being fed to attention.  Instead of
+// launching two kernels we issue one whose total iteration count is
+// q_total + k_total. The first q_total iterations process Q; the rest
+// process K. Halves the launch overhead — especially noticeable for
+// short sequences where each kernel is microseconds.
+//
+// Q and K may have DIFFERENT cos/sin buffers when GQA (grouped-query
+// attention) is in use with different scaling factors per stream.
 
 __global__ void apply_rope_qk_f32_kernel(
     const float* __restrict__ q,

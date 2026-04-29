@@ -1,4 +1,29 @@
 #pragma once
+/**
+ * include/olmo_cpp/train/callbacks/all_callbacks.hpp
+ *
+ * Declarations for every concrete Callback in the framework:
+ *
+ *   - GradientStatsCallback   : per-parameter gradient norm logger.
+ *   - WandbCallback           : streams metrics to Weights & Biases.
+ *   - TensorBoardCallback     : streams metrics to TensorBoard.
+ *   - EarlyStopCallback       : aborts when val loss stops improving.
+ *   - GoodbyeCallback         : final summary at run end.
+ *   - GarbageCollectorCallback: periodic explicit GC.
+ *
+ * See src/train/callbacks/all_callbacks.cpp for the implementations
+ * and the longer pedagogical writeup of what callbacks are.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/train/callback.hpp : the base Callback type.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/main.cpp : optionally instantiates GradientStatsCallback.
+ *   - src/train/callbacks/all_callbacks.cpp : implementations.
+ *
+ * --- Role in training pipeline ---
+ *   Optional. Off by default in the quickstart flow.
+ */
 #include "olmo_cpp/train/callback.hpp"
 #include <fstream>
 #include <deque>

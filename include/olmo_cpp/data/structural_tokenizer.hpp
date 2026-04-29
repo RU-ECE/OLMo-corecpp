@@ -1,5 +1,30 @@
 #pragma once
 
+/**
+ * include/olmo_cpp/data/structural_tokenizer.hpp
+ *
+ * Public interface for the *Structural* tokenizer — an experimental
+ * tokenizer that segments code/prose into (1) structural pattern templates,
+ * (2) identifier atoms (camelCase / snake_case decomposed), (3) numeric
+ * atoms, and (4) a BPE fallback. It builds a 61002-entry vocabulary on top
+ * of stock GPT-2 BPE so the BPE id space is preserved unchanged for
+ * downstream model embedding sharing.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/data/bpe_tokenizer.hpp: embedded BPETokenizer used for the
+ *     fallback path and for the [0, 50000) id range.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - tools/mine_patterns.cpp: trains the patterns the tokenizer consumes.
+ *   - tools/inspect_tokens.cpp / tools/benchmark_tokenizer.cpp: stats &
+ *     side-by-side comparisons against pure BPE.
+ *
+ * --- Role in training pipeline ---
+ *   Optional alternative to BPETokenizer at prepare_data time. Aim is to
+ *   compress code-heavy corpora more aggressively (more bytes per token)
+ *   without breaking the model's existing BPE-id embedding table.
+ */
+
 #include "olmo_cpp/data/bpe_tokenizer.hpp"
 
 #include <cstdint>

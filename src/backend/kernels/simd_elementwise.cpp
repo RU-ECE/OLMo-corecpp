@@ -1,3 +1,41 @@
+/**
+ * src/backend/kernels/simd_elementwise.cpp
+ *
+ * ─── What this file is ──────────────────────────────────────────────
+ *
+ * Hand-vectorised CPU implementations of the same fused ops the .cu
+ * kernels provide on GPU: rms_norm, silu_mul, apply_rope. The
+ * algorithms are identical (RMSNorm, SwiGLU, RoPE — see the .cu
+ * docblocks for the math); only the parallelisation primitive differs.
+ *
+ * On a CUDA host you have thousands of threads and warp shuffles. On
+ * a CPU you have ONE core's vector register file. So instead of a
+ * grid of CUDA blocks each with hundreds of threads, here we have a
+ * scalar outer loop and an inner SIMD loop that processes 4/8/16
+ * floats per iteration.
+ *
+ * The host SIMD ISA is detected at compile time:
+ *
+ *   __ARM_NEON  -> 4-wide float NEON       (Apple Silicon, ARM Linux)
+ *   __AVX512F__ -> 16-wide float AVX-512   (Skylake-X / EPYC server)
+ *   __AVX2__    -> 8-wide float AVX2       (most x86 desktops since 2013)
+ *   else        -> scalar fallback         (correct, just slow)
+ *
+ * Each kernel processes the contiguous flat layout as 1D and assumes
+ * the caller already verified contiguity + dtype.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/backend/kernels/simd_elementwise.hpp : kernel decls.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/backend/simd_backend.cpp: SIMDBackend dispatches its
+ *     IBackend methods to these free functions when can_use_simd()
+ *     returns true.
+ *
+ * --- Role in training pipeline ---
+ *   The CPU equivalent of the .cu kernels. On the 3060 quickstart
+ *   these never run because CUDABackend is installed instead.
+ */
 #include "olmo_cpp/backend/kernels/simd_elementwise.hpp"
 
 #include <cmath>

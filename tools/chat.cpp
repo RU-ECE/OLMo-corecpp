@@ -1,24 +1,61 @@
 /**
- * Interactive CLI chat with a trained OLMo model.
+ * tools/chat.cpp
  *
- * Usage:
- *   ./build/chat --checkpoint checkpoints/125M.pt --config configs/olmo2_125M.json \
- *     --vocab-file data/gpt2/vocab.json --merges-file data/gpt2/merges.txt
+ * Interactive CLI for sampling from a trained OLMo C++ model. Loads the
+ * Transformer + tokenizer, then in a REPL loop reads "You:" prompts on
+ * stdin, encodes them, runs autoregressive decoding (with optional KV
+ * cache and MTP speculative decoding), and streams decoded tokens to
+ * stdout as they are generated. Per-turn it also prints a stats line
+ * with tokens/sec. No files are written.
  *
- * Options:
- *   --checkpoint   Model checkpoint (.pt)
- *   --config       Model config JSON
- *   --vocab-file   GPT-2 vocab.json
- *   --merges-file  GPT-2 merges.txt
- *   --device       mps, cpu, or cuda (default: auto)
- *   --max-tokens   Max tokens to generate (default: 128)
- *   --temperature  Sampling temperature (default: 0.8)
- *   --top-k        Top-k sampling (default: 50, 0 = disabled)
- *   --top-p        Top-p / nucleus sampling (default: 0.9, 1.0 = disabled)
- *   --repetition-penalty  Repetition penalty (default: 1.1, 1.0 = disabled)
- *   --legacy-decode       Decode token 33 as space (for checkpoints trained with old tokenizer)
- *   --no-kv-cache         Disable KV cache (slower but avoids MPS memory issues on Apple Silicon)
- *   --no-speculative      Disable MTP speculative decoding even if model has MTP heads
+ * Example:
+ *   ./build/chat --checkpoint checkpoints/125M.pt \
+ *                --config configs/olmo2_125M.json \
+ *                --vocab-file data/gpt2/vocab.json \
+ *                --merges-file data/gpt2/merges.txt
+ *
+ * --- Flags ---
+ *   --checkpoint            torch::save'd .pt file produced by training
+ *   --config                JSON config used to build the model topology
+ *   --vocab-file            GPT-2 vocab.json
+ *   --merges-file           GPT-2 merges.txt
+ *   --structural-config     optional structural tokenizer config dir
+ *   --device                mps | cuda | cpu (default: auto-detect)
+ *   --max-tokens            cap on generated tokens per turn (default 128)
+ *   --temperature           sampling temperature; <=0 means greedy (0.8)
+ *   --top-k                 top-k cutoff, 0 disables (default 50)
+ *   --top-p                 nucleus sampling cutoff, 1.0 disables (0.9)
+ *   --repetition-penalty    >1.0 penalises tokens already in context (1.1)
+ *   --legacy-decode         decode token 33 as space (older tokenizer)
+ *   --no-kv-cache           force full-context recompute every step
+ *   --no-speculative        disable MTP speculative decoding path
+ *
+ * --- Build target ---
+ *   chat (CMakeLists.txt:517). Links the static `olmo_cpp` library
+ *   (model + tokenizer + backends), LibTorch, and nlohmann/json.
+ *   Compiled with -O3 -march=native; HAS_NLOHMANN_JSON is defined when
+ *   JSON support was found at configure time (required to load configs).
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/config.hpp               : load_config_from_json()
+ *   - olmo_cpp/model/transformer.hpp    : Transformer module class
+ *   - olmo_cpp/model/kv_cache.hpp       : per-layer KV cache + snapshot/rollback
+ *   - olmo_cpp/backend/cuda_graph.hpp   : CUDA graph capture (future use here)
+ *   - olmo_cpp/data/bpe_tokenizer.hpp   : GPT-2 BPE
+ *   - olmo_cpp/data/structural_tokenizer.hpp : optional structural tokenizer
+ *   - olmo_cpp/backend/cuda_backend.hpp : enable fused CUDA kernels on GPU
+ *   - olmo_cpp/backend/simd_backend.hpp : enable SIMD CPU kernels on CPU
+ *
+ * --- Reads / Writes ---
+ *   - reads:  checkpoint .pt, config .json, vocab.json, merges.txt,
+ *             optional structural-config dir
+ *   - writes: nothing — generation is streamed to stdout.
+ *
+ * --- Role in workflow ---
+ *   Used after training (`olmo_train conf/...`) to qualitatively eyeball
+ *   model behaviour and benchmark inference throughput. With MTP heads
+ *   enabled in the config, this is also where the speculative decoding
+ *   acceptance rate is observed.
  */
 
 #include "olmo_cpp/config.hpp"
@@ -46,6 +83,9 @@
 
 namespace {
 
+/// Resolve the runtime device given a user preference string.
+/// Falls through to CPU if MPS/CUDA was requested but isn't available.
+/// On Apple Silicon "metal" is treated as an alias for "mps".
 torch::Device select_device(const std::string& preferred) {
   if (preferred == "mps" || preferred == "metal") {
 #ifdef __APPLE__
@@ -281,6 +321,9 @@ int64_t speculative_decode_step(
 }  // namespace
 
 int main(int argc, char** argv) {
+  // -----------------------------------------------------------------
+  // Phase 1: parse CLI flags. Defaults below match the docblock above.
+  // -----------------------------------------------------------------
   std::string checkpoint_path, config_path, vocab_path, merges_path;
   std::string device_pref = "auto";
   int64_t max_tokens = 128;
@@ -327,6 +370,9 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  // -----------------------------------------------------------------
+  // Phase 2: pick a device. "auto" prefers GPU on each platform.
+  // -----------------------------------------------------------------
   if (device_pref == "auto") {
 #ifdef __APPLE__
     device_pref = torch::mps::is_available() ? "mps" : "cpu";
@@ -337,7 +383,8 @@ int main(int argc, char** argv) {
 
   auto device = select_device(device_pref);
 
-  // Activate optimal backend for device
+  // Switch the IBackend implementation in olmo_cpp so model code dispatches
+  // to fused CUDA kernels (GPU) or vectorized SIMD kernels (CPU).
   if (device.is_cuda()) {
     olmo_cpp::use_cuda_backend();
   } else if (device.is_cpu()) {
@@ -354,6 +401,10 @@ int main(int argc, char** argv) {
 
   try {
 #ifdef HAS_NLOHMANN_JSON
+    // -----------------------------------------------------------------
+    // Phase 3: build the model from JSON config, load weights, move to
+    // the chosen device, and switch into eval mode (disables dropout).
+    // -----------------------------------------------------------------
     auto cfg = olmo_cpp::load_config_from_json(config_path);
     cfg.validate();
 
@@ -410,6 +461,9 @@ int main(int argc, char** argv) {
     };
     auto& tokenizer = bpe_tokenizer;  // for eos_id() access
 
+    // -----------------------------------------------------------------
+    // Phase 4: REPL loop — read prompt, generate response, repeat.
+    // -----------------------------------------------------------------
     std::mt19937 rng(std::random_device{}());
     std::cout << "OLMo Chat (type 'quit' to exit)\n" << std::endl;
 
@@ -565,6 +619,9 @@ int main(int argc, char** argv) {
 #endif
     return 0;
   } catch (const std::exception& e) {
+    // Phase 5: surface any LibTorch / IO / config error with a clear
+    // "Error:" prefix instead of letting the binary terminate via a
+    // raw uncaught exception.
     std::cerr << "Error: " << e.what() << std::endl;
     return 1;
   }

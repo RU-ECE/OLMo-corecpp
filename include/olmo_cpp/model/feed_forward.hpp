@@ -1,4 +1,35 @@
 #pragma once
+/**
+ * include/olmo_cpp/model/feed_forward.hpp
+ *
+ * Declaration of the SwiGLU FeedForward sublayer used inside every
+ * transformer block. SwiGLU forward:
+ *
+ *     gate = W1 x        (D -> H)
+ *     up   = W3 x        (D -> H, separate matrix)
+ *     y    = silu(gate) ⊙ up        (elementwise gated activation)
+ *     out  = W2 y        (H -> D)
+ *
+ * silu(z) = z · sigmoid(z). See kernels/silu_mul.cu for a full
+ * pedagogical writeup.
+ *
+ * The "fused" path concatenates W1 and W3 into a single 2H-wide
+ * weight matrix so there's a single matmul launch instead of two —
+ * ~constant launch-overhead win.
+ *
+ * --- Includes from this project ---
+ *   (none — torch only.)
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/model/feed_forward.cpp : implementation.
+ *   - src/model/block.cpp / fused_block.cpp / block_variants.cpp :
+ *     instantiates a FeedForward as one of the two sublayers in
+ *     every transformer block.
+ *
+ * --- Role in training pipeline ---
+ *   Foundational. Together with attention, this is most of the FLOPs
+ *   in every transformer forward pass.
+ */
 
 #include <torch/torch.h>
 

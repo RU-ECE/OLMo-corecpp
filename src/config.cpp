@@ -1,3 +1,29 @@
+/**
+ * src/config.cpp
+ *
+ * Implements the non-trivial parts of TransformerConfig that don't fit
+ * cleanly in the header:
+ *   - validate(): sanity-check every field combination (GQA divisibility,
+ *     MoE expert counts, RoPE scaling positivity, etc.).
+ *   - load_config_from_json(): build a TransformerConfig from a JSON
+ *     description. Used to interoperate with the upstream OLMo-core
+ *     Python repo, where configs are JSON.
+ *   - olmo2_7b_config(): canonical 7B preset for benchmarking against
+ *     OLMo-2 reference numbers. Used by run_7B.sh and the H100 conf.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/config.hpp : TransformerConfig struct + free functions.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/main.cpp: cfg.validate() right after parsing the .conf file
+ *     (so we fail fast on bad combinations before allocating GPU memory).
+ *   - tools/dump_embeddings.cpp: same — validates after loading the .conf.
+ *   - any benchmark binary that wants the OLMo-2 7B canonical shape.
+ *
+ * --- Role in training pipeline ---
+ *   Pure POD plumbing. No model state lives here — this file simply
+ *   defines the rules for what makes a valid TransformerConfig.
+ */
 #include "olmo_cpp/config.hpp"
 #include <stdexcept>
 #include <fstream>

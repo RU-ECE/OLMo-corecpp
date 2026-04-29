@@ -1,3 +1,32 @@
+/**
+ * src/data/collator.cpp
+ *
+ * ─── What a "collator" does ─────────────────────────────────────────
+ *
+ * A dataset usually returns one sample at a time. The model wants a
+ * batch — that is, several samples stacked into a single tensor of
+ * shape [batch_size, seq_len]. The collator is the function that
+ * does this packing. Its job is non-trivial because samples can have
+ * different lengths and need to be padded, and you have to decide:
+ *
+ *   - which token id is the "pad" token,
+ *   - whether to pad on the left or the right (causal LMs usually
+ *     left-pad for generation, right-pad for training),
+ *   - whether to truncate over-long samples or refuse them.
+ *
+ * DataCollator centralises all that.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/data/collator.hpp : DataCollator declaration.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/data/composable/data_loader.cpp: ComposableDataLoader uses
+ *     a DataCollator to assemble each batch.
+ *
+ * --- Role in training pipeline ---
+ *   Sits between the per-sample data source and the per-batch
+ *   training step.
+ */
 #include "olmo_cpp/data/collator.hpp"
 #include <algorithm>
 #include <stdexcept>

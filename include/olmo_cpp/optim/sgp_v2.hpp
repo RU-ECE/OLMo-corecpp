@@ -1,4 +1,21 @@
 #pragma once
+/**
+ * include/olmo_cpp/optim/sgp_v2.hpp
+ *
+ * Header for the v2 variant of Speculative Gradient Prediction.
+ * Differences vs v1 (sgp.hpp): tighter rejection criterion, predictor
+ * reused across more parameter groups. See src/optim/sgp_v2.cpp.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/optim/sgp.hpp : shared interfaces / state types.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/optim/sgp_v2.cpp : implementation.
+ *   - src/train.cpp        : opt-in wrap when sgp=1 + sgp_version=2.
+ *
+ * --- Role in training pipeline ---
+ *   Optional wall-clock optimisation. Off in the quickstart flow.
+ */
 #include "olmo_cpp/optim/sgp.hpp"
 #include <torch/torch.h>
 #include <vector>

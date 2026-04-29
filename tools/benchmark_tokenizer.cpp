@@ -1,15 +1,47 @@
 /**
- * Tokenizer Benchmark Tool
+ * tools/benchmark_tokenizer.cpp
  *
- * Compares BPE vs Structural tokenization on compression, speed, and
- * vocabulary utilization across code, prose, and data files.
+ * CLI that benchmarks two tokenizers head-to-head on a real corpus:
+ *   1. GPT-2 BPE                — the reference baseline.
+ *   2. Structural tokenizer     — this project's pattern-aware tokenizer
+ *                                 that emits "structural" tokens for
+ *                                 frequent code/prose snippets.
+ * For each tokenizer it measures:
+ *   - bytes/token (compression)
+ *   - tokens/KB
+ *   - vocabulary utilization (unique IDs seen / vocab size)
+ *   - encode speed in MB/s
+ * It also prints a per-domain (code/prose/data) comparison so you can see
+ * where the structural tokenizer wins or loses. Pure stdout — no files
+ * written to disk.
  *
- * Usage:
+ * Example:
  *   ./build/benchmark_tokenizer \
  *     --bpe-vocab data/gpt2/vocab.json --bpe-merges data/gpt2/merges.txt \
  *     --structural-config data/structural_tokenizer/ \
  *     --corpus src/ \
  *     --corpus data/tinystories_raw/
+ *
+ * --- Build target ---
+ *   benchmark_tokenizer (CMakeLists.txt:580). Standalone executable —
+ *   does NOT link the full `olmo_cpp` library or LibTorch. It directly
+ *   compiles `src/data/bpe_tokenizer.cpp` and
+ *   `src/data/structural_tokenizer.cpp`. Compiled with -O3 -march=native.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/data/bpe_tokenizer.hpp:        GPT-2 BPE encoder/decoder
+ *   - olmo_cpp/data/structural_tokenizer.hpp: pattern-aware tokenizer
+ *
+ * --- Reads / Writes ---
+ *   - reads:  vocab.json, merges.txt, structural-config dir, every file
+ *             under each --corpus dir (with allowed extensions, <=1 MB)
+ *   - writes: nothing to disk; results go to stdout.
+ *
+ * --- Role in workflow ---
+ *   Used to evaluate the structural tokenizer before deciding whether
+ *   to switch the training pipeline over from raw BPE. Run after
+ *   `mine_patterns` has produced a structural tokenizer config; before
+ *   `prepare_data --structural-config ...`.
  */
 
 #include "olmo_cpp/data/bpe_tokenizer.hpp"
@@ -30,6 +62,9 @@
 
 namespace fs = std::filesystem;
 
+/// Slurp a whole file into a std::string. Returns "" if the file cannot
+/// be opened (so callers should treat empty content as "skip"). Uses an
+/// ostringstream to avoid hand-managing the buffer.
 static std::string read_file(const std::string& path) {
   std::ifstream f(path);
   if (!f) return "";
@@ -38,6 +73,9 @@ static std::string read_file(const std::string& path) {
   return ss.str();
 }
 
+/// One aggregated row of stats per tokenizer (or per domain). Counters
+/// accumulate across many files; helper methods derive the final metrics
+/// (bytes/token, vocab utilization, encode throughput).
 struct BenchResult {
   std::string name;
   int64_t total_bytes = 0;
@@ -66,6 +104,10 @@ struct BenchResult {
   }
 };
 
+/// Walk every --corpus directory recursively and collect candidate files
+/// for the benchmark. Filters: must be a regular file, extension must be
+/// in the whitelist (text/code/data formats), and size <= 1 MB so a few
+/// huge dumps cannot dominate the result. Stops at `max_files` total.
 static std::vector<std::string> collect_files(const std::vector<std::string>& dirs, int max_files) {
   static const std::set<std::string> valid_exts = {
     ".txt", ".py", ".c", ".cpp", ".h", ".hpp", ".cc",
@@ -89,6 +131,15 @@ static std::vector<std::string> collect_files(const std::vector<std::string>& di
 }
 
 int main(int argc, char** argv) {
+  // -----------------------------------------------------------------
+  // Phase 1: parse CLI flags.
+  //   --bpe-vocab/-merges:      GPT-2 BPE inputs (REQUIRED).
+  //   --structural-config:      directory describing structural tokenizer
+  //                             (optional; if absent we benchmark BPE only).
+  //   --corpus:                 may be passed multiple times to merge dirs.
+  //   --max-files:              cap on total files scanned.
+  //   --verbose/-v:             print per-file progress.
+  // -----------------------------------------------------------------
   std::string bpe_vocab, bpe_merges, structural_config;
   std::vector<std::string> corpus_dirs;
   int max_files = 500;
@@ -123,7 +174,12 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  // Load tokenizers
+  // -----------------------------------------------------------------
+  // Phase 2: load tokenizers.
+  // The structural tokenizer internally uses BPE as a fallback for any
+  // text it cannot match against a structural pattern, so it needs the
+  // same vocab/merges files passed to it.
+  // -----------------------------------------------------------------
   olmo_cpp::BPETokenizer bpe;
   if (!bpe.load(bpe_vocab, bpe_merges)) {
     std::cerr << "Error: failed to load BPE tokenizer\n";
@@ -139,7 +195,9 @@ int main(int argc, char** argv) {
     }
   }
 
-  // Collect files
+  // -----------------------------------------------------------------
+  // Phase 3: collect candidate files from the corpus dirs.
+  // -----------------------------------------------------------------
   auto files = collect_files(corpus_dirs, max_files);
   std::cout << "Collected " << files.size() << " files from " << corpus_dirs.size() << " directories\n\n";
 
@@ -148,6 +206,11 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  // -----------------------------------------------------------------
+  // Phase 4: run both tokenizers over every file and accumulate stats.
+  // Two top-level totals (BPE / Structural) plus per-domain breakdowns
+  // keyed on extension class (code / prose / data).
+  // -----------------------------------------------------------------
   BenchResult bpe_result;
   bpe_result.name = "BPE (GPT-2)";
   bpe_result.vocab_size = bpe.vocab_size();
@@ -177,14 +240,17 @@ int main(int argc, char** argv) {
 
     int64_t bytes = static_cast<int64_t>(content.size());
 
-    // BPE encoding
+    // -- BPE timing/encoding for this file. We measure wall-clock around
+    //    the encode() call only, not the file read, to keep the MB/s
+    //    metric meaningful.
     {
       auto t0 = std::chrono::high_resolution_clock::now();
       auto ids = bpe.encode(content);
       auto t1 = std::chrono::high_resolution_clock::now();
       double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
-      // Remove EOS
+      // Strip the trailing EOS sentinel so it does not skew the per-file
+      // bytes/token ratio.
       if (!ids.empty() && ids.back() == bpe.eos_id()) ids.pop_back();
 
       bpe_result.total_bytes += bytes;
@@ -199,7 +265,9 @@ int main(int argc, char** argv) {
       bd.files++;
     }
 
-    // Structural encoding
+    // -- Structural tokenizer encoding (only if the user passed
+    //    --structural-config). last_stats() returns a breakdown of how
+    //    each token was produced (pattern match / atom / BPE fallback).
     if (has_structural) {
       auto t0 = std::chrono::high_resolution_clock::now();
       auto ids = structural.encode(content);
@@ -232,7 +300,9 @@ int main(int argc, char** argv) {
     }
   }
 
-  // Print results
+  // -----------------------------------------------------------------
+  // Phase 5: print formatted results to stdout.
+  // -----------------------------------------------------------------
   auto print_result = [](const BenchResult& r) {
     std::cout << std::fixed << std::setprecision(2);
     std::cout << "  Total bytes:       " << r.total_bytes << "\n";

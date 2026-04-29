@@ -1,3 +1,54 @@
+/**
+ * src/model/block.cpp
+ *
+ * ─── What a "transformer block" is ──────────────────────────────────
+ *
+ * The transformer's stack is just N copies of the same Block. Each
+ * Block does two things in series, with a residual connection around
+ * each:
+ *
+ *     h  = h + attention( rms_norm(h) )           // attention sublayer
+ *     h  = h + feed_forward( rms_norm(h) )        // FFN sublayer
+ *
+ * "Pre-norm + residual" is the de-facto standard for stable training
+ * in transformers >> 100M parameters (the alternative is "post-norm"
+ * which used to fail at scale).
+ *
+ * This file implements the "reordered-norm" variant used in OLMo-2
+ * and LLaMA-2/3. The norm is computed BEFORE the sublayer (attention
+ * or FFN) so that the residual stream `h` keeps a clean,
+ * unnormalised history all the way through the network — gradients
+ * flow more smoothly that way.
+ *
+ * Sister files:
+ *   - block_variants.cpp: PeriNorm, LayerNormScaled, NormalizedNGPT,
+ *     hybrid MoE blocks — alternative ways to wire up the same two
+ *     sublayers.
+ *   - fused_block.cpp: same topology, but uses FusedAttention and a
+ *     fused FFN with merged gate+up projections.
+ *
+ * The pieces:
+ *   attention_       : an Attention module (multi-head SDPA + RoPE)
+ *   feed_forward_    : a SwiGLU feed-forward (W1, W2, W3 linear)
+ *   attention_norm_  : RMSNorm applied before attention (with fused
+ *                      residual-add via forward_add)
+ *   feed_forward_norm_: RMSNorm applied before the FFN
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/model/block.hpp     : own class declaration.
+ *   - olmo_cpp/backend/backend.hpp : get_backend() for fused norm/silu_mul
+ *     ops; begin_scope()/end_scope() drive the per-block arena allocator
+ *     so block-local intermediates can be freed in one shot.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/model/transformer.cpp: TransformerImpl::forward() walks its
+ *     ModuleList of blocks and calls each one in sequence.
+ *
+ * --- Role in training pipeline ---
+ *   The unit of repetition inside the model. For a 4-layer 30M model,
+ *   the forward pass runs this 4 times sequentially per microbatch.
+ *   For a 32-layer 7B model it runs 32 times.
+ */
 #include "olmo_cpp/model/block.hpp"
 #include "olmo_cpp/backend/backend.hpp"
 

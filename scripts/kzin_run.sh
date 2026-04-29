@@ -1,59 +1,105 @@
 #!/bin/bash
-# ═══════════════════════════════════════════════════════════════════════
-# run_kzin.sh — Full benchmark suite for RTX 3060 (12GB VRAM)
+# ============================================================================
+# scripts/kzin_run.sh  (a.k.a. run_kzin.sh)
 #
-# Adapted from jetstream_run.sh for the kzin Linux system.
-# Runs the full 3-way comparison: Python OLMo-core vs cpp-llm vs llm-cpp
+# Full end-to-end benchmark suite tuned for the kzin workstation
+# (NVIDIA RTX 3060, Ampere sm_86, 12 GB VRAM). Adapted from
+# jetstream_run.sh (which targets H100 sm_90 and uses larger batches).
+#
+# Runs a 3-way head-to-head comparison across:
+#   (a) Python OLMo-core (the upstream reference, run inside a venv)
+#   (b) cpp-llm           (a sibling C++ baseline, location via $CPP_LLM_DIR)
+#   (c) llm-cpp           (this repo's "Experimental" C++ implementation)
+#
+# Pipeline:
+#   1. check_prerequisites    — git, cmake, python3, nvcc, GPU memory
+#   2. build_llm_cpp          — CMake + make for this repo (skips if built)
+#   3. build_cpp_llm          — same for $CPP_LLM_DIR (skips if built)
+#   4. setup_python_env       — venv + torch (CUDA 12.4 / 12.1 / CPU fallback)
+#   5. prepare_data           — GPT-2 tokenizer + tokenized TinyStories
+#   6. run_training_benchmark — 30M / 125M / 350M throughput benchmarks
+#   7. train_for_chat         — short training of 30M models for quality eval
+#   8. run_chat_evaluation    — 10-prompt generation eval w/ auto grading
+#   9. generate_report        — REPORT.txt summary in results/
 #
 # Usage:
 #   export CPP_LLM_DIR=/path/to/cpp-llm   # REQUIRED: already-cloned cpp-llm
-#   ./scripts/run_kzin.sh
+#   ./scripts/kzin_run.sh                 # full pipeline
+#   ./scripts/kzin_run.sh --clean         # wipe build/ + .venv/ + results/
 #
-# What it does:
-#   1. Verifies prerequisites (CUDA, cmake, python3, git)
-#   2. Builds both C++ projects with CUDA for RTX 3060 (sm_86)
-#   3. Sets up Python venv with PyTorch+CUDA and OLMo-core
-#   4. Downloads GPT-2 tokenizer + TinyStories data
-#   5. Runs 3-way training benchmark (30M, 125M, 350M)
-#   6. Trains models for generation quality evaluation
-#   7. Runs 10-prompt chat evaluation with automated grading
-#   8. Produces final report in results/
-# ═══════════════════════════════════════════════════════════════════════
+# --- Reads ---
+#   $CPP_LLM_DIR              (env, REQUIRED — path to cpp-llm checkout)
+#   conf/olmo*.conf           (templates for chat-config JSON generation)
+#   data/gpt2/{vocab,merges}  (downloaded if absent)
+#   data/tinystories_gpt2.npy (built if absent)
+#
+# --- Writes / Side effects ---
+#   build/                    (CMake build dir for this repo)
+#   $CPP_LLM_DIR/build/       (CMake build dir for sibling repo)
+#   .venv/                    (Python venv with torch + ai2-olmo-core)
+#   data/                     (downloaded tokenizer + tokenized corpus)
+#   checkpoints/30M_*.pt      (3 checkpoints, one per framework)
+#   results/bench_*.{log,json},
+#   results/train_*.log,
+#   results/generation_eval.{log,json},
+#   results/REPORT.txt        (final human-readable summary)
+#   /tmp/olmo_*_bench.*.conf  (temp INI configs created via mktemp)
+#
+# --- Calls ---
+#   cmake / make              (build C++ projects)
+#   curl                      (fetch GPT-2 tokenizer files)
+#   python3, $VENV_DIR/bin/{python,pip}
+#   ./build/olmo_train, ./build/prepare_data, ./build/chat
+#   $CPP_LLM_DIR/build/{olmo_train|train|main}, .../build/chat
+#   scripts/conf_to_json.py
+#   scripts/benchmark.py
+#   scripts/eval_generation.py
+#
+# --- Role in workflow ---
+#   Top-level driver intended for CI-style "run everything and produce a
+#   report" usage on the kzin box. For ad-hoc runs prefer the smaller
+#   scripts (build.sh, benchmark.py).
+# ============================================================================
 set -euo pipefail
 
-# ── Configuration ──
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-VENV_DIR="$REPO_ROOT/.venv"
-DATA_DIR="$REPO_ROOT/data"
-RESULTS_DIR="$REPO_ROOT/results"
-CHECKPOINT_DIR="$REPO_ROOT/checkpoints"
-DEVICE="cuda"
-SEED=42
+# ── Configuration ─────────────────────────────────────────────────────────
+# All paths are absolute (resolved from this script's own location) so the
+# script is robust to being run from any cwd.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"   # <repo>/scripts
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"     # <repo>
+VENV_DIR="$REPO_ROOT/.venv"                   # Python venv lives next to repo
+DATA_DIR="$REPO_ROOT/data"                    # tokenizer + tokenized .npy
+RESULTS_DIR="$REPO_ROOT/results"              # logs + JSON + REPORT.txt
+CHECKPOINT_DIR="$REPO_ROOT/checkpoints"       # *.pt model checkpoints
+DEVICE="cuda"                                 # we always train on the GPU
+SEED=42                                       # RNG seed for reproducibility
 
-# RTX 3060 = Ampere sm_86, 12GB VRAM
+# RTX 3060 = Ampere sm_86, 12 GB VRAM. Setting CUDA_ARCH=86 means our CUDA
+# kernels are compiled with -arch=sm_86 and embedded as cubin (no JIT cost).
 CUDA_ARCH="86"
 
-# Benchmark settings (tuned for 12GB VRAM)
-BENCH_STEPS=100
-BENCH_WARMUP=5
-BENCH_BATCH=4
-BENCH_SEQ=256
+# Benchmark settings (tuned to fit 30M and 125M models within 12 GB VRAM).
+BENCH_STEPS=100      # measured steps (after warmup) per model size
+BENCH_WARMUP=5       # untimed steps to let LR / autotuners settle
+BENCH_BATCH=4        # micro-batch for 30M / 125M
+BENCH_SEQ=256        # sequence length for 30M / 125M
 
-# 350M needs smaller batch on 12GB
+# 350M does not fit at batch=4 on 12 GB even with bf16; drop to batch=2.
 BENCH_350_BATCH=2
 BENCH_350_SEQ=256
 
-# Training for chat quality (longer run)
+# Longer training run for the generation-quality (chat) eval. 2000 steps is
+# enough to get coherent TinyStories-style generations from a 30M model.
 CHAT_TRAIN_STEPS=2000
 CHAT_BATCH=8
 CHAT_SEQ=256
 
-# ── Parse arguments ──
+# ── Parse arguments ───────────────────────────────────────────────────────
+# We only support a single optional flag (--clean) plus --help.
 CLEAN=""
 for arg in "$@"; do
     case $arg in
-        --clean) CLEAN=1 ;;
+        --clean) CLEAN=1 ;;                    # nuke build/ + venv + results
         --help|-h)
             echo "Usage: CPP_LLM_DIR=/path/to/cpp-llm $0 [--clean]"
             echo "  --clean   Force rebuild of all binaries"
@@ -62,7 +108,9 @@ for arg in "$@"; do
     esac
 done
 
-# Clean builds if requested
+# Clean: wipe build/ caches AND the venv AND results so the run is hermetic.
+# (We deliberately keep data/ and checkpoints/ — those are expensive to
+# regenerate and idempotent enough that the next run will reuse them.)
 if [ -n "$CLEAN" ]; then
     echo "Cleaning builds..."
     rm -rf "$REPO_ROOT/build" "$REPO_ROOT/.venv" "$REPO_ROOT/results"

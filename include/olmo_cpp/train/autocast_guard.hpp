@@ -1,4 +1,31 @@
 #pragma once
+/**
+ * include/olmo_cpp/train/autocast_guard.hpp
+ *
+ * RAII guard around PyTorch's "autocast" mode. Autocast tells ATen
+ * to automatically run amp-friendly ops (matmul, conv) in BF16/FP16
+ * while keeping the rest of the graph in FP32. Inside the guard's
+ * scope, ops dispatch through the autocast key; on scope exit the
+ * dispatch key is restored.
+ *
+ * Header-only because we need the same RAII behaviour from a few
+ * different .cpp files (the train loop and activation
+ * checkpointing's recompute path), and the API is portable across
+ * PyTorch 2.x versions only via this header's compile-time branches.
+ *
+ * --- Includes from this project ---
+ *   (none — torch headers only.)
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/train.cpp                         : guards each
+ *     forward+backward when train_cfg.use_amp is set.
+ *   - src/train/activation_checkpoint.cpp   : guards the recompute
+ *     pass to keep its precision identical to the original forward.
+ *
+ * --- Role in training pipeline ---
+ *   Mixed-precision plumbing. The quickstart's conf has amp=0 so the
+ *   guard is a no-op there.
+ */
 
 #include <torch/torch.h>
 #include <ATen/autocast_mode.h>

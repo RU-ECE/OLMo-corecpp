@@ -526,6 +526,21 @@ endif()
 add_executable(dump_params tools/dump_params.cpp)
 target_link_libraries(dump_params PRIVATE olmo_cpp)
 
+# Embedding dumper (post-training inspection: writes .npy + summary).
+# Links olmo_cpp for the Transformer / FusedTransformer modules and cnpy
+# (compiled into olmo_cpp) for the .npy writer. nlohmann/json is optional;
+# without it the --vocab flag is a no-op.
+add_executable(dump_embeddings tools/dump_embeddings.cpp)
+target_include_directories(dump_embeddings PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cnpy
+  ${JSON_INCLUDE_DIR}
+)
+target_link_libraries(dump_embeddings PRIVATE olmo_cpp)
+target_compile_options(dump_embeddings PRIVATE -O3)
+if(JSON_INCLUDE_DIR)
+  target_compile_definitions(dump_embeddings PRIVATE HAS_NLOHMANN_JSON=1)
+endif()
+
 # HF checkpoint converter
 add_executable(convert_hf tools/convert_hf.cpp)
 target_link_libraries(convert_hf PRIVATE olmo_cpp)

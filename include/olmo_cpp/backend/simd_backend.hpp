@@ -1,5 +1,34 @@
 #pragma once
 
+/**
+ * include/olmo_cpp/backend/simd_backend.hpp
+ *
+ * Concrete IBackend that uses hand-tuned SIMD kernels (NEON on Apple
+ * Silicon, AVX2 on x86, scalar fallback otherwise; see
+ * src/backend/kernels/simd_elementwise.cpp). Activated when the model
+ * runs on CPU with float32 contiguous tensors. For any tensor that is
+ * non-contiguous, non-CPU, or not float32 the backend falls through to
+ * IBackend's ATen reference path automatically.
+ *
+ * Pairs with the thread-local arena: begin_scope / end_scope wrap a
+ * region of scratch allocations, so per-block intermediates recycle the
+ * same memory range without repeatedly hitting the system allocator.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/backend/backend.hpp: IBackend base class.
+ *   - olmo_cpp/backend/arena.hpp:   thread_arena() for scratch tensors.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/main.cpp: calls use_simd_backend() when a CPU device is chosen.
+ *   - src/backend/simd_backend.cpp: the implementation file.
+ *
+ * --- Role in training pipeline ---
+ *   On CPU, the dominant cost of an RMSNorm is reading the row twice
+ *   (variance pass + scale pass). The SIMD kernel does both in one
+ *   pass with vectorized FMAs, then a horizontal reduction. With the
+ *   arena, hot scratch buffers stay in L2/L3 across blocks.
+ */
+
 #include "olmo_cpp/backend/backend.hpp"
 #include "olmo_cpp/backend/arena.hpp"
 

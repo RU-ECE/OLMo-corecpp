@@ -1,5 +1,41 @@
 #pragma once
 
+/**
+ * include/olmo_cpp/nn/multi_res_embedding.hpp
+ *
+ * Declares the Dual-Codebook Multi-Resolution Embedding (DC-MRE), a drop-in
+ * replacement for nn::Embedding that fuses four orthogonal sources of token
+ * information into a single d_model vector via additive composition:
+ *
+ *   1. Semantic       — standard learned token embedding.
+ *   2. Syntactic role — a tiny codebook indexed by a precomputed token->role map
+ *                       (WORD/PROPER/NUMBER_LIKE/PUNCT/CONTINUATION/STRUCTURE/...).
+ *   3. Morphology     — character trigram hashes pooled per token (catches
+ *                       prefixes/suffixes/roots without growing vocab).
+ *   4. Phrase context — local 3-gram hash over (left, center, right) token IDs.
+ *
+ * Streams 2-4 use low-rank embeddings projected up to d_model, so the added
+ * parameter count and FLOPs are small. Lookup tables are built once at
+ * construction time from the BPE vocab and cached as buffers.
+ *
+ * --- Includes from this project ---
+ *   - <torch/torch.h>: nn::Module, nn::Embedding, nn::Linear, TORCH_MODULE.
+ *   - <string>: BPE vocab path argument.
+ *   - <vector>: included for transitive use (no direct std::vector here).
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/nn/multi_res_embedding.cpp: implementation of every method.
+ *   - src/model/transformer.cpp / fused_transformer.cpp: TransformerImpl can
+ *     instantiate MultiResEmbedding instead of plain nn::Embedding when
+ *     enabled by config (see TransformerConfig::use_multi_res_embedding).
+ *
+ * --- Role in training pipeline ---
+ *   First module touched by every forward pass: token IDs go in, hidden
+ *   states come out before the first attention block. Replacing the standard
+ *   embedding with DC-MRE is one of the structural changes that lets us
+ *   exploit the StructuralTokenizer's role-aware vocab partitioning.
+ */
+
 #include <torch/torch.h>
 #include <string>
 #include <vector>

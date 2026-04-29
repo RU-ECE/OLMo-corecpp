@@ -1,14 +1,43 @@
 /**
- * Convert HuggingFace OLMo-2 safetensors → OLMo C++ .pt checkpoint
+ * tools/convert_hf.cpp
  *
- * Usage:
- *   ./build/convert_hf --hf-dir <path_to_hf_model> \
- *       --config configs/olmo2_7B_mtp.json \
- *       --output checkpoints/olmo2_7B_mtp.pt
+ * One-shot converter that ingests a HuggingFace OLMo-2 (or Llama-style)
+ * model directory full of `.safetensors` files and produces a single
+ * `.pt` checkpoint that this project's `Transformer` class can load
+ * directly via `torch::load(model, path)`. It also leaves the optional
+ * MTP (Multi-Token Prediction) heads randomly initialized when the
+ * target config requests them, so the user can fine-tune the heads on
+ * their own data.
  *
- * This loads HF safetensors, maps parameter names to our C++ module names,
- * creates the model (with randomly initialized MTP heads if configured),
- * loads backbone weights, and saves the full model.
+ * Example:
+ *   ./build/convert_hf --hf-dir ~/hf/OLMo-2-1124-7B \
+ *                      --config configs/olmo2_7B_mtp.json \
+ *                      --output checkpoints/olmo2_7B_mtp.pt
+ *
+ * --- Flags ---
+ *   --hf-dir   directory containing the model's .safetensors shards
+ *   --config   JSON config matching the target topology
+ *   --output   path to write the converted .pt checkpoint
+ *   --fp32     force fp32 weights (default: keep dtype from safetensors)
+ *
+ * --- Build target ---
+ *   convert_hf (CMakeLists.txt:530). Links olmo_cpp + LibTorch +
+ *   nlohmann/json. Compiled with -O3.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/config.hpp           : load_config_from_json + validate
+ *   - olmo_cpp/model/transformer.hpp: Transformer module being populated
+ *   - olmo_cpp/nn/hf_convert.hpp    : safetensors loader (returns
+ *                                     std::unordered_map<name,Tensor>)
+ *
+ * --- Reads / Writes ---
+ *   - reads:  every *.safetensors file in --hf-dir, plus --config JSON
+ *   - writes: --output .pt file (parent dir auto-created)
+ *
+ * --- Role in workflow ---
+ *   Run once when bootstrapping training/finetuning from a public HF
+ *   model. After this, downstream tools (`chat`, `olmo_train` resume,
+ *   etc.) load --output through standard LibTorch C++ paths.
  */
 
 #include "olmo_cpp/config.hpp"
@@ -83,6 +112,10 @@ std::string hf_to_olmo_name(const std::string& hf_name) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  // -----------------------------------------------------------------
+  // Phase 1: parse CLI flags. All three of --hf-dir, --config and
+  // --output are mandatory; --fp32 is opt-in.
+  // -----------------------------------------------------------------
   std::string hf_dir, config_path, output_path;
   bool fp32 = false;
 
@@ -102,7 +135,9 @@ int main(int argc, char** argv) {
 
 #ifdef HAS_NLOHMANN_JSON
   try {
-    // Load our config
+    // -----------------------------------------------------------------
+    // Phase 2: load and validate the target model config.
+    // -----------------------------------------------------------------
     auto cfg = olmo_cpp::load_config_from_json(config_path);
     cfg.validate();
 
@@ -112,11 +147,19 @@ int main(int argc, char** argv) {
               << " n_kv_heads=" << cfg.get_n_kv_heads()
               << " num_mtp_heads=" << cfg.num_mtp_heads << "\n";
 
-    // Create model (MTP heads will be randomly initialized)
+    // -----------------------------------------------------------------
+    // Phase 3: build a freshly initialized Transformer matching the
+    // config. init_weights() seeds parameters with the standard
+    // initialization. MTP head weights stay at this random init since
+    // they don't exist in upstream HF checkpoints.
+    // -----------------------------------------------------------------
     auto model = olmo_cpp::Transformer(cfg);
     model->init_weights();
 
-    // Find all safetensors files in the HF directory
+    // -----------------------------------------------------------------
+    // Phase 4: find all .safetensors shards in --hf-dir and sort them
+    // alphabetically so multi-shard models load in a stable order.
+    // -----------------------------------------------------------------
     std::vector<std::string> st_files;
     for (const auto& entry : fs::directory_iterator(hf_dir)) {
       if (entry.path().extension() == ".safetensors") {
@@ -131,7 +174,11 @@ int main(int argc, char** argv) {
     }
     std::cout << "Found " << st_files.size() << " safetensors file(s)\n";
 
-    // Build a map of our model's parameter names → tensor references
+    // -----------------------------------------------------------------
+    // Phase 5: index our model's params by name so the safetensors loop
+    // can do an O(1) lookup. We hold raw pointers because we need to
+    // mutate the underlying tensor in-place.
+    // -----------------------------------------------------------------
     std::unordered_map<std::string, torch::Tensor*> our_params;
     for (auto& item : model->named_parameters()) {
       our_params[item.key()] = &item.value();
@@ -139,7 +186,11 @@ int main(int argc, char** argv) {
 
     int loaded = 0, skipped = 0;
 
-    // Load each safetensors file
+    // -----------------------------------------------------------------
+    // Phase 6: stream every safetensors shard and copy each tensor into
+    // the matching parameter slot. Mismatches in shape are warned about
+    // and skipped (rather than aborting).
+    // -----------------------------------------------------------------
     for (const auto& st_file : st_files) {
       std::cout << "Loading " << fs::path(st_file).filename().string() << "...\n";
       auto tensors = olmo_cpp::safetensors::load(st_file);
@@ -174,7 +225,10 @@ int main(int argc, char** argv) {
                 << ") initialized randomly — train them on your data\n";
     }
 
-    // Save
+    // -----------------------------------------------------------------
+    // Phase 7: ensure the output directory exists, then serialize the
+    // populated module via LibTorch's C++ saver.
+    // -----------------------------------------------------------------
     fs::create_directories(fs::path(output_path).parent_path());
     torch::save(model, output_path);
     std::cout << "Saved to " << output_path << "\n";

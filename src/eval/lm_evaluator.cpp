@@ -1,3 +1,23 @@
+/**
+ * src/eval/lm_evaluator.cpp
+ *
+ * Concrete EvalTask for plain language-model evaluation. Iterates the
+ * eval dataset (a TokenDataset) one batch at a time, runs the model
+ * in `torch::NoGradGuard` mode, accumulates cross-entropy, and
+ * reports mean CE loss and perplexity (= exp(mean CE)).
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/eval/lm_evaluator.hpp  : LMEvaluator declaration.
+ *   - olmo_cpp/data/token_dataset.hpp : the eval-set source.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/train.cpp: when train_cfg.eval_data_path is set, this
+ *     evaluator is registered and invoked every eval_interval steps.
+ *
+ * --- Role in training pipeline ---
+ *   Periodic eval. Result printed alongside train loss for trend
+ *   monitoring.
+ */
 #include "olmo_cpp/eval/lm_evaluator.hpp"
 #include "olmo_cpp/data/token_dataset.hpp"
 #include <iostream>

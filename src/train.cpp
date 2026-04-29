@@ -1,3 +1,41 @@
+/**
+ * src/train.cpp
+ *
+ * The full training loop. This is THE file to read if you want to know
+ * what one training step actually does in this framework. It owns:
+ *   - the data loader (TokenDataset / DataLoader),
+ *   - the optimizer (AdamW / Muon / Lion / Dion / SGP / SkipStep wrappers),
+ *   - the LR schedule (warmup + cosine, or others),
+ *   - autocast / pure-BF16 weight casting,
+ *   - DDP allreduce (when built with Gloo),
+ *   - activation checkpointing,
+ *   - the always-on profiler scopes (step_total / data_loading /
+ *     forward / backward / allreduce / optimizer_step),
+ *   - heartbeat-file emission for long runs,
+ *   - eval and periodic checkpointing.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/train.hpp                : TrainConfig + train() entry signature.
+ *   - olmo_cpp/data/token_dataset.hpp   : the .npy-backed token tensor.
+ *   - olmo_cpp/profiler.hpp             : ProfileScope used to time every stage.
+ *   - olmo_cpp/distributed/ddp.hpp      : gradient allreduce.
+ *   - olmo_cpp/optim/{adamw,muon,lion,dion,sgp,skip_step}.hpp : every optimizer the loop can pick.
+ *   - olmo_cpp/train/grad_scaler.hpp    : FP16 dynamic loss scaling.
+ *   - olmo_cpp/train/activation_checkpoint.hpp : per-block recompute.
+ *   - olmo_cpp/train/checkpoint.hpp     : sharded checkpoint manager.
+ *   - olmo_cpp/eval/evaluator.hpp       : periodic validation loss.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/main.cpp: the only caller. After parsing the .conf and building
+ *     a Transformer or FusedTransformer, main() invokes
+ *     olmo_cpp::train(model, cfg, train_cfg, device, callbacks).
+ *
+ * --- Role in training pipeline ---
+ *   This is the orchestrator. It pulls one batch, runs the forward,
+ *   computes the loss, runs the backward, optionally allreduces, clips
+ *   gradients, and steps the optimizer — wrapping each phase in a
+ *   ProfileScope so the user gets a per-stage timing table at the end.
+ */
 // Full-featured training loop with callbacks, multiple optimizers,
 // LR schedulers, activation checkpointing, gradient scaling, and eval
 #include "olmo_cpp/train.hpp"

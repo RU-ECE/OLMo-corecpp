@@ -1,3 +1,44 @@
+/**
+ * src/model/block_variants.cpp
+ *
+ * ─── What this file is ──────────────────────────────────────────────
+ *
+ * The "reordered-norm" block in block.cpp is the production default,
+ * but research often wants to try alternative wirings of attention,
+ * FFN, and norms. This file collects those alternatives:
+ *
+ *   - **PeriNormBlock**          (norm wrapped *around* each sublayer
+ *                                  on both sides — was the LLaMA-1
+ *                                  recipe; tends to be more stable
+ *                                  with deeper models).
+ *   - **LayerNormScaledBlock**   (block.cpp + a learnable scalar
+ *                                  multiplying each sublayer output —
+ *                                  inspired by ReZero).
+ *   - **NormalizedNGPTBlock**    (the "normalised GPT" block from the
+ *                                  nGPT paper — every weight matrix
+ *                                  kept on the unit sphere).
+ *   - **MoEReorderedNormBlock**  (same skeleton as ReorderedNorm but
+ *                                  the FFN sublayer is replaced by an
+ *                                  MoE layer — see src/model/moe/).
+ *   - **MoEHybridReorderedNorm** (alternates dense FFN and MoE FFN
+ *                                  every K layers — cheaper than
+ *                                  all-MoE without losing much
+ *                                  capacity).
+ *
+ * All of them implement the same forward signature as the canonical
+ * Block so transformer.cpp can swap them in based on cfg.block_type.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/model/block_variants.hpp : declarations of the block
+ *     variant classes.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/model/transformer.cpp / fused_transformer.cpp: select one
+ *     variant at construction time based on cfg.block_type.
+ *
+ * --- Role in training pipeline ---
+ *   Off the hot path unless explicitly selected via the .conf.
+ */
 #include "olmo_cpp/model/block_variants.hpp"
 
 namespace olmo_cpp {

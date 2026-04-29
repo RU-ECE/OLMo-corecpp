@@ -1,3 +1,43 @@
+/**
+ * src/backend/simd_backend.cpp
+ *
+ * ─── What "SIMD" is ─────────────────────────────────────────────────
+ *
+ * SIMD = **S**ingle **I**nstruction **M**ultiple **D**ata. Modern
+ * CPUs have wide vector registers (NEON 128-bit on Apple Silicon /
+ * ARM, AVX2 256-bit on most x86, AVX-512 512-bit on server x86) that
+ * can execute the same operation on 4, 8, or 16 floats at once. To
+ * get good CPU performance you have to write loops that the compiler
+ * (or you, with intrinsics) can map onto these wide ops.
+ *
+ * This file is the **CPU equivalent** of the .cu kernels:
+ *
+ *   - SIMDBackend implements the IBackend interface (rms_norm,
+ *     silu_mul, apply_rope, residual_rms_norm) using vectorised
+ *     CPU code from src/backend/kernels/simd_elementwise.cpp.
+ *
+ *   - The fast paths only kick in when the input is contiguous, on
+ *     CPU, and in a supported dtype. Anything else falls back to the
+ *     default ATen recipe (the IBackend base class's implementation).
+ *     The can_use_simd() predicate at the top of every op gates that.
+ *
+ * On the 3060 quickstart the SIMD backend is NOT installed because
+ * device=cuda; CUDABackend takes over. SIMDBackend is what runs on a
+ * Mac laptop or any GPU-less Linux box.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/backend/simd_backend.hpp           : SIMDBackend class.
+ *   - olmo_cpp/backend/kernels/simd_elementwise.hpp : the actual
+ *                                                     vectorised kernels.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/main.cpp: use_simd_backend() is called when device=cpu,
+ *     installing SIMDBackend as the global backend singleton.
+ *
+ * --- Role in training pipeline ---
+ *   The fast-path for CPU-only training. Mirrors what the .cu kernels
+ *   do but with NEON/AVX intrinsics instead of CUDA threads.
+ */
 #include "olmo_cpp/backend/simd_backend.hpp"
 #include "olmo_cpp/backend/kernels/simd_elementwise.hpp"
 

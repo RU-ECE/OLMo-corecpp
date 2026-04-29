@@ -1,5 +1,34 @@
 #pragma once
 
+/**
+ * include/olmo_cpp/backend/cuda_backend.hpp
+ *
+ * Concrete IBackend that dispatches to hand-written CUDA kernels in the
+ * kernels/ directory (rms_norm.cu, silu_mul.cu, rope.cu). The kernels
+ * are exposed to LibTorch via TORCH_LIBRARY(olmo_ops, ...) and looked
+ * up at first call by name through c10::Dispatcher. After the first
+ * call the OperatorHandle is cached in a static local, so subsequent
+ * dispatch is a simple typed call — no string lookup per layer.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/backend/backend.hpp: IBackend base class.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/main.cpp: calls use_cuda_backend() when device == cuda.
+ *   - src/backend/cuda_backend.cpp: implementation that resolves the
+ *     "olmo_ops::rms_norm", "olmo_ops::silu_mul", "olmo_ops::apply_rope",
+ *     "olmo_ops::residual_rms_norm" handles.
+ *
+ * --- Role in training pipeline ---
+ *   When the model runs on a CUDA device, every TransformerBlock
+ *   forward eventually calls get_backend().rms_norm(...) which lands
+ *   here, jumps into the kernel via the dispatcher, and returns the
+ *   result tensor directly with no extra allocations. The default
+ *   ATen path is kept as a safety net for fp16 or other unsupported
+ *   dtypes; this gives correct fallback behaviour even when the kernel
+ *   library wasn't compiled in (OLMO_HAS_CUDA_KERNELS undefined).
+ */
+
 #include "olmo_cpp/backend/backend.hpp"
 
 namespace olmo_cpp {

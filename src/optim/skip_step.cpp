@@ -1,3 +1,35 @@
+/**
+ * src/optim/skip_step.cpp
+ *
+ * ─── What "skip step" means ─────────────────────────────────────────
+ *
+ * Sometimes a single training step produces a degenerate gradient:
+ *   - a NaN or Inf from a numerical underflow,
+ *   - or a gradient norm 100x larger than the recent moving average
+ *     (a "spike", usually a bad batch or a rare numerical edge case).
+ *
+ * Letting the optimizer apply that gradient pollutes the momentum and
+ * adam-like state for thousands of subsequent steps. SkipStep is a
+ * defensive wrapper that intercepts step() — if the gradient looks
+ * unsafe it just doesn't apply it. The model is left untouched, and
+ * the next batch is given a chance to recover.
+ *
+ * It's a drop-in around any inner optimizer (AdamW, Muon, Lion, ...).
+ * Forwards every other API call — state_dict, lr, etc. — so the train
+ * loop can't tell it's there.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/optim/skip_step.hpp : SkipStepOptimizer declaration.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/train.cpp: optionally wraps the inner optimizer when
+ *     skip_step=1 in the [optimization] section of the .conf.
+ *
+ * --- Role in training pipeline ---
+ *   Sits between the train loop and the inner optimizer. Useful in
+ *   BF16/FP8 where one bad batch could blow up the moments and ruin
+ *   the next thousand steps.
+ */
 #include "olmo_cpp/optim/skip_step.hpp"
 #include <algorithm>
 #include <cmath>

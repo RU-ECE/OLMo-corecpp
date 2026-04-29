@@ -1,3 +1,30 @@
+/**
+ * src/model/fused_transformer.cpp
+ *
+ * The "fused" sister of transformer.cpp. Same overall topology
+ * (Embedding → N Blocks → final norm → LMHead) but each block is a
+ * FusedTransformerBlock (see fused_block.cpp) and each FFN/QKV uses
+ * merged Linear weights. The math is unchanged, the kernel-launch
+ * count goes down, and training is a few percent faster.
+ *
+ * The quickstart's 3060 conf has fused=1, so this is the variant that
+ * actually runs on his demo.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/model/fused_transformer.hpp : class declaration.
+ *   - olmo_cpp/train/activation_checkpoint.hpp : per-block recompute
+ *                                                hook for memory savings.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/main.cpp: instantiated when use_fused=1.
+ *   - tools/dump_embeddings.cpp: instantiated read-only to extract
+ *     the embedding matrix when the .conf had fused=1.
+ *
+ * --- Role in training pipeline ---
+ *   THE model on the quickstart run. Every microbatch's forward()
+ *   walks Embedding → blocks → final norm → lm_head, loss in
+ *   src/train.cpp.
+ */
 #include "olmo_cpp/model/fused_transformer.hpp"
 #include "olmo_cpp/train/activation_checkpoint.hpp"
 #include <torch/nn/init.h>

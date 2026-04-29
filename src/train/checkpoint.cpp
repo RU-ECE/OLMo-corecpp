@@ -1,3 +1,60 @@
+/**
+ * src/train/checkpoint.cpp
+ *
+ * ─── What a "checkpoint" is ─────────────────────────────────────────
+ *
+ * A model checkpoint is a snapshot of every parameter and buffer in
+ * the model, plus enough metadata (step number, optimizer learning
+ * rate, etc.) to resume training as if nothing happened. Without
+ * checkpoints, a 24-hour training run that crashes at hour 23 has to
+ * start over.
+ *
+ * This file implements `CheckpointManager`, which:
+ *
+ *   - **save(tag, model, optimizer, meta)**  serialise everything
+ *     to <base_path>/<tag>/rank_<R>/. The model parameters are split
+ *     into chunks and saved by a thread pool so wall-clock time is
+ *     dominated by disk bandwidth, not single-threaded torch::save.
+ *
+ *   - **save_async(...)**  same, but returns a std::future that
+ *     completes when the save is done. The training loop can call
+ *     this and immediately resume the next forward — disk write
+ *     overlaps with compute.
+ *
+ *   - **load(tag, model, optimizer)**  reverse of save: read the
+ *     archive(s) under that tag and copy_() the tensors back into
+ *     the (already-constructed) model's parameters/buffers.
+ *
+ *   - **latest()** / **list_checkpoints()** / **prune(keep_n)**
+ *     inventory + retention helpers. `prune` keeps only the N most
+ *     recent checkpoints so disk usage doesn't grow unbounded.
+ *
+ * Layout on disk:
+ *
+ *   base_path/
+ *     step_001000/rank_0/
+ *       model_chunk_0.pt
+ *       model_chunk_M.pt
+ *       optimizer.pt
+ *       metadata.json
+ *
+ * Per-rank shards mean a multi-rank run produces a tree where each
+ * rank dumps its own slice — useful when combined with FSDP/TP.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/train/checkpoint.hpp : CheckpointManager declaration.
+ *   - olmo_cpp/io/filesystem.hpp    : abstraction over local disk vs.
+ *                                      remote (S3/GCS/etc.).
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/train.cpp: emplaces a CheckpointManager when the .conf
+ *     specifies checkpoint_dir, then calls .save() every
+ *     checkpoint_interval steps and .prune() to enforce keep_n.
+ *
+ * --- Role in training pipeline ---
+ *   Periodically active during training. Disabled when
+ *   checkpoint_dir is empty.
+ */
 #include "olmo_cpp/train/checkpoint.hpp"
 #include "olmo_cpp/io/filesystem.hpp"
 

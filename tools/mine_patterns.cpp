@@ -1,14 +1,56 @@
 /**
- * Structural Pattern Mining Tool
+ * tools/mine_patterns.cpp
  *
- * Analyzes a corpus of code/text files to discover frequent structural patterns.
- * Replaces identifiers and literals with {SLOT} placeholders, counts frequency,
- * ranks by frequency × tokens_saved, and outputs patterns as JSON.
+ * Structural pattern miner used to bootstrap the structural tokenizer.
+ * It walks a corpus directory, abstracts every line by replacing
+ * identifiers / numeric literals / string literals with typed slot
+ * placeholders ({IDENT}, {NUM}, {STR}), counts how often each abstract
+ * pattern appears, scores patterns by `frequency * (tokens_saved - 1)`,
+ * and writes the top-N patterns to a JSON file. Optionally merges in a
+ * hand-curated "seed" pattern set so trusted patterns survive the
+ * top-N cut.
  *
- * Usage:
- *   ./build/mine_patterns --dir data/tinystories_raw/ --output data/structural_tokenizer/mined_patterns.json
+ * Examples:
+ *   # Mine TinyStories prose patterns
+ *   ./build/mine_patterns --dir data/tinystories_raw/ \
+ *       --output data/structural_tokenizer/mined_patterns.json
+ *
+ *   # Mine source code, keep top-5000 patterns seen >=3 times
  *   ./build/mine_patterns --dir src/ --top 5000 --min-freq 3
- *   ./build/mine_patterns --dir src/ --seed data/structural_tokenizer/seed_patterns.json --merge
+ *
+ *   # Merge mined patterns with a hand-curated seed set
+ *   ./build/mine_patterns --dir src/ \
+ *       --seed data/structural_tokenizer/seed_patterns.json --merge
+ *
+ * --- Flags ---
+ *   --dir <p>          (REQUIRED) corpus directory to walk
+ *   --output <p>       output JSON path
+ *   --seed <p>         seed pattern JSON to optionally merge in
+ *   --merge            include the seed patterns in the output
+ *   --top <n>          keep top-N patterns by score (default 5000)
+ *   --min-freq <n>     drop patterns seen fewer than n times (default 2)
+ *   --max-files <n>    cap on files scanned (default 10000)
+ *   --verbose / -v     print per-file progress
+ *
+ * --- Build target ---
+ *   mine_patterns (CMakeLists.txt:571). Standalone executable — does
+ *   not link olmo_cpp or LibTorch (only header-only filesystem/regex
+ *   STL). Compiled with -O3 -march=native.
+ *
+ * --- Includes from this project ---
+ *   (none — this tool is intentionally self-contained.)
+ *
+ * --- Reads / Writes ---
+ *   - reads:  every text/code/data file under --dir; optional --seed JSON
+ *   - writes: --output JSON file. ID space convention:
+ *               * 50000-50999 reserved for seed patterns
+ *               * mined patterns start at 51000 (or at the configured
+ *                 base_id when --merge is not set)
+ *
+ * --- Role in workflow ---
+ *   First step in building a structural tokenizer. The output JSON is
+ *   then consumed by the StructuralTokenizer at load time — see
+ *   `benchmark_tokenizer` and `prepare_data --structural-config`.
  */
 
 #include <algorithm>

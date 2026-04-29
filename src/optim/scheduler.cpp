@@ -1,3 +1,41 @@
+/**
+ * src/optim/scheduler.cpp
+ *
+ * ─── What an "LR scheduler" is ──────────────────────────────────────
+ *
+ * The optimizer step is `w ← w − lr · update`. If lr is fixed at a
+ * sensible value, training tends to plateau early. Empirically, two
+ * tricks help a lot:
+ *
+ *   1. **Warmup**: start at a tiny lr and linearly ramp up over the
+ *      first ~1% of steps. Without this, the first few gradients are
+ *      so noisy that they kick the model off the manifold.
+ *
+ *   2. **Cosine decay**: after warmup, smoothly decay lr along
+ *      lr_max · 0.5 · (1 + cos(π · progress)) to ≈ 0 by the end of
+ *      training. The model gets fine-grained refinement near the end
+ *      where the loss landscape is shallow.
+ *
+ * This file implements the canonical four shapes:
+ *   - constant
+ *   - linear            : lr → 0 over total_steps (no warmup)
+ *   - cosine            : warmup then cosine decay to 0
+ *   - cosine_with_floor : same but floors at (1−decay_ratio) · lr_max
+ *
+ * Every scheduler is **stateless** beyond its constructor arguments —
+ * lr is a pure function of the global step. Easy to checkpoint.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/optim/scheduler.hpp : LRScheduler interface + factories.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/train.cpp: built once, then queried each microbatch to set
+ *     param_groups()[g].options().lr() before optimizer step.
+ *
+ * --- Role in training pipeline ---
+ *   Read-only function of the global step. The .conf's "scheduler"
+ *   key selects which one to instantiate.
+ */
 #include "olmo_cpp/optim/scheduler.hpp"
 #include <algorithm>
 #include <cmath>

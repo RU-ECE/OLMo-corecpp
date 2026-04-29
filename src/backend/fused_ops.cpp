@@ -1,3 +1,29 @@
+/**
+ * src/backend/fused_ops.cpp
+ *
+ * Implementations of the free-function "recipes" declared in
+ * olmo_cpp/backend/fused_ops.hpp. These are not low-level kernels;
+ * they reduce ATen op count by combining matmul + split or matmul +
+ * elementwise patterns into one helper. The actual elementwise
+ * acceleration comes from the backend installed in get_backend().
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/backend/fused_ops.hpp: declarations.
+ *   - olmo_cpp/backend/backend.hpp:   get_backend().silu_mul / .rms_norm.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   Direct callers not located via quick grep — the recipes are
+ *   intended for FusedTransformer / FusedBlock and unit tests.
+ *
+ * --- Role in training pipeline ---
+ *   FusedTransformer concatenates Q,K,V weights into a single matrix
+ *   at construction time, then uses fused_qkv_projection to do one
+ *   GEMM per block instead of three. Same idea for gate+up. Cutting
+ *   the number of independent GEMMs reduces dispatch overhead and
+ *   sometimes lets cuBLAS pick a more efficient kernel for the larger
+ *   shape.
+ */
+
 #include "olmo_cpp/backend/fused_ops.hpp"
 #include "olmo_cpp/backend/backend.hpp"
 #include <cmath>
@@ -9,6 +35,10 @@ namespace fused {
 // Fused QKV projection
 // ---------------------------------------------------------------------------
 
+/// One Linear instead of three. weight_qkv is the row-stacked matrix
+/// [W_q; W_k; W_v] of shape [3*D_out, D]. After the GEMM the result is
+/// split along the last dim into the three projections. The split is
+/// a view (no copy) so it costs nothing.
 QKVResult fused_qkv_projection(torch::Tensor x,
                                 torch::Tensor weight_qkv,
                                 std::optional<torch::Tensor> bias_qkv) {

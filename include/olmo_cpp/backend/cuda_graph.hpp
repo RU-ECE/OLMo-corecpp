@@ -1,5 +1,36 @@
 #pragma once
 
+/**
+ * include/olmo_cpp/backend/cuda_graph.hpp
+ *
+ * Header-only RAII helper around at::cuda::CUDAGraph. CUDA Graphs let
+ * you record a sequence of kernel launches once and replay it as a
+ * single op, eliminating per-launch CPU overhead (~5-10 us per launch
+ * on H100; with ~100 launches per decode step that is meaningful).
+ *
+ * The runner expects a function fn(input)->output that always launches
+ * the same kernels in the same order with the same shapes. On the first
+ * call it does:
+ *   1) a warmup call (CUDA refuses to capture if kernels haven't been
+ *      JIT-compiled / autotuned),
+ *   2) clone the input into a static input_buffer_,
+ *   3) replay the function inside graph_.capture_begin/end.
+ * Subsequent calls copy the new input into the static buffer and call
+ * graph_.replay() — no kernel launch overhead, no allocation.
+ *
+ * --- Includes from this project ---
+ *   - (none — pulls only torch headers)
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   Direct callers not located via quick grep.
+ *
+ * --- Role in training pipeline ---
+ *   This is wiring for an upcoming inference / static-shape training
+ *   optimization. In Python OLMo the equivalent is torch.cuda.graphs;
+ *   we keep the same semantics so a forward call can be replayed
+ *   instead of relaunched once shapes stabilize.
+ */
+
 #include <torch/torch.h>
 #include <functional>
 #include <vector>

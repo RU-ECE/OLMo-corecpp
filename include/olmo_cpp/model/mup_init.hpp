@@ -1,4 +1,35 @@
 #pragma once
+/**
+ * include/olmo_cpp/model/mup_init.hpp
+ *
+ * ─── What "muP" is ──────────────────────────────────────────────────
+ *
+ * µP = **M**aximal **U**pdate **P**arameterization (Yang & Hu 2021).
+ * A specific recipe for how to scale init-stds, learning rates, and
+ * residual gains as a function of width so that hyperparameters
+ * tuned at small width transfer cleanly to much larger widths.
+ *
+ * Without µP, the optimal lr at d_model=256 is different from the
+ * optimal lr at d_model=2048, so people sweep at every model size.
+ * With µP, the same lr that worked for 256 will work for 2048,
+ * which lets you do hyperparameter search cheaply on a tiny model
+ * and then deploy the results.
+ *
+ * apply_mup_init() walks the model's parameters and applies the
+ * width-aware scaling. Selected by mup=1 in the .conf.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/config.hpp : reads cfg.d_model and other size knobs.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/main.cpp : if use_mup is requested, calls apply_mup_init()
+ *                     instead of model->init_weights() at startup.
+ *   - src/model/mup_init.cpp : implementation.
+ *
+ * --- Role in training pipeline ---
+ *   Optional one-shot at model construction. Off in the quickstart
+ *   conf (mup=0); the simpler init_weights() is used.
+ */
 
 #include "olmo_cpp/config.hpp"
 #include <torch/torch.h>

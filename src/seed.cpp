@@ -1,3 +1,33 @@
+/**
+ * src/seed.cpp
+ *
+ * Reproducibility plumbing. Owns a process-wide SeedState and offers
+ * three things:
+ *   - seed_all(seed_or_random)      seed every RNG that affects training:
+ *                                   PyTorch CPU/CUDA, a torch::Generator
+ *                                   for weight init, and an mt19937 for
+ *                                   our own data shuffle/permutation use.
+ *   - capture_rng_state() / restore_rng_state()  serialise/restore the
+ *                                   above into a small POD so checkpoints
+ *                                   can resume training without regressing
+ *                                   the data order.
+ *   - print_rng_state_summary()     log the current RNG state for the user.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/seed.hpp : SeedState struct + function declarations.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/main.cpp: seed_all(seed) at startup before any model is built.
+ *   - src/main.cpp: print_rng_state_summary() at end of training when
+ *     profile=1 (so the user can confirm the seed actually got used).
+ *   - src/train/checkpoint.cpp: capture_rng_state / restore_rng_state for
+ *     deterministic resume.
+ *
+ * --- Role in training pipeline ---
+ *   Run exactly once at process start, then read on demand. Without this,
+ *   weight init and data shuffling drift between runs even with the same
+ *   .conf.
+ */
 #include "olmo_cpp/seed.hpp"
 #include <iostream>
 #include <sstream>

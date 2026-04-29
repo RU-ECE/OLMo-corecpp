@@ -1,5 +1,37 @@
 #pragma once
 
+/**
+ * include/olmo_cpp/data/token_dataset.hpp
+ *
+ * The hot-path data source used by the OLMo pretraining loop. Memory-maps a
+ * single .npy file containing the full tokenized corpus (one big 1-D
+ * integer array), partitions it into fixed-length seq_len chunks, and
+ * serves shuffled (input, label) batches where the labels are the inputs
+ * shifted by one (next-token prediction).
+ *
+ * Three execution modes (see to_device()):
+ *   - GPU-resident: full token tensor + chunk-index permutation live on
+ *     CUDA, gather is a single cudaMemcpy/index_select per step. Used when
+ *     the corpus fits in ~25% of free VRAM (or under the user cap).
+ *   - Streaming (CUDA): tokens stay pinned on the host; a background
+ *     thread prepares batch N+1 into a pinned double-buffer while batch N
+ *     trains. Bounded host memory; one async H2D per step.
+ *   - CPU: simple synchronous gather, used for unit tests and CPU bench.
+ *
+ * --- Includes from this project ---
+ *   - <torch/torch.h>: returned tensors and device handling.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/train.cpp: instantiates a TokenDataset at TrainConfig parse time
+ *     and pulls a batch per global step.
+ *   - tools/dump_params.cpp / scripts/verify_*: consume validation shards.
+ *
+ * --- Role in training pipeline ---
+ *   Owns the memory-mapped token tensor read by the training loop each
+ *   step; constructed once at TrainConfig parse time. Provides the only
+ *   non-trivial overlap of data prep with compute on the H100/A100 path.
+ */
+
 #include <string>
 #include <vector>
 #include <torch/torch.h>
@@ -13,6 +45,10 @@ namespace olmo_cpp {
 /// Supports uint16 or uint32 token IDs (common for OLMo).
 /// Includes async prefetch: while GPU runs forward/backward on batch N,
 /// CPU prepares batch N+1 in a background thread.
+///
+/// Tensors layout per step:
+///   input:  [batch_size, seq_len]  int64
+///   labels: [batch_size, seq_len]  int64  (= tokens shifted by +1 position)
 class TokenDataset {
  public:
   /// Load token array from .npy file. Expects 1D array of token IDs.

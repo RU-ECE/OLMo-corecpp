@@ -1,3 +1,61 @@
+/**
+ * src/nn/multi_res_embedding.cpp
+ *
+ * ─── What an "embedding" is ────────────────────────────────────────
+ *
+ * Every transformer starts the forward pass by mapping each input
+ * token id (an integer) to a continuous d_model-wide vector. The
+ * canonical way is a single big lookup table:
+ *
+ *     class Embedding(vocab_size, d_model):
+ *       weight: [vocab_size, d_model]      // learned parameters
+ *       def forward(ids):                  // ids: [B, S]
+ *         return weight[ids]               // result: [B, S, d_model]
+ *
+ * That's `torch::nn::Embedding`, used in src/model/transformer.cpp
+ * when cfg.use_multi_res is false.
+ *
+ * ─── What DC-MRE is (this file) ────────────────────────────────────
+ *
+ * "DC-MRE" = **D**ual-**C**odebook **M**ulti-**R**esolution **E**mbedding.
+ * The motivation: in a 50k-vocabulary BPE, 90% of the tokens occur very
+ * rarely.  Their rows in the plain Embedding table never get enough
+ * gradient signal to learn anything useful.  DC-MRE addresses this by
+ * decomposing each token's representation into THREE parallel codebook
+ * lookups whose results are summed:
+ *
+ *   semantic_emb[id]            (the conventional row, vocab_size × D)
+ *   + char_emb[trigram_bucket]  (bucketed by sub-token trigrams,
+ *                                 ~few-thousand buckets — heavy parameter
+ *                                 sharing across rare tokens)
+ *   + phrase_emb[phrase_bucket] (bucketed at the super-token level)
+ *
+ * Rare tokens still benefit because most of their gradient lands in
+ * the (shared) char- and phrase-buckets, which other tokens with
+ * similar substrings or contexts are also updating.
+ *
+ * The trigram and phrase bucket lookups are precomputed at construction
+ * time from the BPE vocabulary file (hence the include of
+ * bpe_tokenizer.hpp) so that the forward pass is just three index_select
+ * calls + a sum — no string-processing on the hot path.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/nn/multi_res_embedding.hpp : MultiResEmbedding declaration.
+ *   - olmo_cpp/data/bpe_tokenizer.hpp     : used at construction to
+ *     enumerate the token strings so we can compute char trigrams.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/model/transformer.cpp: when cfg.use_multi_res, the Transformer
+ *     replaces torch::nn::Embedding with this MultiResEmbedding.
+ *   - tools/dump_embeddings.cpp: extracts the .semantic sub-codebook
+ *     when --multi_res is in effect (because the "semantic" stream is
+ *     the closest analogue to a classical embedding row).
+ *
+ * --- Role in training pipeline ---
+ *   First op in the forward pass when DC-MRE is enabled. Output shape
+ *   matches a plain Embedding: [B, S, d_model]. Constructed once at
+ *   model init.
+ */
 #include "olmo_cpp/nn/multi_res_embedding.hpp"
 #include "olmo_cpp/data/bpe_tokenizer.hpp"
 #include <algorithm>

@@ -1,3 +1,46 @@
+/**
+ * src/optim/muon.cpp
+ *
+ * ─── What Muon is ────────────────────────────────────────────────────
+ *
+ * Muon (Bernstein 2024) is a relatively new optimizer that has been
+ * reporting AdamW-beating results on transformer pre-training. The
+ * idea, in plain English:
+ *
+ *   - Take the usual momentum buffer m_t = β m_{t-1} + g_t.
+ *   - Treat m_t as a 2-D matrix (it usually IS — Linear weight grads
+ *     are 2-D). Compute the matrix's "polar factor": the orthogonal
+ *     part U V^T from its SVD U Σ V^T. This bounds every singular
+ *     value to 1 — every direction the optimizer steps in has equal
+ *     scale.
+ *   - Step: w_t ← w_{t-1} − lr · (polar(m_t) + λ w_{t-1}).
+ *
+ * Computing the polar factor exactly via SVD is too slow. Muon
+ * approximates it using a **Newton-Schulz** matrix iteration: a
+ * 5-step polynomial that converges to U V^T from a normalised input.
+ * Five matmuls per parameter per step — much cheaper than an SVD,
+ * still much more expensive than AdamW's elementwise update. The
+ * tradeoff is favourable when the optimiser is the bottleneck (large
+ * batch / small model) but not always otherwise.
+ *
+ * Muon is NOT used for 1-D tensors (norm scales, biases), embeddings,
+ * or the LM head — those are routed to AdamW elsewhere because the
+ * Newton-Schulz iteration is undefined for non-2D parameters.
+ *
+ * The "async_muon" flag (handled here on CUDA) overlaps the
+ * Newton-Schulz iteration with the next forward pass to hide its
+ * latency.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/optim/muon.hpp : MuonOptions + MuonOptimizer declarations.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/train.cpp: when optimizer="muon" in the .conf, the train
+ *     loop constructs MuonOptimizer and calls .step() each microbatch.
+ *
+ * --- Role in training pipeline ---
+ *   Replaces AdamW for 2-D weights when selected.
+ */
 #include "olmo_cpp/optim/muon.hpp"
 
 #ifdef USE_CUDA

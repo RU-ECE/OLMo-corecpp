@@ -1,4 +1,30 @@
 #pragma once
+/**
+ * include/olmo_cpp/optim/scheduler.hpp
+ *
+ * Learning-rate schedulers. Defines the LRScheduler base class plus
+ * factories for the four canonical shapes: constant, linear,
+ * cosine-with-warmup, cosine-with-floor.
+ *
+ * Schedulers are stateless — `get_lr(step)` is a pure function of
+ * the global step. This makes them trivial to checkpoint (just
+ * record the step) and predictable across resumes.
+ *
+ * See src/optim/scheduler.cpp for the implementation and the
+ * formulae for each shape.
+ *
+ * --- Includes from this project ---
+ *   (none — torch only.)
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/optim/scheduler.cpp : implementation.
+ *   - src/train.cpp           : queries scheduler.get_lr(step) every
+ *                                microbatch and updates the optimizer
+ *                                param-group lr field.
+ *
+ * --- Role in training pipeline ---
+ *   Drives lr over the run. The .conf's "scheduler" key picks the shape.
+ */
 #include <torch/torch.h>
 #include <cmath>
 #include <functional>

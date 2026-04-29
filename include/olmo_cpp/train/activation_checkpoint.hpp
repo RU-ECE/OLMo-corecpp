@@ -1,4 +1,28 @@
 #pragma once
+/**
+ * include/olmo_cpp/train/activation_checkpoint.hpp
+ *
+ * Activation checkpointing — drops intermediate activations during
+ * forward and re-runs the segment under enable_grad() during
+ * backward. Trades one extra forward for big memory savings. Crucial
+ * for fitting big models on limited VRAM (e.g. 125M+ on a 12 GB
+ * 3060).
+ *
+ * Implemented via a torch::autograd::Function. See
+ * src/train/activation_checkpoint.cpp for the longer description.
+ *
+ * --- Includes from this project ---
+ *   (none — torch only.)
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/train/activation_checkpoint.cpp : implementation.
+ *   - src/model/transformer.cpp / fused_transformer.cpp : forward()
+ *     wraps each block call when the .conf enables checkpointing.
+ *
+ * --- Role in training pipeline ---
+ *   Memory-saving optimisation, opt-in. Off in the 30M quickstart
+ *   conf (30M fits trivially); ON in the 125M conf.
+ */
 
 #include <torch/torch.h>
 #include <functional>

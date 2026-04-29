@@ -1,3 +1,30 @@
+/**
+ * src/data/composable/token_source.cpp
+ *
+ * Adapter layer in the composable data pipeline (see
+ * document_source.cpp's docblock for the full architecture).
+ *
+ * A TokenSource is a unified interface for "things that produce a
+ * stream of token ids", with concrete implementations for:
+ *
+ *   - a single .npy file (FileTokenSource),
+ *   - a SourceMixture combining several TokenSources at weighted
+ *     ratios (so multi-corpus pretraining drops in cleanly),
+ *   - a DocumentSource adapter (so the document-aware pipeline can
+ *     pretend its docs are just a flat token stream when the
+ *     consumer doesn't care about boundaries).
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/data/composable/token_source.hpp : declaration.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/data/composable/instance_source.cpp: instance sources read
+ *     from a TokenSource.
+ *
+ * --- Role in training pipeline ---
+ *   Active only in the composable data path. Inactive in the
+ *   quickstart's flow.
+ */
 #include "olmo_cpp/data/composable/token_source.hpp"
 #include <algorithm>
 #include <numeric>

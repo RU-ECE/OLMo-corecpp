@@ -1,4 +1,26 @@
 #pragma once
+/**
+ * include/olmo_cpp/model/convolution.hpp
+ *
+ * Declaration for CausalConv1d — a depthwise causal 1-D convolution
+ * used as a pre-attention "shift register" in some research configs
+ * (Mamba-like hybrid architectures).
+ *
+ * "Causal" means a token only sees past tokens (we left-pad). "Depth-
+ * wise" means each channel has its own filter and channels don't mix.
+ * See src/model/convolution.cpp for the longer explanation.
+ *
+ * --- Includes from this project ---
+ *   (none — torch only.)
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/model/convolution.cpp : implementation.
+ *   - src/model/block_variants.cpp : some block variants insert a
+ *     CausalConv1d before attention.
+ *
+ * --- Role in training pipeline ---
+ *   Optional. Inactive in the TinyStories quickstart flow.
+ */
 
 #include <torch/torch.h>
 

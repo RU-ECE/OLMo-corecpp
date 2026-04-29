@@ -1,3 +1,47 @@
+/**
+ * src/train/activation_checkpoint.cpp
+ *
+ * ─── What "activation checkpointing" is ─────────────────────────────
+ *
+ * To compute gradients via backprop, the framework normally keeps in
+ * memory every intermediate activation produced during forward — for
+ * a 32-layer model that's ~32x the activation memory of a single
+ * layer. On a 12 GB 3060 this can blow the VRAM budget for any
+ * serious model size.
+ *
+ * Activation checkpointing trades **compute** for **memory**: drop
+ * intermediate activations during forward, and **recompute** them
+ * during backward right before they're needed. You pay one extra
+ * forward pass per checkpointed segment but save the matching memory.
+ *
+ * This file wires that into LibTorch's autograd. We use a
+ * `torch::autograd::Function` — the standard primitive for inserting
+ * a custom forward/backward pair — whose forward saves only the
+ * input, and whose backward re-runs the segment under
+ * `torch::enable_grad()` to materialise gradients.
+ *
+ * Two policies (selected by cfg.activation_checkpoint_mode):
+ *   - "full"             : checkpoint every block.
+ *   - "selected_blocks"  : checkpoint every Nth block (controlled by
+ *                          activation_checkpoint_interval). Halving
+ *                          the count of checkpointed blocks roughly
+ *                          halves the memory savings AND halves the
+ *                          recompute cost.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/train/activation_checkpoint.hpp : entry-point decl.
+ *   - olmo_cpp/train/autocast_guard.hpp        : keeps the recompute
+ *     pass under the same autocast precision as the original forward.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/model/transformer.cpp / fused_transformer.cpp: forward()
+ *     wraps each block's call in checkpoint(...) when the .conf
+ *     enables it.
+ *
+ * --- Role in training pipeline ---
+ *   Memory-saving feature, opt-in. Off in the 30M quickstart conf
+ *   (it fits trivially in 12 GB) but ON in the 125M conf.
+ */
 #include "olmo_cpp/train/activation_checkpoint.hpp"
 #include "olmo_cpp/train/autocast_guard.hpp"
 

@@ -1,3 +1,31 @@
+/**
+ * src/model/fused_block.cpp
+ *
+ * The "fused" sister of block.cpp. Same algorithm — pre-norm
+ * attention + residual, then pre-norm FFN + residual — but using:
+ *
+ *   - FusedAttention (single QKV matmul instead of three separate
+ *     Q/K/V Linears, see fused_attention.cpp), and
+ *   - FeedForward(use_fused_gate_up=true) (single 2H-wide W1 matmul
+ *     instead of separate gate and up Linears, see feed_forward.cpp).
+ *
+ * The math is identical to a regular Block; only the matmul launch
+ * count is reduced. With cudaGraphs disabled, each kernel launch
+ * costs ~5-10 µs — saving 4 launches per block per fwd is a few
+ * percent of step time on a 4-layer model and more on big ones.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/model/fused_block.hpp : class declaration.
+ *   - olmo_cpp/backend/backend.hpp   : get_backend() for fused norms.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/model/fused_transformer.cpp: FusedTransformer instantiates
+ *     N of these and walks its ModuleList in forward().
+ *
+ * --- Role in training pipeline ---
+ *   The unit of repetition inside FusedTransformer. The quickstart's
+ *   3060 conf has fused=1 so this file is on the hot path.
+ */
 #include "olmo_cpp/model/fused_block.hpp"
 #include "olmo_cpp/backend/backend.hpp"
 

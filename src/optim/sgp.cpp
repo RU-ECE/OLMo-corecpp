@@ -1,3 +1,25 @@
+/**
+ * src/optim/sgp.cpp
+ *
+ * Speculative Gradient Prediction v1. The original of this idea —
+ * see sgp_v2.cpp's docblock for a longer description of the
+ * "predict-then-verify" approach.
+ *
+ * v1 vs v2 in one line: v1 uses a single shared predictor across all
+ * parameter groups and a looser acceptance criterion; v2 reuses that
+ * predictor across more parameters but tightens the threshold.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/optim/sgp.hpp : SGPOptimizer declaration.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/train.cpp: when sgp=1 + sgp_version=1, the train loop wraps
+ *     the inner optimizer in SGPOptimizer.
+ *
+ * --- Role in training pipeline ---
+ *   Wall-clock optimisation, opt-in. Off by default in the quickstart
+ *   flow.
+ */
 #include "olmo_cpp/optim/sgp.hpp"
 #include <ATen/ATen.h>
 

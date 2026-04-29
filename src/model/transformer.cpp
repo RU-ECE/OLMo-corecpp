@@ -1,3 +1,55 @@
+/**
+ * src/model/transformer.cpp
+ *
+ * ─── What a "transformer" is ────────────────────────────────────────
+ *
+ * A transformer is the neural network at the heart of every modern
+ * LLM. It maps a sequence of token ids into a sequence of probability
+ * distributions over the vocabulary (the next-token predictions).
+ * Internally:
+ *
+ *   ids: [B, S]                         (B = batch, S = sequence length)
+ *     │
+ *     ├─ Embedding lookup                  ──> h: [B, S, D]
+ *     ├─ N transformer blocks (each:
+ *     │    RMSNorm → Attention → residual
+ *     │    RMSNorm → FFN(SwiGLU) → residual)
+ *     ├─ Final RMSNorm
+ *     └─ LM head (Linear D → vocab_size)   ──> logits: [B, S, vocab]
+ *
+ * This file (`Transformer`) is the standard reference variant. It uses
+ * a plain Embedding + N "ReorderedNorm" blocks (defined in block.cpp).
+ *
+ * The "fused" sister (FusedTransformer in fused_transformer.cpp) is a
+ * faster variant that combines the QKV projections and the FFN
+ * gate+up projections into single Linear layers — same math, fewer
+ * kernel launches.
+ *
+ * MTP heads ("multi-token prediction"): an optional auxiliary that
+ * predicts the next K tokens at once, like medusa. Empty by default.
+ *
+ * Multi-res embedding (DC-MRE): swapped in via cfg.use_multi_res — see
+ * src/nn/multi_res_embedding.cpp for the longer explanation.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/model/transformer.hpp       : own class declaration.
+ *   - olmo_cpp/train/activation_checkpoint.hpp : per-block recompute
+ *                                                hook used inside forward
+ *                                                when activation_checkpoint
+ *                                                is enabled.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/main.cpp: instantiated when use_fused=0; forward() called
+ *     each microbatch from inside src/train.cpp.
+ *   - tools/dump_embeddings.cpp: instantiated read-only to extract
+ *     the embedding matrix from a checkpoint.
+ *
+ * --- Role in training pipeline ---
+ *   THE model. Every microbatch's forward() pass goes through the
+ *   constructor's submodules in order: embeddings → blocks → final
+ *   norm → lm_head. Loss is computed in src/train.cpp on the returned
+ *   logits.
+ */
 #include "olmo_cpp/model/transformer.hpp"
 #include "olmo_cpp/train/activation_checkpoint.hpp"
 #include <torch/nn/init.h>

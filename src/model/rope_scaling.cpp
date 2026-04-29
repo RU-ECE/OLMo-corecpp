@@ -1,3 +1,35 @@
+/**
+ * src/model/rope_scaling.cpp
+ *
+ * Implements four RoPE *scaling* variants used to extend a model's effective
+ * context length beyond what it saw during pre-training:
+ *   - ABFScaledRoPE      : Absolute Base Frequency — scale theta by a factor.
+ *   - PIScaledRoPE       : Position Interpolation (Chen et al., 2023).
+ *   - StepwiseScaledRoPE : NTK-aware stepwise interpolation (per-dim quant).
+ *   - YaRNScaledRoPE     : Peng et al. 2023, NTK-by-parts + attention factor.
+ * Each variant overrides only the inv_freq construction (or position scaling)
+ * and reuses the same rotate_half + apply_rotary mechanics as the standard
+ * RoPE in src/model/rope.cpp. Selection is config-driven for context-window
+ * extension experiments.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/model/rope_scaling.hpp: declares the four *Impl classes
+ *     wrapped by their TORCH_MODULE holders, plus RoPEBuffers reuse.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - Direct callers not located via quick grep. Wired in by builder code
+ *     that selects between RotaryEmbedding and one of these scaled variants
+ *     based on cfg.rope_scaling_type during model construction (see
+ *     src/model/transformer.cpp / fused_transformer.cpp RotaryEmbedding
+ *     instantiation; the scaled variants substitute in there for long-ctx
+ *     experiments).
+ *
+ * --- Role in training pipeline ---
+ *   When enabled, replaces the standard RoPE inside attention. Generates
+ *   sin/cos buffers once per (seq_len, device) and applies them to (q, k)
+ *   on every step. Used both for fine-tuning longer-context models from a
+ *   shorter-context checkpoint and for inference-only context extension.
+ */
 #include "olmo_cpp/model/rope_scaling.hpp"
 
 #include <cmath>
@@ -15,10 +47,14 @@ namespace olmo_cpp {
 // Helper: build sin/cos buffers from inv_freq and position sequence
 // ===========================================================================
 
+/// Build sin/cos buffers from a per-dim inv_freq and a per-position seq.
+/// Used by every variant; only the inv_freq formula differs across variants.
 static RoPEBuffers buffers_from_inv_freq(const torch::Tensor& inv_freq,
                                           const torch::Tensor& seq) {
   // inv_freq: (half_dim,)   seq: (seq_len,)
   auto freqs = seq.unsqueeze(1) * inv_freq.unsqueeze(0);  // (seq_len, half_dim)
+  // Duplicate halves so the result has the full head_dim layout that
+  // rotate_half + (cos, sin) decomposition expects.
   auto positions = torch::cat({freqs, freqs}, -1);         // (seq_len, dim)
   RoPEBuffers bufs;
   bufs.pos_sin = positions.sin();
@@ -26,6 +62,8 @@ static RoPEBuffers buffers_from_inv_freq(const torch::Tensor& inv_freq,
   return bufs;
 }
 
+/// Shared apply() body. Each variant passes its own rotate_half /
+/// apply_rotary as lambdas so the helper can stay variant-agnostic.
 static std::pair<torch::Tensor, torch::Tensor> apply_rope_to_qk(
     torch::Tensor q, torch::Tensor k, const RoPEBuffers& bufs,
     std::optional<int64_t> start_pos,
@@ -33,11 +71,14 @@ static std::pair<torch::Tensor, torch::Tensor> apply_rope_to_qk(
     std::function<torch::Tensor(torch::Tensor)> rotate_half_fn,
     std::function<torch::Tensor(torch::Tensor, torch::Tensor, torch::Tensor)>
         apply_rotary_fn) {
+  // Same prefill / decode position math as RotaryEmbeddingImpl::apply.
   auto q_len = q.size(2);
   auto k_len = k.size(2);
   int64_t q_abs_start = start_pos ? *start_pos : (k_len - q_len);
   int64_t k_abs_start = start_pos ? *start_pos : 0;
 
+  // Slice the buffer rows for our position window and unsqueeze leading
+  // dims so they broadcast across batch and head dimensions.
   auto sin_q = bufs.pos_sin.slice(0, q_abs_start, q_abs_start + q_len)
                    .unsqueeze(0)
                    .unsqueeze(0);
@@ -51,8 +92,9 @@ static std::pair<torch::Tensor, torch::Tensor> apply_rope_to_qk(
                    .unsqueeze(0)
                    .unsqueeze(0);
 
-  // Buffers are already on the correct device from get_buffers().
-  // Only cast dtype if needed (buffers are float32, q/k may differ).
+  // Buffers are already on the correct device from get_buffers(). We may
+  // still need a one-shot dtype cast — scaled variants build buffers in
+  // FP32 unconditionally, while q/k may be bf16 under AMP.
   if (sin_q.dtype() != q.dtype()) {
     sin_q = sin_q.to(q.dtype());
     cos_q = cos_q.to(q.dtype());
@@ -67,8 +109,15 @@ static std::pair<torch::Tensor, torch::Tensor> apply_rope_to_qk(
 
 // ===========================================================================
 // ABFScaledRoPE — Absolute Base Frequency scaling
+// Trick: replace theta by theta * scaling_factor everywhere, which lengthens
+// every rotational wavelength uniformly. Equivalent to a "linear" rescale of
+// frequencies; simple and works well when only mildly extending context.
 // ===========================================================================
 
+/// Construct an ABF-scaled RoPE.
+/// scaling_factor   : multiplier on theta. Empirical values are 4-32x.
+/// original_max_len : max position the underlying model was pre-trained for
+///                     (informational only here).
 ABFScaledRoPEImpl::ABFScaledRoPEImpl(int64_t head_size, int64_t theta,
                                       double scaling_factor,
                                       int64_t original_max_len)
@@ -77,11 +126,14 @@ ABFScaledRoPEImpl::ABFScaledRoPEImpl(int64_t head_size, int64_t theta,
       scaling_factor_(scaling_factor),
       original_max_len_(original_max_len) {}
 
+/// Same rotate_half as standard RoPE; duplicated to keep classes decoupled.
 torch::Tensor ABFScaledRoPEImpl::rotate_half(torch::Tensor x) {
   auto chunks = x.chunk(2, -1);
   return torch::cat({-chunks[1], chunks[0]}, -1);
 }
 
+/// Apply rotation: y = t * cos + rotate_half(t) * sin. ATen path (no backend
+/// dispatch), to_dtype keeps the result in the input dtype after broadcasting.
 torch::Tensor ABFScaledRoPEImpl::apply_rotary(torch::Tensor t,
                                                 torch::Tensor sin,
                                                 torch::Tensor cos) {

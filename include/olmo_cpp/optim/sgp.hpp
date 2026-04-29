@@ -1,4 +1,23 @@
 #pragma once
+/**
+ * include/olmo_cpp/optim/sgp.hpp
+ *
+ * Header for the Speculative Gradient Prediction v1 optimizer wrapper.
+ * SGP attempts to predict the next gradient from history with a tiny
+ * linear model so the optimizer can step k>1 times between actual
+ * backward passes; see src/optim/sgp.cpp for the longer explanation.
+ *
+ * --- Includes from this project ---
+ *   (none — declares a class and uses LibTorch types.)
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/optim/sgp.cpp        : implements every method here.
+ *   - src/train.cpp            : wraps the inner optimizer in SGP
+ *                                 when sgp=1 + sgp_version=1.
+ *
+ * --- Role in training pipeline ---
+ *   Optional wall-clock optimisation. Off in the quickstart flow.
+ */
 #include <torch/torch.h>
 #include <vector>
 #include <string>

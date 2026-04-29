@@ -1,3 +1,41 @@
+/**
+ * src/distributed/tensor_parallel.cpp
+ *
+ * ─── What "Tensor Parallelism" is ───────────────────────────────────
+ *
+ * TP (Megatron-LM, 2019) splits the *weight matrices themselves*
+ * across GPUs. For a Linear layer y = x · W with W of shape [in, out]:
+ *
+ *   "column-parallel": each rank holds W[:, slice], computes a partial
+ *     output [in, out/world_size], and the activations are concatenated
+ *     across ranks (all_gather, but typically deferred).
+ *
+ *   "row-parallel":    each rank holds W[slice, :], computes a partial
+ *     sum over a slice of the input dim, and an **all_reduce** sums
+ *     the partials to get the true output.
+ *
+ * In a transformer block the standard recipe is:
+ *   QKV projection — column-parallel
+ *   attention output projection — row-parallel  (allreduce here)
+ *   FFN up/gate — column-parallel
+ *   FFN down — row-parallel  (allreduce here)
+ *
+ * So TP costs two allreduces per block per fwd, two per bwd. That's
+ * heavy bandwidth — TP is usually only used inside a single node where
+ * NVLink can keep up, and combined with DP/PP across nodes.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/distributed/tensor_parallel.hpp : TP context + helpers.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/model/attention.cpp / feed_forward.cpp: when a TP context is
+ *     present, the linear ops dispatch to TP-aware variants that
+ *     allreduce.
+ *
+ * --- Role in training pipeline ---
+ *   Used when a single layer's weights don't fit on one device.
+ *   Disabled by default; activated when world_size_tp > 1.
+ */
 #include "olmo_cpp/distributed/tensor_parallel.hpp"
 
 namespace olmo_cpp {

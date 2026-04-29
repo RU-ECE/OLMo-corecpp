@@ -1,3 +1,35 @@
+/**
+ * src/nn/hf_convert.cpp
+ *
+ * Implements the OLMo<->HuggingFace checkpoint conversion utilities declared
+ * in hf_convert.hpp. Three layers:
+ *
+ *   - StateMapping::create_*       — builds the OLMo<->HF parameter-name map.
+ *   - HFConverter::convert_*       — applies the map to in-memory state dicts
+ *                                    and to on-disk checkpoints.
+ *   - safetensors::{load,save}     — minimal but spec-correct safetensors I/O.
+ *
+ * Safetensors layout (used here):
+ *     [8 bytes header_size, little-endian]  [JSON header]  [raw tensor bytes]
+ * The JSON header maps each tensor name to {dtype, shape, data_offsets}, where
+ * offsets are byte ranges into the trailing blob.
+ *
+ * --- Includes from this project ---
+ *   - "olmo_cpp/nn/hf_convert.hpp": class declarations.
+ *   - <torch/serialize.h>: torch::serialize::{Input,Output}Archive for .pt I/O.
+ *   - <filesystem>: directory creation and existence checks.
+ *   - <fstream>, <sstream>, <stdexcept>, <algorithm>, <cstring>: std utilities.
+ *   - <nlohmann/json.hpp> (optional): JSON parsing for safetensors headers
+ *     and HF config files; gated on HAS_NLOHMANN_JSON.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - tools/convert_hf.cpp: CLI front-end calls HFConverter directly.
+ *
+ * --- Role in training pipeline ---
+ *   Off the hot path. Used to ingest published Llama/OLMo checkpoints (warm
+ *   start) and to publish our own checkpoints back to HF format for evals.
+ */
+
 #include "olmo_cpp/nn/hf_convert.hpp"
 #include <torch/serialize.h>
 #include <filesystem>
@@ -11,6 +43,8 @@
 #include <nlohmann/json.hpp>
 #endif
 
+// Local alias so we can write `fs::create_directories(...)` instead of the
+// fully-qualified std::filesystem name.
 namespace fs = std::filesystem;
 
 namespace olmo_cpp {

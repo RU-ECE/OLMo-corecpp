@@ -1,3 +1,24 @@
+/**
+ * src/eval/evaluator.cpp
+ *
+ * Generic multi-task evaluation orchestrator. The training loop
+ * registers a list of EvalTask objects (each with a name, a dataset,
+ * and a metric function) and `MultiTaskEvaluator::run(model)` walks
+ * them in order, returning a structured report.
+ *
+ * Used to keep the training-loop code agnostic of WHICH evaluations
+ * the user has configured — adding a new task is just registering
+ * one more EvalTask.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/eval/evaluator.hpp : MultiTaskEvaluator + EvalTask.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/train.cpp: evaluator is invoked every `eval_interval` steps.
+ *
+ * --- Role in training pipeline ---
+ *   Periodic monitoring. Inactive between eval points.
+ */
 #include "olmo_cpp/eval/evaluator.hpp"
 #include <iostream>
 

@@ -1,3 +1,31 @@
+/**
+ * src/data/source_mixture.cpp
+ *
+ * ─── What "source mixing" is ────────────────────────────────────────
+ *
+ * Real LLM training rarely uses one corpus; it mixes several at fixed
+ * ratios — e.g. "70% web, 20% code, 10% papers". SourceMixture takes a
+ * list of (TokenSource, weight) pairs and at each batch decides which
+ * source to draw from according to those weights. This is the way
+ * data-engineers control what the model "specialises in" without
+ * having to physically interleave files on disk.
+ *
+ * The sampling is **stochastic** with the requested per-source
+ * probabilities, but a low-discrepancy scheme keeps the long-run
+ * empirical mix close to the target (so a small batch isn't
+ * accidentally 95% one source).
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/data/source_mixture.hpp : SourceMixture declaration.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/data/composable/token_source.cpp: a SourceMixture is one
+ *     possible TokenSource in the composable data pipeline.
+ *
+ * --- Role in training pipeline ---
+ *   Used only when multiple data sources are configured. The
+ *   quickstart's single-source TinyStories run does NOT exercise it.
+ */
 #include "olmo_cpp/data/source_mixture.hpp"
 #include <fstream>
 #include <sstream>

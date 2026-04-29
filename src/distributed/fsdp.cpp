@@ -1,3 +1,41 @@
+/**
+ * src/distributed/fsdp.cpp
+ *
+ * ─── What FSDP is ────────────────────────────────────────────────────
+ *
+ * FSDP = **F**ully **S**harded **D**ata **P**arallel (Meta, 2022).
+ *
+ * Plain DDP keeps a full copy of the model on every GPU. For a 70B
+ * parameter model in BF16 that's 140 GB — too big for a single GPU.
+ *
+ * FSDP shards each parameter across all ranks, so each GPU only
+ * stores 1/world_size of every weight, gradient, and optimizer-state
+ * tensor. When a layer's forward needs the full parameter, an
+ * **all_gather** reconstructs it on the fly into a temporary buffer;
+ * after the layer is done the buffer is freed. After backward, the
+ * gradients are **reduce_scattered** so each rank only ends up
+ * holding the gradient slice corresponding to its parameter shard.
+ *
+ *   forward:  for each layer:  all_gather(params) → compute → free
+ *   backward: for each layer:  all_gather(params) → backward → free
+ *                              reduce_scatter(grads)
+ *
+ * The cost is the extra communication. The benefit is that the
+ * memory footprint per GPU shrinks linearly with world_size, so you
+ * can train models that would not otherwise fit anywhere.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/distributed/fsdp.hpp : FSDPContext + sharding helpers.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/train.cpp: when FSDP is configured, the train loop uses
+ *     FSDPContext::pre_forward / post_backward hooks.
+ *
+ * --- Role in training pipeline ---
+ *   Memory-saving alternative to DDP for very large models. Like the
+ *   other DDP-family files, the implementation is gated by OLMO_HAS_DDP.
+ *   Single-GPU runs (the 3060 quickstart) don't touch this file.
+ */
 #include "olmo_cpp/distributed/fsdp.hpp"
 #include <algorithm>
 #include <cmath>

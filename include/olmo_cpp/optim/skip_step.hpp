@@ -1,4 +1,23 @@
 #pragma once
+/**
+ * include/olmo_cpp/optim/skip_step.hpp
+ *
+ * Header for SkipStepOptimizer. This is a defensive wrapper that
+ * intercepts step() — if the gradient is NaN/Inf or has a norm well
+ * above the recent moving average, it just doesn't apply the update
+ * (the model is left untouched). See src/optim/skip_step.cpp for
+ * the longer explanation.
+ *
+ * --- Includes from this project ---
+ *   (none — torch only.)
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/optim/skip_step.cpp : implementation.
+ *   - src/train.cpp           : optional wrap of the inner optimizer.
+ *
+ * --- Role in training pipeline ---
+ *   Optional defensive layer. Especially useful in BF16/FP8 training.
+ */
 #include <torch/torch.h>
 #include <deque>
 #include <memory>

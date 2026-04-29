@@ -1,3 +1,37 @@
+/**
+ * src/generate/speculative_decode.cpp
+ *
+ * ─── What "speculative decoding" is ─────────────────────────────────
+ *
+ * At inference time, generating each output token requires a full
+ * forward pass through the big model — slow. Speculative decoding
+ * (Leviathan, 2022) speeds this up by using a SMALL "draft" model to
+ * propose K candidate next tokens cheaply, then having the BIG model
+ * **verify** all K in a single batched forward pass.
+ *
+ *     repeat:
+ *       drafts = small_model.generate(K tokens)         // cheap
+ *       logits = big_model.forward(prompt + drafts)     // one batched call
+ *       for each draft, accept if it matches what big_model would
+ *       have produced; on first rejection, sample one fresh token
+ *       from big_model and continue.
+ *
+ * The end result is BIT-FOR-BIT identical to greedy or sampled
+ * generation from the big model alone, but typically 2-3x faster
+ * because the big-model forward is K times cheaper per generated
+ * token whenever the small model gets at least some drafts right.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/generate/speculative_decode.hpp : declaration.
+ *   - olmo_cpp/profiler.hpp                    : ProfileScope around
+ *                                                 draft / verify.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - tools/chat.cpp: optional fast-path for interactive generation.
+ *
+ * --- Role in training pipeline ---
+ *   Inference-time only. Not used during training.
+ */
 #include "olmo_cpp/generate/speculative_decode.hpp"
 #include "olmo_cpp/profiler.hpp"
 #include <algorithm>

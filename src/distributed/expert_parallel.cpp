@@ -1,3 +1,36 @@
+/**
+ * src/distributed/expert_parallel.cpp
+ *
+ * ─── What "Expert Parallelism" is ──────────────────────────────────
+ *
+ * MoE = **M**ixture **o**f **E**xperts. Instead of every token going
+ * through one big FFN, an MoE layer has N small "expert" FFNs and a
+ * lightweight router. The router picks top-k experts per token; only
+ * those experts compute. Result: more total parameters at the same
+ * per-token compute. (See src/model/moe/* for the math.)
+ *
+ * With many experts and many GPUs, "Expert Parallelism" assigns each
+ * GPU a disjoint subset of the experts. A token's hidden state is
+ * shipped to whichever GPU owns the expert it was routed to, the
+ * expert FFN runs there, and the result is shipped back.
+ *
+ * The collective primitive used is **all_to_all**: each rank sends a
+ * shard of its tokens to every other rank and simultaneously receives
+ * a shard from every other rank. Two all_to_alls per layer (dispatch
+ * + combine).
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/distributed/expert_parallel.hpp : context + EP utilities.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/model/moe/moe.cpp: when EP is configured, MoELayer routes
+ *     tokens through ExpertParallelContext::dispatch / combine.
+ *
+ * --- Role in training pipeline ---
+ *   Active only when use_moe=1 and an expert-parallel sub-group exists.
+ *   Without Gloo (the OLMO_HAS_DDP guard) the file collapses to no-op
+ *   stubs. The quickstart's single-GPU 3060 flow does NOT use this.
+ */
 #include "olmo_cpp/distributed/expert_parallel.hpp"
 #include <stdexcept>
 

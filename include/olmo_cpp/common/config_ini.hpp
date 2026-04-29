@@ -1,4 +1,42 @@
 #pragma once
+/**
+ * include/olmo_cpp/common/config_ini.hpp
+ *
+ * Header-only INI-style key/value parser. The .conf files in conf/
+ * (e.g. conf/quickstart_3060.conf) are read with this — it provides
+ * `ConfigINI(path, section)` and a `get<T>(key)` /
+ * `get_or<T>(key, default)` API.
+ *
+ * Format:
+ *
+ *   [section_name]
+ *   key1   value1
+ *   key2   value2     # comment
+ *
+ *   [other_section]
+ *   ...
+ *
+ * Whitespace separates key from value (tabs preferred); '#' starts a
+ * comment. Sections are mutually exclusive — you instantiate one
+ * ConfigINI per [section] you want to read.
+ *
+ * Header-only because it's tiny and used by both the C++ training
+ * binary and the standalone tools (which don't link to any common
+ * lib that would otherwise own the implementation).
+ *
+ * --- Includes from this project ---
+ *   (none — pure stdlib + templates.)
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/main.cpp: parses every .conf section into TrainingConfig +
+ *     TransformerConfig.
+ *   - tools/dump_embeddings.cpp: re-parses the same .conf to know
+ *     what shape model to allocate before loading the checkpoint.
+ *
+ * --- Role in training pipeline ---
+ *   The single source of truth for "what the user typed in their
+ *   .conf". Anything not in the .conf falls back to its default.
+ */
 
 #include <string>
 #include <unordered_map>

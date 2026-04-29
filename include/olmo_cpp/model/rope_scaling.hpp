@@ -1,4 +1,38 @@
 #pragma once
+/**
+ * include/olmo_cpp/model/rope_scaling.hpp
+ *
+ * ─── What "RoPE scaling" is ─────────────────────────────────────────
+ *
+ * RoPE (rotary position embeddings, see kernels/rope.cu) was designed
+ * for a fixed maximum context length. If you trained on 4k tokens
+ * and try to do inference on 32k, naive RoPE breaks because the
+ * angles for positions > 4k are frequencies it has never seen.
+ *
+ * Several scaling techniques rescale the per-frequency angles so
+ * that long-context inference / fine-tuning works:
+ *
+ *   - **PositionInterpolation**: linear scale of position indices.
+ *     Simple, slightly degrades short-context quality.
+ *   - **ABF** (Adjusted Base Frequency): retunes the base frequency.
+ *   - **YaRN**: piecewise re-scaling that preserves high-frequency
+ *     pairs and only rescales the low-frequency ones — best
+ *     long-context preservation.
+ *   - **Stepwise**: piecewise constant rescaling between regimes.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/model/rope.hpp : RoPEBuffers struct that the scalers
+ *     populate / mutate.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/model/rope_scaling.cpp : implementations.
+ *   - src/model/rope.cpp : applies the chosen scaling at buffer
+ *     construction time, before any forward call.
+ *
+ * --- Role in training pipeline ---
+ *   One-shot at model init when cfg.rope_scaling_type != None.
+ *   Off in the quickstart conf (rope_scaling_type=none).
+ */
 
 #include "olmo_cpp/model/rope.hpp"
 

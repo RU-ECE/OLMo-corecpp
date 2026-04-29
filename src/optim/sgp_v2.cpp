@@ -1,3 +1,35 @@
+/**
+ * src/optim/sgp_v2.cpp
+ *
+ * ─── What "Speculative Gradient Prediction" is ──────────────────────
+ *
+ * Backward passes are expensive — typically as costly as the forward
+ * pass. SGP is an experimental technique in this repo that asks: can
+ * we sometimes *predict* the next k gradients from history, take an
+ * optimistic step, and only run a real backward to verify every k
+ * steps?
+ *
+ * The predictor is a tiny low-rank linear model fit to the recent
+ * sequence of (parameter, gradient) pairs. If its prediction lands
+ * close enough to the verified gradient, k can grow; if it's wrong,
+ * we roll back, fall back to k=1, and retrain the predictor.
+ *
+ * v2 differs from v1 (sgp.cpp) by:
+ *   - reusing the predictor across more parameter groups,
+ *   - using a tighter rejection criterion, so it accepts predictions
+ *     less often but mis-applies them less often.
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/optim/sgp_v2.hpp : SGPv2 wrapper + state.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   - src/train.cpp: when sgp=1 + sgp_version=2 in the .conf, the
+ *     train loop wraps the inner optimizer in SGPv2.
+ *
+ * --- Role in training pipeline ---
+ *   Optional wall-clock optimisation. Off by default in the quickstart
+ *   flow.
+ */
 #include "olmo_cpp/optim/sgp_v2.hpp"
 #include <ATen/ATen.h>
 #include <algorithm>

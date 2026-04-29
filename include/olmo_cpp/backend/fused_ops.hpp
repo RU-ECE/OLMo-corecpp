@@ -1,5 +1,38 @@
 #pragma once
 
+/**
+ * include/olmo_cpp/backend/fused_ops.hpp
+ *
+ * Free-function helpers that compose multiple ATen ops into a smaller
+ * number of GEMMs / kernel launches:
+ *   - fused_qkv_projection: 1 GEMM instead of 3 for the Q,K,V heads.
+ *   - fused_attention:       reference SDPA (currently the textbook
+ *                            softmax(QK^T/sqrt(d))V).
+ *   - fused_swiglu_ffn:      gate+up share a single GEMM, then SiLU*mul
+ *                            via the active backend, then down GEMM.
+ *   - fused_residual_norm:   residual add + RMSNorm (+ optional dropout).
+ *   - fused_gate_up_projection: just the gate+up GEMM-then-split half
+ *                            of fused_swiglu_ffn for callers that want
+ *                            it standalone.
+ *
+ * These are *not* IBackend methods — they are recipes that *call into*
+ * the active backend for the elementwise pieces and let LibTorch handle
+ * the matmuls (which are already fast cuBLAS/MKL).
+ *
+ * --- Includes from this project ---
+ *   - olmo_cpp/backend/backend.hpp (in .cpp): get_backend() for the
+ *     elementwise SiLU*mul and rms_norm steps.
+ *
+ * --- Callers (concrete uses elsewhere) ---
+ *   Direct callers not located via quick grep — these are utility
+ *   recipes intended for FusedTransformer / FusedBlock and tests.
+ *
+ * --- Role in training pipeline ---
+ *   These compositions live one level above the IBackend ops. They
+ *   exist so the FusedTransformer can write `auto qkv = fused_qkv...`
+ *   and have a single hook to optimize, rather than three Linears.
+ */
+
 #include <torch/torch.h>
 #include <optional>
 

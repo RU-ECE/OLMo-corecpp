@@ -409,13 +409,16 @@ int64_t speculative_decode_step(
   auto temp_tokens = all_tokens;
   temp_tokens.push_back(main_token);
 
-  // TODO(fast-inference [10a]): k separate D->H copies + k sample_logits calls.
-  // Stack draft_logits_list into one [k, V] tensor, do one .cpu(), and either
-  // (a) one fused-sampler launch for all k positions (depends on [6]), or
-  // (b) loop on host over a single contiguous buffer. Free perf, no algorithm
-  // change required.
+  // Stack all draft logits into one [num_drafts, V] tensor and do a single
+  // device->host copy instead of k separate ones. Sampling itself stays
+  // sequential because each step's rep_penalty depends on the previous
+  // draft (temp_tokens grows per iteration). Bandwidth win: 1 sync + 1
+  // transfer instead of k. (fast-inference [10a])
+  auto draft_logits_stacked = torch::stack(draft_logits_list);  // [k, V] on device
+  auto draft_logits_cpu = draft_logits_stacked.cpu().contiguous();
+
   for (int64_t k = 0; k < num_drafts; ++k) {
-    auto dl = draft_logits_list[k].cpu().contiguous();
+    auto dl = draft_logits_cpu.select(0, k);  // [V] view, no copy
     dl = apply_repetition_penalty(dl, temp_tokens, repetition_penalty);
     int64_t draft_tok = sample_logits(dl, temperature, top_k, top_p, rng);
     draft_tokens.push_back(draft_tok);

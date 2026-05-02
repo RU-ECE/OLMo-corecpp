@@ -68,6 +68,9 @@
 #include "olmo_cpp/backend/simd_backend.hpp"
 #include "olmo_cpp/backend/topp_radix.hpp"
 #include "olmo_cpp/backend/fused_lm_head_sample.hpp"
+#include "olmo_cpp/backend/lm_head_gemv.hpp"
+#include "olmo_cpp/backend/persistent_decode.hpp"
+#include "olmo_cpp/generate/draft_model_speculative.hpp"
 #include <torch/torch.h>
 #include <iostream>
 #include <string>
@@ -391,7 +394,8 @@ int64_t speculative_decode_step(
     olmo_cpp::BPETokenizer& tokenizer,
     int64_t& total_drafted,
     int64_t& total_accepted,
-    int64_t max_drafts) {  // (fast-inference [10b]) caller's dynamic cap
+    int64_t max_drafts,    // (fast-inference [10b]) caller's dynamic cap
+    bool use_custom_lm_head_gemv) {  // (fast-inference [11])
 
   // Honor the dynamic cap: never exceed the model's MTP head count, but
   // allow the caller to draft fewer when running acceptance is poor.
@@ -412,10 +416,17 @@ int64_t speculative_decode_step(
   auto last_hidden = hidden.select(1, 0);  // [1, d_model]
 
   // Step 2: Main head prediction for position t+1.
-  // Skip an explicit .cpu() — sample_logits transfers via pinned memory
-  // internally. (fast-inference [12d])
-  auto main_logits = model->apply_lm_head(last_hidden.unsqueeze(1))
-                         .squeeze(0).squeeze(0);
+  // (fast-inference [11]) Optionally route the LM-head projection through
+  // the custom GEMV kernel; behaviorally identical to apply_lm_head.
+  // (fast-inference [12d]) sample_logits transfers via pinned memory.
+  torch::Tensor main_logits;
+  if (use_custom_lm_head_gemv) {
+    auto h = last_hidden.squeeze(0);  // [d_model]
+    main_logits = olmo_cpp::lm_head_gemv(h, model->lm_head_weight());
+  } else {
+    main_logits = model->apply_lm_head(last_hidden.unsqueeze(1))
+                       .squeeze(0).squeeze(0);
+  }
   int64_t main_token = sample_logits(main_logits, temperature, top_k, top_p,
                                      all_tokens, repetition_penalty, rng);
 
@@ -548,6 +559,19 @@ int main(int argc, char** argv) {
   // because it changes sampling semantics (Philox RNG, not std::mt19937).
   bool use_fused_sampler = false;
   uint64_t fused_seed = 0xC0FFEEULL;  // override-able via --fused-seed
+  // fast-inference [11]: route LM-head projection through the custom
+  // GEMV kernel instead of cuBLAS-via-Linear. Behaviorally identical
+  // (same logits), perf only.
+  bool use_custom_lm_head_gemv = false;
+  // fast-inference [13]: route the (greedy/temp-only) sampler through
+  // the persistent-decode handle. Currently a stub that delegates
+  // synchronously to fused_lm_head_sample; demonstrates the API path.
+  bool use_persistent_decode = false;
+  // fast-inference [17]: two-model speculative decoding. When both
+  // a draft checkpoint and config are supplied, switches the
+  // speculative path to use a separate small model instead of MTP.
+  std::string draft_checkpoint_path;
+  std::string draft_config_path;
   std::string structural_config;
 
   for (int i = 1; i < argc; ++i) {
@@ -569,6 +593,12 @@ int main(int argc, char** argv) {
     else if (arg == "--fused-sampler") use_fused_sampler = true;
     else if (arg == "--fused-seed" && i + 1 < argc)
       fused_seed = std::stoull(argv[++i]);
+    else if (arg == "--custom-lm-head-gemv") use_custom_lm_head_gemv = true;
+    else if (arg == "--persistent-decode") use_persistent_decode = true;
+    else if (arg == "--draft-checkpoint" && i + 1 < argc)
+      draft_checkpoint_path = argv[++i];
+    else if (arg == "--draft-config" && i + 1 < argc)
+      draft_config_path = argv[++i];
   }
 
   if (checkpoint_path.empty() || config_path.empty() || vocab_path.empty() || merges_path.empty()) {
@@ -587,7 +617,12 @@ int main(int argc, char** argv) {
               << "  --fused-sampler            (use fused LM-head + Gumbel-max sampler;\n"
               << "                              forces top_k=0, top_p=1.0, rep_penalty=1.0;\n"
               << "                              Philox RNG, not std::mt19937)\n"
-              << "  --fused-seed <uint64>      (RNG seed for the fused sampler)\n";
+              << "  --fused-seed <uint64>      (RNG seed for the fused sampler)\n"
+              << "  --custom-lm-head-gemv      (use custom GEMV kernel for the LM head)\n"
+              << "  --persistent-decode        (route greedy/temp sampling through the\n"
+              << "                              persistent-decode handle; stub for now)\n"
+              << "  --draft-checkpoint <path>  (draft model .pt for two-model speculative)\n"
+              << "  --draft-config <path>      (draft model JSON config)\n";
     return 1;
   }
 
@@ -654,6 +689,22 @@ int main(int argc, char** argv) {
 
     olmo_cpp::Transformer model(cfg);
     torch::load(model, checkpoint_path);
+
+    // (fast-inference [17]) Optional draft model for two-model speculative.
+    std::unique_ptr<olmo_cpp::Transformer> draft_model;
+    if (!draft_checkpoint_path.empty() && !draft_config_path.empty()) {
+      auto draft_cfg = olmo_cpp::load_config_from_json(draft_config_path);
+      draft_cfg.validate();
+      draft_model = std::make_unique<olmo_cpp::Transformer>(draft_cfg);
+      torch::load(*draft_model, draft_checkpoint_path);
+      (*draft_model)->to(device);
+      (*draft_model)->eval();
+      std::cout << "Loaded draft model from " << draft_checkpoint_path
+                << " (two-model speculative enabled)\n";
+    } else if (!draft_checkpoint_path.empty() || !draft_config_path.empty()) {
+      std::cout << "Note: --draft-checkpoint and --draft-config must both be set"
+                   " for two-model speculative; ignoring partial spec.\n";
+    }
     model->to(device);
     model->eval();
 
@@ -767,6 +818,55 @@ int main(int argc, char** argv) {
       auto gen_start = std::chrono::steady_clock::now();
       int64_t tokens_generated = 0;
 
+      // (fast-inference [17]) When a draft model is loaded, route the
+      // speculative path through the two-model implementation instead of
+      // the MTP-head version. Both share the chat loop's state.
+      if (do_speculative && draft_model) {
+        olmo_cpp::DraftModelSpeculativeState dms(
+            &model, draft_model.get(),
+            model->n_layers(), (*draft_model)->n_layers(), device);
+
+        // Prefill both models so their KV caches are warm.
+        {
+          auto prefill_input = torch::tensor(
+              at::IntArrayRef(all_tokens.data(), all_tokens.size()),
+              torch::kInt64).unsqueeze(0).to(device);
+          torch::NoGradGuard no_grad;
+          model->forward(prefill_input, c10::nullopt, -100, &dms.target_kv);
+          (*draft_model)->forward(prefill_input, c10::nullopt, -100, &dms.draft_kv);
+#ifdef __APPLE__
+          if (is_mps) torch::mps::synchronize();
+#endif
+        }
+
+        while (static_cast<int64_t>(all_tokens.size()) < max_total) {
+          if (!all_tokens.empty() && all_tokens.back() == static_cast<int64_t>(tokenizer.eos_id()))
+            break;
+          int64_t accepted = olmo_cpp::draft_model_speculative_step(
+              dms, all_tokens, device, temperature, top_k, top_p,
+              repetition_penalty, rng, tokenizer);
+          tokens_generated += accepted;
+          // Stream the accepted tail.
+          int64_t start = static_cast<int64_t>(all_tokens.size()) - accepted;
+          std::vector<uint32_t> emit;
+          for (int64_t i = start; i < static_cast<int64_t>(all_tokens.size()); ++i) {
+            emit.push_back(static_cast<uint32_t>(all_tokens[i]));
+          }
+          std::cout << decode_tokens(emit) << std::flush;
+        }
+
+        auto gen_end_dms = std::chrono::steady_clock::now();
+        double gen_s = std::chrono::duration<double>(gen_end_dms - gen_start).count();
+        double tok_per_s = tokens_generated / (gen_s > 0 ? gen_s : 1);
+        double ar = dms.total_drafted > 0
+                        ? 100.0 * dms.total_accepted / dms.total_drafted : 0.0;
+        std::cout << "\n[" << tokens_generated << " tokens, "
+                  << std::fixed << std::setprecision(1) << tok_per_s << " tok/s, "
+                  << "draft-model-spec, " << std::setprecision(0) << ar << "% accepted]\n"
+                  << std::endl;
+        continue;
+      }
+
       if (do_speculative) {
         // === MTP Speculative Decoding with KV Cache ===
         // Prefill: run full prompt through backbone to warm KV cache
@@ -809,7 +909,8 @@ int main(int argc, char** argv) {
           int64_t accepted = speculative_decode_step(
               model, all_tokens, spec_kv, device, temperature, top_k, top_p,
               repetition_penalty, rng, tokenizer, total_drafted, total_accepted,
-              /*max_drafts=*/dyn_k);
+              /*max_drafts=*/dyn_k,
+              /*use_custom_lm_head_gemv=*/use_custom_lm_head_gemv);
           tokens_generated += accepted;
 
           if (++steps_since_adjust >= kAdjustEvery) {
@@ -852,6 +953,23 @@ int main(int argc, char** argv) {
         // Each generated token gets a unique (seed, position) pair; resetting
         // here so a fresh turn starts at 0.
         uint32_t fused_pos = 0;
+        // (fast-inference [13]) Optionally route greedy/temp sampling
+        // through the persistent-decode handle. Currently a synchronous
+        // stub; future real implementation runs a long-lived CUDA kernel.
+        std::unique_ptr<olmo_cpp::PersistentDecode> pd;
+        if (use_persistent_decode && use_fused_sampler) {
+          pd = std::make_unique<olmo_cpp::PersistentDecode>(
+              cfg.vocab_size, cfg.d_model, device, fused_seed);
+        }
+        auto sample_fused = [&](torch::Tensor h) -> int64_t {
+          float t = static_cast<float>(temperature > 0 ? temperature : 1.0);
+          if (pd) {
+            int slot = pd->enqueue(h, model->lm_head_weight(), t, fused_pos++);
+            return pd->poll(slot);
+          }
+          return olmo_cpp::fused_lm_head_sample(
+              h, model->lm_head_weight(), t, fused_seed, fused_pos++);
+        };
         {
           auto input = torch::from_blob(all_tokens.data(), {1, prompt_len},
                                         torch::TensorOptions().dtype(torch::kInt64))
@@ -860,14 +978,9 @@ int main(int argc, char** argv) {
           torch::NoGradGuard no_grad;
           int64_t next_id;
           if (use_fused_sampler) {
-            // (fast-inference [6]) Get hidden via forward_backbone, then call
-            // fused LM-head + Gumbel-max sampler. Skips materializing logits.
             auto hidden = model->forward_backbone(input, &kv_cache);
             auto last_hidden = hidden.select(1, hidden.size(1) - 1).squeeze(0);
-            next_id = olmo_cpp::fused_lm_head_sample(
-                last_hidden, model->lm_head_weight(),
-                static_cast<float>(temperature > 0 ? temperature : 1.0),
-                fused_seed, fused_pos++);
+            next_id = sample_fused(last_hidden);  // [6] / [13] routing
           } else {
             auto logits = model->forward(input, c10::nullopt, -100, &kv_cache);
             auto next_logits = logits.select(1, logits.size(1) - 1).squeeze(0);
@@ -891,14 +1004,9 @@ int main(int argc, char** argv) {
           torch::NoGradGuard no_grad;
           int64_t next_id;
           if (use_fused_sampler) {
-            // (fast-inference [6]) Same fused path as prefill: hidden ->
-            // single-kernel sample, no logits materialized.
             auto hidden = model->forward_backbone(input, &kv_cache);
             auto last_hidden = hidden.select(1, hidden.size(1) - 1).squeeze(0);
-            next_id = olmo_cpp::fused_lm_head_sample(
-                last_hidden, model->lm_head_weight(),
-                static_cast<float>(temperature > 0 ? temperature : 1.0),
-                fused_seed, fused_pos++);
+            next_id = sample_fused(last_hidden);  // [6] / [13] routing
           } else {
             auto logits = model->forward(input, c10::nullopt, -100, &kv_cache);
             auto next_logits = logits.select(1, logits.size(1) - 1).squeeze(0);

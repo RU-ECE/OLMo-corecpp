@@ -117,7 +117,181 @@ torch::Tensor apply_repetition_penalty(torch::Tensor logits,
   return logits;
 }
 
+// =====================================================================
+// FAST-INFERENCE ROADMAP — beat TensorRT-LLM at one config.
+// Branch: fast-inference. Target: Llama/OLMo-class 1B–7B on H100,
+//   batch=1 decode latency. Numbers assume V≈50K, H100, bf16.
+// =====================================================================
+//
+// Strategy: don't fight TRT-LLM on its home turf (general transformer
+// inference, all GPUs, all batches). Specialize ruthlessly to ONE
+// config and win there. ~10% from each item below; combined ~2-3x
+// vs TRT-LLM at this niche is the realistic ceiling.
+//
+// Order is execution order, not just impact order. Earlier items
+// unlock later items (e.g. paged KV unlocks CUDA graphs).
+// =====================================================================
+//
+// PHASE 1 — UNBLOCK (weeks 1-4)
+// ---------------------------------------------------------------------
+//
+// [1] Paged KV cache.   Prerequisite for almost everything else.
+//     Current concat-based cache (chat.cpp around L655 forward call)
+//     reallocates each step → shape changes → CUDA graphs impossible,
+//     batching impossible, long context O(L) memcpy per step.
+//     Build: fixed-size page allocator (e.g. 16 tokens/page), per-
+//     request page table, kernel-side gather via page indices.
+//     Reference: vLLM PagedAttention paper. ~3 weeks of focused work.
+//     Files to touch: include/olmo_cpp/model/kv_cache.hpp,
+//                     src/model/attention.cpp,
+//                     new kernels/paged_attention.cu
+//
+// [2] CUDA graphs around the decode step.   ~10-30% latency.
+//     Capture the [1,1]-input forward pass once, replay each step.
+//     Eliminates ~500 launches × ~3-5μs of driver overhead per token.
+//     Blocked on [1] (shapes must be stable).
+//     Call site: tools/chat.cpp:650 (the KV-cache decode loop).
+//     Reference: cudaGraphCreate / cudaGraphLaunch. ~1 week.
+//
+// [3] Bench harness vs TRT-LLM.   Without this you don't know if you
+//     won. Pick: Llama-3-8B (or OLMo equivalent), H100 SXM, FP8/BF16,
+//     128-token prompt → 256-token decode, batch=1. Measure: TPOT
+//     (time per output token) and TTFT (time to first token).
+//     Build: a script that runs both engines on the same prompts
+//     and emits a comparison table. ~3 days.
+//     Lives under: scripts/bench_vs_trtllm.sh
+//
+// PHASE 2 — KERNEL DOMINANCE (weeks 5-12)
+// ---------------------------------------------------------------------
+//
+// [4] FlashAttention-2/3 decode kernel.   ~30-50% on attention.
+//     Decode attention is bandwidth-bound on KV reads. Need the
+//     decode variant (single Q vs many K,V) — different from the
+//     training attention. Options: port FA-3, fork FlashInfer's
+//     batch_decode_with_paged_kv_cache, or write fresh on top of
+//     CUTLASS. ~4 weeks.
+//     Reference: Tri Dao FA-3 paper, FlashInfer source.
+//     Files: new kernels/decode_attention.cu, integrate via IBackend.
+//
+// [5] Custom LM-head GEMV.   ~20-40% on LM head step.
+//     cuBLAS GEMM is tuned for square matmuls, not [1,H]·[H,V] GEMV.
+//     Hand-written GEMV with split-K reduction across the V dim,
+//     using TMA on H100 for W_U streaming. ~2 weeks.
+//     Files: new kernels/lm_head_gemv.cu
+//
+// [6] Fused LM-head + sampling kernel via Gumbel-max trick.   ~5-10%.
+//     sample(softmax(l/T)) ≡ argmax_i (l_i/T + g_i), g_i~Gumbel(0,1).
+//     Fold into [5]: stream W_U rows, dot with hidden, generate
+//     Gumbel via Philox(seed,position,vocab_idx) [or curand_uniform
+//     in device API], reduce argmax, emit one int64.
+//     Eliminates: [V] logits write to HBM, the multi-kernel
+//     softmax/topk/sort chain, AND the 200KB D->H copy at chat.cpp
+//     around L132. Phase 1: greedy + temperature only.
+//     Switches std::mt19937 -> Philox; samples differ from CPU path
+//     even with same seed — document this and gate behind a config flag.
+//     Files: kernels/lm_head_gemv.cu (extend [5])
+//     Call site: tools/chat.cpp around L545, L564, L222 (speculative).
+//
+// [7] Bucket-radix top-p kernel.   For when top-p is needed.
+//     16 log-spaced bins, single pass histogram, scan to find cutoff
+//     bucket, sort just that bucket. O(V) vs O(V log V). Min-p early
+//     drop (probs < 2^-16) cuts ~70% of vocab outright.
+//     Replaces CPU sort at L148-165. Fuses with [6].
+//     Files: kernels/topp_radix.cu. ~1 week.
+//
+// PHASE 3 — QUANTIZATION (weeks 13-18)
+// ---------------------------------------------------------------------
+//
+// [8] FP8 weight-only quantization.   ~1.5x decode throughput.
+//     H100 has native FP8. Quantize weights to FP8 E4M3, keep
+//     activations in BF16, dequant in the GEMM/GEMV epilogue.
+//     Touches every Linear layer; biggest hit on LM head and
+//     attention out_proj. Use TransformerEngine as a reference,
+//     but write kernels specialized to this model. ~2-3 weeks.
+//     Quality: typically <0.5% perplexity regression on calibrated
+//     sets. No retraining needed.
+//
+// [9] INT4 weight-only quantization (AWQ-style).   ~2x on top of [8].
+//     Group-quantized INT4 (g=128) with FP16 scales. Custom GEMV
+//     kernel that dequants in registers. Loses ~1-2% perplexity,
+//     gainable back with group-aware fine-tune. ~3-4 weeks.
+//     Reference: AWQ paper, llama.cpp Q4_K_M.
+//
+// PHASE 4 — RESEARCH WINS (weeks 19-26)
+// ---------------------------------------------------------------------
+//
+// [10] Speculative decoding overhaul.   1.5-3x at unchanged quality.
+//      MTP path exists at speculative_decode_step (around L189) but
+//      is suboptimal:
+//      (a) batch the k draft sample calls (currently k separate
+//          .cpu() round-trips at L322-329 — already TODO'd inline).
+//      (b) tune draft length k dynamically from running accept rate.
+//      (c) try a tiny separate draft model (TinyLlama 1B drafting
+//          for 7B target) — typically higher acceptance than MTP.
+//      (d) combine with EAGLE-2 / lookahead decoding for tree-style
+//          drafting. This is publishable.
+//
+// [11] Persistent decode kernel.   The killer.
+//      One kernel launched at startup, runs forever, polls a memory
+//      queue for work. CPU writes "next token + KV ptr"; GPU runs
+//      the full decode step (forward + sample) and writes the result.
+//      ZERO kernel launches per token after init.
+//      Saves ~500 launches × ~3μs = ~1.5ms/token of pure overhead
+//      (which is huge if your forward is already optimized below 5ms).
+//      Reference: TensorRT-LLM in-flight batching kernel,
+//                 FlashInfer persistent kernel.
+//      ~3-4 weeks. This is what gets you from "tied with TRT-LLM"
+//      to "beating it."
+//
+// PHASE 5 — POLISH (ongoing)
+// ---------------------------------------------------------------------
+//
+// [12] Smaller wins worth a pass:
+//      - Pinned host buffers for D->H copies (cudaHostAlloc) —
+//        irrelevant once [6] lands (no copies left).
+//      - Fuse repetition_penalty into the sampling kernel (currently
+//        a separate CPU loop at chat.cpp:105 that materializes a clone).
+//      - Pre-tokenize prompt on a worker thread while model loads.
+//      - bf16 end-to-end (model already supports it; verify config).
+//      - Capture full conversation context once across turns instead
+//        of re-encoding per turn (chat loop in main()).
+//      - Replace torch::Tensor on the inference path with raw CUDA
+//        pointers + a tiny shape struct — saves PyTorch dispatcher
+//        overhead in C++ (~1-2μs per op, real at high token rates).
+//
+// EXPLICITLY NOT DOING (sunk-cost traps):
+// ---------------------------------------------------------------------
+//   - Rewriting from scratch. The model code, tokenizer, and existing
+//     CUDA kernels (rms_norm.cu, silu_mul.cu, rope.cu) are correct
+//     and reusable. Carve and replace, don't rebuild.
+//   - General-purpose engine (multi-arch, multi-GPU, multi-precision).
+//     Specialize to ONE target config; that's how you beat TRT-LLM.
+//   - Continuous batching unless we go server-side. Single-stream
+//     latency is the win condition; batching is a different game.
+//   - top-p sort fusion. Use [7] (bucket-radix) instead.
+//   - Standalone GPU multinomial replacement. Subsumed by [6].
+//
+// SUCCESS CRITERION:
+// ---------------------------------------------------------------------
+//   Median TPOT (time per output token) on Llama-3-8B (or equivalent),
+//   H100 SXM, batch=1, 128→256 tokens, FP8: lower than TensorRT-LLM
+//   v0.16+ at the same TTFT and same output quality (PPL within 1%).
+//   Bench harness from [3] is the source of truth.
+//
+// ESTIMATED TIMELINE:
+//   Single researcher full-time: 5-6 months to TRT-LLM-competitive,
+//   8-10 months to clearly beating it on this niche.
+//   With one collaborator: cut by ~30%.
+// =====================================================================
+
 /// Sample from logits with temperature, top-k, and top-p (nucleus) filtering.
+///
+/// TODO(fast-inference [6]): for greedy/temperature-only (top_k<=0 &&
+/// top_p>=1.0), replace this entire function with a single fused kernel
+/// call inside the LM-head GEMV (roadmap item [6], depends on [5]).
+/// The .cpu().contiguous() below is the costliest line — 200 KB D->H/token.
+/// For top-p path see roadmap item [7] (bucket-radix kernel) — keep this
+/// CPU implementation only as a debug fallback once [7] lands.
 int64_t sample_logits(torch::Tensor logits, double temperature,
                       int64_t top_k, double top_p, std::mt19937& gen) {
   // Greedy
@@ -235,6 +409,11 @@ int64_t speculative_decode_step(
   auto temp_tokens = all_tokens;
   temp_tokens.push_back(main_token);
 
+  // TODO(fast-inference [10a]): k separate D->H copies + k sample_logits calls.
+  // Stack draft_logits_list into one [k, V] tensor, do one .cpu(), and either
+  // (a) one fused-sampler launch for all k positions (depends on [6]), or
+  // (b) loop on host over a single contiguous buffer. Free perf, no algorithm
+  // change required.
   for (int64_t k = 0; k < num_drafts; ++k) {
     auto dl = draft_logits_list[k].cpu().contiguous();
     dl = apply_repetition_penalty(dl, temp_tokens, repetition_penalty);
@@ -532,6 +711,14 @@ int main(int argc, char** argv) {
       } else if (use_kv_cache) {
         // KV cache path: prefill + incremental decode
         // CUDA graphs capture the decode step (always [1,1] input) for zero launch overhead
+        // TODO(fast-inference [1]+[2]): this loop is THE hot path.
+        //   Step 1: replace concat KV cache with paged KV ([1]) — current
+        //   reshape every step blocks everything below.
+        //   Step 2: cudaGraphCapture this loop body once, cudaGraphLaunch
+        //   every iteration ([2]). Combined with fused sampler ([6]) and
+        //   custom decode attention ([4]), this loop becomes:
+        //     1 graph replay + 8B D->H per token. ~3-5x faster than today.
+        //   Eventually replace the whole loop with a persistent kernel ([11]).
         olmo_cpp::KVCache kv_cache(model->n_layers());
         {
           auto input = torch::from_blob(all_tokens.data(), {1, prompt_len},
@@ -570,6 +757,9 @@ int main(int argc, char** argv) {
         }
       } else {
         // No KV cache: feed full sequence each step
+        // TODO(perf): this is the slow fallback path — O(L^2) attention recompute
+        // per step. Don't optimize this loop directly; the fix is just "use the
+        // KV cache path above." Keep as a correctness reference / debug mode.
         for (int64_t step = prompt_len; step < max_total; ++step) {
           int64_t last_token = all_tokens.back();
           if (last_token == static_cast<int64_t>(tokenizer.eos_id())) break;

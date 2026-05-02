@@ -9,6 +9,7 @@ add_library(olmo_kernels SHARED
     fused_lm_head_sample.cu    # fast-inference [6]
     paged_attention.cu         # fast-inference [9]
     lm_head_gemv.cu            # fast-inference [11]
+    flash_decode.cu            # fast-inference [12]
 )
 target_include_directories(olmo_kernels PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/..

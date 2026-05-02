@@ -390,9 +390,13 @@ int64_t speculative_decode_step(
     std::mt19937& rng,
     olmo_cpp::BPETokenizer& tokenizer,
     int64_t& total_drafted,
-    int64_t& total_accepted) {
+    int64_t& total_accepted,
+    int64_t max_drafts) {  // (fast-inference [10b]) caller's dynamic cap
 
+  // Honor the dynamic cap: never exceed the model's MTP head count, but
+  // allow the caller to draft fewer when running acceptance is poor.
   int64_t num_drafts = model->num_mtp_heads();
+  if (max_drafts > 0 && max_drafts < num_drafts) num_drafts = max_drafts;
   int64_t eos_id = static_cast<int64_t>(tokenizer.eos_id());
   torch::NoGradGuard no_grad;
 
@@ -780,14 +784,46 @@ int main(int argc, char** argv) {
 
         int64_t total_drafted = 0, total_accepted = 0;
 
+        // (fast-inference [10b]) Dynamic draft length: tune k from running
+        // acceptance rate. Start at 1 (most conservative — k=1 still gets
+        // a 2-token-from-1-step speedup if accepted) and ramp toward
+        // num_mtp_heads when the running accept rate is high. Drop back
+        // toward 1 when it craters.
+        //
+        //   accept_rate >= 0.7  → ramp up (k += 1, capped at MTP heads)
+        //   accept_rate <= 0.3  → ramp down (k -= 1, floored at 1)
+        //   in between          → hold steady
+        //
+        // Re-evaluated every kAdjustEvery steps so we have a stable
+        // window of samples (avoids thrashing on noise).
+        const int64_t mtp_max = model->num_mtp_heads();
+        int64_t dyn_k = std::min<int64_t>(1, mtp_max);  // start small
+        const int64_t kAdjustEvery = 4;
+        int64_t steps_since_adjust = 0;
+        int64_t prev_drafted = 0, prev_accepted = 0;
+
         while (static_cast<int64_t>(all_tokens.size()) < max_total) {
           if (!all_tokens.empty() && all_tokens.back() == static_cast<int64_t>(tokenizer.eos_id()))
             break;
 
           int64_t accepted = speculative_decode_step(
               model, all_tokens, spec_kv, device, temperature, top_k, top_p,
-              repetition_penalty, rng, tokenizer, total_drafted, total_accepted);
+              repetition_penalty, rng, tokenizer, total_drafted, total_accepted,
+              /*max_drafts=*/dyn_k);
           tokens_generated += accepted;
+
+          if (++steps_since_adjust >= kAdjustEvery) {
+            int64_t window_drafted  = total_drafted  - prev_drafted;
+            int64_t window_accepted = total_accepted - prev_accepted;
+            if (window_drafted > 0) {
+              double rate = static_cast<double>(window_accepted) / window_drafted;
+              if (rate >= 0.7 && dyn_k < mtp_max) ++dyn_k;
+              else if (rate <= 0.3 && dyn_k > 1) --dyn_k;
+            }
+            prev_drafted = total_drafted;
+            prev_accepted = total_accepted;
+            steps_since_adjust = 0;
+          }
         }
 
         auto gen_end_spec = std::chrono::steady_clock::now();

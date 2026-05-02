@@ -217,6 +217,7 @@ set(OLMO_SOURCES
     src/backend/kernels/simd_elementwise.cpp
     src/backend/cuda_backend.cpp
     src/backend/topp_radix.cpp  # fast-inference [7]
+    src/backend/fused_lm_head_sample.cpp  # fast-inference [6]
     # Seed and profiling infrastructure
     src/seed.cpp
     src/profiler.cpp
@@ -539,6 +540,14 @@ add_executable(test_topp_radix tools/test_topp_radix.cpp)
 target_link_libraries(test_topp_radix PRIVATE olmo_cpp)
 target_include_directories(test_topp_radix PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(test_topp_radix PRIVATE -O3 -march=native)
+
+# Fused LM-head + Gumbel-max sampler unit test (fast-inference [6]).
+# CPU-only; verifies determinism, distribution match vs softmax, and
+# temperature-sharpening behavior.
+add_executable(test_fused_lm_head tools/test_fused_lm_head.cpp)
+target_link_libraries(test_fused_lm_head PRIVATE olmo_cpp)
+target_include_directories(test_fused_lm_head PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(test_fused_lm_head PRIVATE -O3 -march=native)
 
 # Param dumper (debug utility)
 add_executable(dump_params tools/dump_params.cpp)

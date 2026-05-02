@@ -647,13 +647,26 @@ int main(int argc, char** argv) {
     // Phase 4: REPL loop — read prompt, generate response, repeat.
     // -----------------------------------------------------------------
     std::mt19937 rng(std::random_device{}());
-    std::cout << "OLMo Chat (type 'quit' to exit)\n" << std::endl;
+    std::cout << "OLMo Chat (type 'quit' to exit, 'reset' to clear context)\n" << std::endl;
+
+    // Persistent conversation tokens — grows each turn with both the
+    // user's prompt and the model's response. Each turn's prefill re-
+    // processes the whole conversation (no cross-turn KV reuse yet —
+    // that needs paged KV, fast-inference [1]). (fast-inference [12a])
+    constexpr int64_t kMaxContext = 2048;
+    std::vector<int64_t> all_tokens;
+    all_tokens.reserve(static_cast<size_t>(kMaxContext));
 
     while (true) {
       std::cout << "You: ";
       std::string prompt;
       if (!std::getline(std::cin, prompt)) break;
       if (prompt == "quit" || prompt == "exit" || prompt == "q") break;
+      if (prompt == "reset" || prompt == "clear") {
+        all_tokens.clear();
+        std::cout << "[context cleared]\n" << std::endl;
+        continue;
+      }
       if (prompt.empty()) continue;
 
       std::vector<uint32_t> prompt_ids = encode_text(prompt);
@@ -663,11 +676,23 @@ int main(int argc, char** argv) {
         continue;
       }
 
-      // Convert prompt to int64 tokens
-      std::vector<int64_t> all_tokens(prompt_ids.begin(), prompt_ids.end());
+      // Append new turn's tokens to running conversation.
+      for (auto id : prompt_ids) {
+        all_tokens.push_back(static_cast<int64_t>(id));
+      }
+
+      // Trim oldest tokens if conversation would overflow context budget.
+      // Keep enough headroom for max_tokens of generation.
+      int64_t budget = kMaxContext - max_tokens;
+      if (budget < 1) budget = 1;
+      if (static_cast<int64_t>(all_tokens.size()) > budget) {
+        int64_t to_drop = static_cast<int64_t>(all_tokens.size()) - budget;
+        all_tokens.erase(all_tokens.begin(), all_tokens.begin() + to_drop);
+      }
+
       int64_t prompt_len = static_cast<int64_t>(all_tokens.size());
       int64_t max_total = prompt_len + max_tokens;
-      if (max_total > 2048) max_total = 2048;
+      if (max_total > kMaxContext) max_total = kMaxContext;
 
       std::cout << "Model: " << std::flush;
 

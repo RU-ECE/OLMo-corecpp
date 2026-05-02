@@ -222,6 +222,7 @@ set(OLMO_SOURCES
     src/backend/lm_head_gemv.cpp  # fast-inference [11]
     src/backend/flash_decode.cpp  # fast-inference [12]
     src/backend/persistent_decode.cpp  # fast-inference [13] (stub)
+    src/nn/quant.cpp  # fast-inference [14] FP8 + [15] INT4
     src/model/paged_kv_cache.cpp  # fast-inference [1] partial (concat shim)
     src/model/block_manager.cpp  # fast-inference [9] (page allocator)
     # Seed and profiling infrastructure

@@ -100,6 +100,26 @@ torch::Device select_device(const std::string& preferred) {
   return torch::Device(torch::kCPU);
 }
 
+/// Bring a tensor to host via *pinned* (page-locked) memory. Pinned pages
+/// skip the driver's pageable-staging copy, ~2x faster D->H transfer on
+/// PCIe. Always returns a fresh writable owned buffer. On CPU/MPS this
+/// degrades to .contiguous().clone() — pinning is CUDA-specific.
+/// (fast-inference [12d])
+torch::Tensor to_pinned_host(const torch::Tensor& t) {
+  if (t.is_cuda()) {
+    auto src = t.contiguous();
+    auto dst = torch::empty(src.sizes(),
+                            torch::TensorOptions()
+                                .dtype(src.dtype())
+                                .device(torch::kCPU)
+                                .pinned_memory(true));
+    dst.copy_(src, /*non_blocking=*/true);
+    torch::cuda::synchronize();
+    return dst;
+  }
+  return t.contiguous().clone();
+}
+
 // =====================================================================
 // FAST-INFERENCE ROADMAP — beat TensorRT-LLM at one config.
 // Branch: fast-inference. Target: Llama/OLMo-class 1B–7B on H100,
@@ -286,10 +306,9 @@ int64_t sample_logits(torch::Tensor logits, double temperature,
                       const std::vector<int64_t>& rep_tokens,
                       double rep_penalty,
                       std::mt19937& gen) {
-  // Bring to CPU and clone so we own a writable contiguous buffer.
-  // .cpu() is a no-op view if already on CPU; .clone() guarantees we
-  // don't mutate the caller's tensor.
-  auto logits_cpu = logits.cpu().contiguous().clone();
+  // Bring to host via pinned memory (faster D->H on CUDA) and own the
+  // resulting buffer so we can mutate it in place. (fast-inference [12d])
+  auto logits_cpu = to_pinned_host(logits);
   int64_t vocab_size = logits_cpu.size(0);
   auto* p = logits_cpu.data_ptr<float>();
 
@@ -392,9 +411,11 @@ int64_t speculative_decode_step(
   // hidden: [1, 1, d_model] → last position
   auto last_hidden = hidden.select(1, 0);  // [1, d_model]
 
-  // Step 2: Main head prediction for position t+1
+  // Step 2: Main head prediction for position t+1.
+  // Skip an explicit .cpu() — sample_logits transfers via pinned memory
+  // internally. (fast-inference [12d])
   auto main_logits = model->apply_lm_head(last_hidden.unsqueeze(1))
-                         .squeeze(0).squeeze(0).cpu().contiguous();
+                         .squeeze(0).squeeze(0);
   int64_t main_token = sample_logits(main_logits, temperature, top_k, top_p,
                                      all_tokens, repetition_penalty, rng);
 
@@ -418,7 +439,9 @@ int64_t speculative_decode_step(
   // draft (temp_tokens grows per iteration). Bandwidth win: 1 sync + 1
   // transfer instead of k. (fast-inference [10a])
   auto draft_logits_stacked = torch::stack(draft_logits_list);  // [k, V] on device
-  auto draft_logits_cpu = draft_logits_stacked.cpu().contiguous();
+  // One pinned D->H for the whole [k, V] block; subsequent loop iterations
+  // view rows out of this buffer. (fast-inference [12d])
+  auto draft_logits_cpu = to_pinned_host(draft_logits_stacked);
 
   for (int64_t k = 0; k < num_drafts; ++k) {
     auto dl = draft_logits_cpu.select(0, k);  // [V] view, no copy
@@ -449,7 +472,7 @@ int64_t speculative_decode_step(
 #ifdef __APPLE__
   if (device.is_mps()) torch::mps::synchronize();
 #endif
-  verify_logits = verify_logits.cpu().contiguous();
+  verify_logits = to_pinned_host(verify_logits);  // (fast-inference [12d])
 
   // Step 5: Accept tokens — verify_logits[0][0] predicts what comes after main_token
   // verify_logits[0][k] predicts what comes after draft_tokens[k-1]
@@ -811,8 +834,9 @@ int main(int argc, char** argv) {
 #ifdef __APPLE__
           if (is_mps) torch::mps::synchronize();
 #endif
-          // Move logits to CPU immediately to free MPS memory
-          auto next_logits = logits.select(1, logits.size(1) - 1).squeeze(0).cpu().contiguous();
+          // Move logits to host via pinned memory (free GPU tensor right after).
+          // (fast-inference [12d])
+          auto next_logits = to_pinned_host(logits.select(1, logits.size(1) - 1).squeeze(0));
           // Release GPU tensors
           logits.reset();
           input.reset();

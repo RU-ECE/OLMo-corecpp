@@ -66,6 +66,8 @@
 #include "olmo_cpp/data/structural_tokenizer.hpp"
 #include "olmo_cpp/backend/cuda_backend.hpp"
 #include "olmo_cpp/backend/simd_backend.hpp"
+#include "olmo_cpp/backend/topp_radix.hpp"
+#include "olmo_cpp/backend/fused_lm_head_sample.hpp"
 #include <torch/torch.h>
 #include <iostream>
 #include <string>
@@ -350,16 +352,10 @@ int64_t sample_logits(torch::Tensor logits, double temperature,
 
   auto probs = torch::softmax(logits_cpu, -1);
 
-  // Top-p (nucleus). TODO(fast-inference [7]): replace with bucket-radix.
+  // Top-p (nucleus) via bucket-radix histogram (O(V) vs O(V log V) sort).
+  // (fast-inference [7] — wired live)
   if (top_p < 1.0) {
-    auto [sorted_probs, sorted_indices] = probs.sort(-1, /*descending=*/true);
-    auto cumulative = sorted_probs.cumsum(-1);
-    auto mask = cumulative - sorted_probs > top_p;
-    sorted_probs.index_put_({mask}, 0.0f);
-    probs.zero_();
-    probs.scatter_(-1, sorted_indices, sorted_probs);
-    auto sum = probs.sum();
-    if (sum.item<float>() > 0) probs = probs / sum;
+    olmo_cpp::topp_radix_filter_cpu(probs, static_cast<float>(top_p), /*min_p=*/1.0e-5f);
   }
 
   // Copy to std::vector before discrete_distribution to avoid holding tensor
@@ -542,6 +538,12 @@ int main(int argc, char** argv) {
   bool legacy_decode = false;
   bool use_kv_cache = true;
   bool use_speculative = true;
+  // fast-inference [6]: fused LM-head + Gumbel-max sampler. Bypasses
+  // sample_logits entirely. Requires top_k=0, top_p=1.0, rep_penalty=1.0
+  // (the kernel doesn't support those filters yet). Off by default
+  // because it changes sampling semantics (Philox RNG, not std::mt19937).
+  bool use_fused_sampler = false;
+  uint64_t fused_seed = 0xC0FFEEULL;  // override-able via --fused-seed
   std::string structural_config;
 
   for (int i = 1; i < argc; ++i) {
@@ -560,6 +562,9 @@ int main(int argc, char** argv) {
     else if (arg == "--legacy-decode") legacy_decode = true;
     else if (arg == "--no-kv-cache") use_kv_cache = false;
     else if (arg == "--no-speculative") use_speculative = false;
+    else if (arg == "--fused-sampler") use_fused_sampler = true;
+    else if (arg == "--fused-seed" && i + 1 < argc)
+      fused_seed = std::stoull(argv[++i]);
   }
 
   if (checkpoint_path.empty() || config_path.empty() || vocab_path.empty() || merges_path.empty()) {
@@ -574,7 +579,11 @@ int main(int argc, char** argv) {
               << "  --repetition-penalty <float>(default: 1.1, 1.0=disabled)\n"
               << "  --legacy-decode            (for checkpoints trained with old tokenizer)\n"
               << "  --no-kv-cache              (slower, avoids MPS memory issues)\n"
-              << "  --no-speculative           (disable MTP speculative decoding)\n";
+              << "  --no-speculative           (disable MTP speculative decoding)\n"
+              << "  --fused-sampler            (use fused LM-head + Gumbel-max sampler;\n"
+              << "                              forces top_k=0, top_p=1.0, rep_penalty=1.0;\n"
+              << "                              Philox RNG, not std::mt19937)\n"
+              << "  --fused-seed <uint64>      (RNG seed for the fused sampler)\n";
     return 1;
   }
 
@@ -605,6 +614,29 @@ int main(int argc, char** argv) {
   if (is_mps && use_kv_cache) {
     std::cout << "Note: KV cache disabled on MPS for stability. Using full-context mode.\n";
     use_kv_cache = false;
+  }
+
+  // (fast-inference [6]) Fused sampler only fires in the KV-cache decode
+  // path and only supports the unfiltered greedy/temperature regime.
+  // Force the conflicting params off (with a notice) so the user gets the
+  // speedup they asked for instead of a silent fallback.
+  if (use_fused_sampler) {
+    if (!use_kv_cache) {
+      std::cout << "Note: --fused-sampler requires KV cache; disabling --no-kv-cache override.\n";
+      use_kv_cache = true;
+    }
+    if (top_k != 0 || top_p < 1.0 || repetition_penalty != 1.0) {
+      std::cout << "Note: --fused-sampler does not support top_k/top_p/repetition_penalty"
+                   " — forcing top_k=0, top_p=1.0, repetition_penalty=1.0.\n";
+      top_k = 0;
+      top_p = 1.0;
+      repetition_penalty = 1.0;
+    }
+    if (use_speculative) {
+      std::cout << "Note: --fused-sampler is incompatible with speculative decoding; disabling.\n";
+      use_speculative = false;
+    }
+    std::cout << "Using fused LM-head + Gumbel-max sampler (Philox seed=" << fused_seed << ").\n";
   }
 
   try {
@@ -780,16 +812,32 @@ int main(int argc, char** argv) {
         //     1 graph replay + 8B D->H per token. ~3-5x faster than today.
         //   Eventually replace the whole loop with a persistent kernel ([11]).
         olmo_cpp::KVCache kv_cache(model->n_layers());
+        // Position counter for the fused sampler's Philox sequence.
+        // Each generated token gets a unique (seed, position) pair; resetting
+        // here so a fresh turn starts at 0.
+        uint32_t fused_pos = 0;
         {
           auto input = torch::from_blob(all_tokens.data(), {1, prompt_len},
                                         torch::TensorOptions().dtype(torch::kInt64))
                            .clone()
                            .to(device);
           torch::NoGradGuard no_grad;
-          auto logits = model->forward(input, c10::nullopt, -100, &kv_cache);
-          auto next_logits = logits.select(1, logits.size(1) - 1).squeeze(0);
-          int64_t next_id = sample_logits(next_logits, temperature, top_k, top_p,
-                                          all_tokens, repetition_penalty, rng);
+          int64_t next_id;
+          if (use_fused_sampler) {
+            // (fast-inference [6]) Get hidden via forward_backbone, then call
+            // fused LM-head + Gumbel-max sampler. Skips materializing logits.
+            auto hidden = model->forward_backbone(input, &kv_cache);
+            auto last_hidden = hidden.select(1, hidden.size(1) - 1).squeeze(0);
+            next_id = olmo_cpp::fused_lm_head_sample(
+                last_hidden, model->lm_head_weight(),
+                static_cast<float>(temperature > 0 ? temperature : 1.0),
+                fused_seed, fused_pos++);
+          } else {
+            auto logits = model->forward(input, c10::nullopt, -100, &kv_cache);
+            auto next_logits = logits.select(1, logits.size(1) - 1).squeeze(0);
+            next_id = sample_logits(next_logits, temperature, top_k, top_p,
+                                    all_tokens, repetition_penalty, rng);
+          }
           all_tokens.push_back(next_id);
           std::vector<uint32_t> tok_to_decode = {static_cast<uint32_t>(next_id)};
           std::cout << decode_tokens(tok_to_decode) << std::flush;
@@ -805,10 +853,22 @@ int main(int argc, char** argv) {
           if (last_token == static_cast<int64_t>(tokenizer.eos_id())) break;
           auto input = torch::tensor({last_token}, torch::kInt64).unsqueeze(0).to(device);
           torch::NoGradGuard no_grad;
-          auto logits = model->forward(input, c10::nullopt, -100, &kv_cache);
-          auto next_logits = logits.select(1, logits.size(1) - 1).squeeze(0);
-          int64_t next_id = sample_logits(next_logits, temperature, top_k, top_p,
-                                          all_tokens, repetition_penalty, rng);
+          int64_t next_id;
+          if (use_fused_sampler) {
+            // (fast-inference [6]) Same fused path as prefill: hidden ->
+            // single-kernel sample, no logits materialized.
+            auto hidden = model->forward_backbone(input, &kv_cache);
+            auto last_hidden = hidden.select(1, hidden.size(1) - 1).squeeze(0);
+            next_id = olmo_cpp::fused_lm_head_sample(
+                last_hidden, model->lm_head_weight(),
+                static_cast<float>(temperature > 0 ? temperature : 1.0),
+                fused_seed, fused_pos++);
+          } else {
+            auto logits = model->forward(input, c10::nullopt, -100, &kv_cache);
+            auto next_logits = logits.select(1, logits.size(1) - 1).squeeze(0);
+            next_id = sample_logits(next_logits, temperature, top_k, top_p,
+                                    all_tokens, repetition_penalty, rng);
+          }
           all_tokens.push_back(next_id);
           if (next_id == static_cast<int64_t>(tokenizer.eos_id())) break;
           std::vector<uint32_t> tok_to_decode = {static_cast<uint32_t>(next_id)};

@@ -102,6 +102,11 @@ class TransformerImpl : public torch::nn::Module {
   /// Apply LM head to hidden states → logits
   torch::Tensor apply_lm_head(torch::Tensor hidden_states) { return lm_head_(hidden_states); }
 
+  /// LM head's unembedding matrix [V, H]. Used by the fused LM-head +
+  /// Gumbel-max sampler (fast-inference [6]) which computes the GEMV
+  /// itself instead of going through apply_lm_head + sample.
+  const torch::Tensor& lm_head_weight() const { return lm_head_->w_out()->weight; }
+
  private:
   // Embedding: either plain or multi-resolution (DC-MRE)
   /// Plain torch::nn::Embedding (active when use_multi_res_ is false).

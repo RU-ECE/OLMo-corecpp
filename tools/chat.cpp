@@ -100,23 +100,6 @@ torch::Device select_device(const std::string& preferred) {
   return torch::Device(torch::kCPU);
 }
 
-/// Apply repetition penalty to logits for tokens that already appeared.
-/// Returns contiguous tensor (avoids modifying views that can cause segfaults).
-torch::Tensor apply_repetition_penalty(torch::Tensor logits,
-                                       const std::vector<int64_t>& token_ids,
-                                       double penalty) {
-  if (penalty == 1.0 || token_ids.empty()) return logits;
-  logits = logits.contiguous().clone();
-  auto logits_accessor = logits.accessor<float, 1>();
-  for (int64_t id : token_ids) {
-    if (id < 0 || id >= logits.size(0)) continue;
-    float score = logits_accessor[id];
-    logits_accessor[id] = (score > 0) ? score / static_cast<float>(penalty)
-                                     : score * static_cast<float>(penalty);
-  }
-  return logits;
-}
-
 // =====================================================================
 // FAST-INFERENCE ROADMAP — beat TensorRT-LLM at one config.
 // Branch: fast-inference. Target: Llama/OLMo-class 1B–7B on H100,
@@ -284,29 +267,60 @@ torch::Tensor apply_repetition_penalty(torch::Tensor logits,
 //   With one collaborator: cut by ~30%.
 // =====================================================================
 
-/// Sample from logits with temperature, top-k, and top-p (nucleus) filtering.
+/// Sample from logits with rep-penalty, temperature, top-k, and top-p
+/// (nucleus) filtering, all fused into a single host-side preprocessing pass.
+///
+/// Owns one CPU clone of the logits and modifies it in place. The previous
+/// `apply_repetition_penalty` step is gone — rep_tokens scatter directly into
+/// this buffer, and the temperature scale is the same dense walk. One walk,
+/// not two; one allocation, not two. (fast-inference [12c])
 ///
 /// TODO(fast-inference [6]): for greedy/temperature-only (top_k<=0 &&
 /// top_p>=1.0), replace this entire function with a single fused kernel
 /// call inside the LM-head GEMV (roadmap item [6], depends on [5]).
-/// The .cpu().contiguous() below is the costliest line — 200 KB D->H/token.
+/// The .cpu() below is the costliest line — 200 KB D->H/token.
 /// For top-p path see roadmap item [7] (bucket-radix kernel) — keep this
 /// CPU implementation only as a debug fallback once [7] lands.
 int64_t sample_logits(torch::Tensor logits, double temperature,
-                      int64_t top_k, double top_p, std::mt19937& gen) {
-  // Greedy
-  if (temperature <= 0) {
-    return logits.argmax(-1).item<int64_t>();
+                      int64_t top_k, double top_p,
+                      const std::vector<int64_t>& rep_tokens,
+                      double rep_penalty,
+                      std::mt19937& gen) {
+  // Bring to CPU and clone so we own a writable contiguous buffer.
+  // .cpu() is a no-op view if already on CPU; .clone() guarantees we
+  // don't mutate the caller's tensor.
+  auto logits_cpu = logits.cpu().contiguous().clone();
+  int64_t vocab_size = logits_cpu.size(0);
+  auto* p = logits_cpu.data_ptr<float>();
+
+  // FUSED pre-pass over the host buffer:
+  //   (a) rep penalty: sparse scatter into already-seen token ids
+  //   (b) temperature: dense scale across the vocab
+  // Order matters: rep penalty divides existing logits, so applying it
+  // before temperature is mathematically equivalent to applying it after
+  // (just a constant factor swap) and lets us touch the same memory once.
+  if (rep_penalty != 1.0 && !rep_tokens.empty()) {
+    const float pen = static_cast<float>(rep_penalty);
+    for (int64_t id : rep_tokens) {
+      if (id < 0 || id >= vocab_size) continue;
+      const float s = p[id];
+      p[id] = (s > 0.0f) ? (s / pen) : (s * pen);
+    }
   }
 
-  // Temperature scaling
-  logits = logits / temperature;
+  // Greedy: rep-penalty-modified argmax. Skip temperature/sampling pipeline.
+  if (temperature <= 0.0) {
+    return logits_cpu.argmax(-1).item<int64_t>();
+  }
 
-  // Move to CPU for sampling
-  auto logits_cpu = logits.cpu().contiguous();
-  int64_t vocab_size = logits_cpu.size(0);
+  if (temperature != 1.0) {
+    const float inv_t = 1.0f / static_cast<float>(temperature);
+    for (int64_t i = 0; i < vocab_size; ++i) p[i] *= inv_t;
+  }
 
-  // Top-k filtering
+  // Top-k filtering. NOTE: this reassigns logits_cpu to a new tensor (the
+  // where() output), so the `p` pointer above becomes stale here. That's
+  // fine because we don't need the original buffer anymore.
   if (top_k > 0 && top_k < vocab_size) {
     auto [topk_vals, topk_indices] = logits_cpu.topk(top_k);
     auto threshold = topk_vals.index({topk_vals.size(0) - 1}).item<float>();
@@ -315,36 +329,25 @@ int64_t sample_logits(torch::Tensor logits, double temperature,
                               logits_cpu);
   }
 
-  // Softmax to get probabilities
   auto probs = torch::softmax(logits_cpu, -1);
 
-  // Top-p (nucleus) filtering
+  // Top-p (nucleus). TODO(fast-inference [7]): replace with bucket-radix.
   if (top_p < 1.0) {
     auto [sorted_probs, sorted_indices] = probs.sort(-1, /*descending=*/true);
     auto cumulative = sorted_probs.cumsum(-1);
-
-    // Find cutoff: zero out tokens after cumulative probability exceeds top_p
     auto mask = cumulative - sorted_probs > top_p;
     sorted_probs.index_put_({mask}, 0.0f);
-
-    // Scatter back to original order
     probs.zero_();
     probs.scatter_(-1, sorted_indices, sorted_probs);
-
-    // Renormalize
     auto sum = probs.sum();
-    if (sum.item<float>() > 0) {
-      probs = probs / sum;
-    }
+    if (sum.item<float>() > 0) probs = probs / sum;
   }
 
   // Copy to std::vector before discrete_distribution to avoid holding tensor
-  // references (fixes MPS malloc/free crashes on Apple Silicon)
-  std::vector<double> probs_vec(vocab_size);
-  auto p_ptr = probs.data_ptr<float>();
-  for (int64_t i = 0; i < vocab_size; ++i) {
-    probs_vec[i] = static_cast<double>(p_ptr[i]);
-  }
+  // references (fixes MPS malloc/free crashes on Apple Silicon).
+  std::vector<double> probs_vec(static_cast<size_t>(vocab_size));
+  auto* p_probs = probs.data_ptr<float>();
+  for (int64_t i = 0; i < vocab_size; ++i) probs_vec[i] = static_cast<double>(p_probs[i]);
   std::discrete_distribution<int64_t> dist(probs_vec.begin(), probs_vec.end());
   return dist(gen);
 }
@@ -392,8 +395,8 @@ int64_t speculative_decode_step(
   // Step 2: Main head prediction for position t+1
   auto main_logits = model->apply_lm_head(last_hidden.unsqueeze(1))
                          .squeeze(0).squeeze(0).cpu().contiguous();
-  main_logits = apply_repetition_penalty(main_logits, all_tokens, repetition_penalty);
-  int64_t main_token = sample_logits(main_logits, temperature, top_k, top_p, rng);
+  int64_t main_token = sample_logits(main_logits, temperature, top_k, top_p,
+                                     all_tokens, repetition_penalty, rng);
 
   if (main_token == eos_id) {
     all_tokens.push_back(main_token);
@@ -419,8 +422,8 @@ int64_t speculative_decode_step(
 
   for (int64_t k = 0; k < num_drafts; ++k) {
     auto dl = draft_logits_cpu.select(0, k);  // [V] view, no copy
-    dl = apply_repetition_penalty(dl, temp_tokens, repetition_penalty);
-    int64_t draft_tok = sample_logits(dl, temperature, top_k, top_p, rng);
+    int64_t draft_tok = sample_logits(dl, temperature, top_k, top_p,
+                                      temp_tokens, repetition_penalty, rng);
     draft_tokens.push_back(draft_tok);
     temp_tokens.push_back(draft_tok);
     if (draft_tok == eos_id) break;
@@ -762,8 +765,8 @@ int main(int argc, char** argv) {
           torch::NoGradGuard no_grad;
           auto logits = model->forward(input, c10::nullopt, -100, &kv_cache);
           auto next_logits = logits.select(1, logits.size(1) - 1).squeeze(0);
-          next_logits = apply_repetition_penalty(next_logits, all_tokens, repetition_penalty);
-          int64_t next_id = sample_logits(next_logits, temperature, top_k, top_p, rng);
+          int64_t next_id = sample_logits(next_logits, temperature, top_k, top_p,
+                                          all_tokens, repetition_penalty, rng);
           all_tokens.push_back(next_id);
           std::vector<uint32_t> tok_to_decode = {static_cast<uint32_t>(next_id)};
           std::cout << decode_tokens(tok_to_decode) << std::flush;
@@ -781,8 +784,8 @@ int main(int argc, char** argv) {
           torch::NoGradGuard no_grad;
           auto logits = model->forward(input, c10::nullopt, -100, &kv_cache);
           auto next_logits = logits.select(1, logits.size(1) - 1).squeeze(0);
-          next_logits = apply_repetition_penalty(next_logits, all_tokens, repetition_penalty);
-          int64_t next_id = sample_logits(next_logits, temperature, top_k, top_p, rng);
+          int64_t next_id = sample_logits(next_logits, temperature, top_k, top_p,
+                                          all_tokens, repetition_penalty, rng);
           all_tokens.push_back(next_id);
           if (next_id == static_cast<int64_t>(tokenizer.eos_id())) break;
           std::vector<uint32_t> tok_to_decode = {static_cast<uint32_t>(next_id)};
@@ -813,8 +816,8 @@ int main(int argc, char** argv) {
           // Release GPU tensors
           logits.reset();
           input.reset();
-          next_logits = apply_repetition_penalty(next_logits, all_tokens, repetition_penalty);
-          int64_t next_id = sample_logits(next_logits, temperature, top_k, top_p, rng);
+          int64_t next_id = sample_logits(next_logits, temperature, top_k, top_p,
+                                          all_tokens, repetition_penalty, rng);
           all_tokens.push_back(next_id);
           if (next_id == static_cast<int64_t>(tokenizer.eos_id())) break;
           std::vector<uint32_t> tok_to_decode = {static_cast<uint32_t>(next_id)};

@@ -216,6 +216,7 @@ set(OLMO_SOURCES
     src/backend/fused_ops.cpp
     src/backend/kernels/simd_elementwise.cpp
     src/backend/cuda_backend.cpp
+    src/backend/topp_radix.cpp  # fast-inference [7]
     # Seed and profiling infrastructure
     src/seed.cpp
     src/profiler.cpp
@@ -531,6 +532,13 @@ target_compile_options(bench_chat PRIVATE -O3 -march=native)
 if(JSON_INCLUDE_DIR)
   target_compile_definitions(bench_chat PRIVATE HAS_NLOHMANN_JSON=1)
 endif()
+
+# Bucket-radix top-p kernel unit test (fast-inference [7]).
+# CPU-only; verifies the algorithm against a sort-based reference.
+add_executable(test_topp_radix tools/test_topp_radix.cpp)
+target_link_libraries(test_topp_radix PRIVATE olmo_cpp)
+target_include_directories(test_topp_radix PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(test_topp_radix PRIVATE -O3 -march=native)
 
 # Param dumper (debug utility)
 add_executable(dump_params tools/dump_params.cpp)

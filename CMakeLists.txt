@@ -218,7 +218,9 @@ set(OLMO_SOURCES
     src/backend/cuda_backend.cpp
     src/backend/topp_radix.cpp  # fast-inference [7]
     src/backend/fused_lm_head_sample.cpp  # fast-inference [6]
+    src/backend/paged_attention.cpp  # fast-inference [9] (CPU ref + dispatch)
     src/model/paged_kv_cache.cpp  # fast-inference [1] partial (concat shim)
+    src/model/block_manager.cpp  # fast-inference [9] (page allocator)
     # Seed and profiling infrastructure
     src/seed.cpp
     src/profiler.cpp

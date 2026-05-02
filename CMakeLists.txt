@@ -522,6 +522,16 @@ if(JSON_INCLUDE_DIR)
   target_compile_definitions(chat PRIVATE HAS_NLOHMANN_JSON=1)
 endif()
 
+# Inference micro-benchmark (fast-inference roadmap item [3]).
+# Greedy-only deterministic decode with JSON timing output.
+add_executable(bench_chat tools/bench_chat.cpp)
+target_link_libraries(bench_chat PRIVATE olmo_cpp)
+target_include_directories(bench_chat PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${JSON_INCLUDE_DIR})
+target_compile_options(bench_chat PRIVATE -O3 -march=native)
+if(JSON_INCLUDE_DIR)
+  target_compile_definitions(bench_chat PRIVATE HAS_NLOHMANN_JSON=1)
+endif()
+
 # Param dumper (debug utility)
 add_executable(dump_params tools/dump_params.cpp)
 target_link_libraries(dump_params PRIVATE olmo_cpp)

@@ -624,17 +624,19 @@ int main(int argc, char** argv) {
       }
     }
 
-    // Tokenizer interface lambdas
-    auto encode_text = [&](const std::string& text) -> std::vector<uint32_t> {
+    // Tokenizer interface lambdas. encode_text_into appends into a caller-
+    // owned buffer; the REPL hoists a single scratch vector out of the loop
+    // so we don't reallocate every turn (BPE path skips the allocation
+    // entirely; struct_tok path still allocates inside its own encode).
+    // (fast-inference [12b])
+    auto encode_text_into = [&](const std::string& text, std::vector<uint32_t>& out) {
       if (struct_tok) {
         auto ids = struct_tok->encode(text);
         // Remove trailing EOS
         if (!ids.empty() && ids.back() == struct_tok->eos_id()) ids.pop_back();
-        return ids;
+        out.insert(out.end(), ids.begin(), ids.end());
       } else {
-        std::vector<uint32_t> ids;
-        bpe_tokenizer.encode_append(text, ids);
-        return ids;
+        bpe_tokenizer.encode_append(text, out);
       }
     };
     auto decode_tokens = [&](const std::vector<uint32_t>& ids) -> std::string {
@@ -656,6 +658,9 @@ int main(int argc, char** argv) {
     constexpr int64_t kMaxContext = 2048;
     std::vector<int64_t> all_tokens;
     all_tokens.reserve(static_cast<size_t>(kMaxContext));
+    // Reused scratch buffer for the per-turn tokenizer output. (fast-inference [12b])
+    std::vector<uint32_t> prompt_ids;
+    prompt_ids.reserve(256);
 
     while (true) {
       std::cout << "You: ";
@@ -669,7 +674,8 @@ int main(int argc, char** argv) {
       }
       if (prompt.empty()) continue;
 
-      std::vector<uint32_t> prompt_ids = encode_text(prompt);
+      prompt_ids.clear();
+      encode_text_into(prompt, prompt_ids);
 
       if (prompt_ids.empty()) {
         std::cout << "Model: (empty)\n" << std::endl;

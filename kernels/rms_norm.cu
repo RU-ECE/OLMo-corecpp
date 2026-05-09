@@ -152,12 +152,12 @@ __global__ void rms_norm_f32_kernel(
   // wide (saturates HBM bandwidth on Ampere/Hopper).
   float sum_sq = 0.0f;
   int64_t vec_dim = dim / 4;
-  const float4* x4 = reinterpret_cast<const float4*>(row_x);
+  const float4* x4 = reinterpret_cast<const float4*>(row_x); // in register array?
 
   // Each thread strides through the row; for d_model=4096 with 256
   // threads, each thread sees 4 float4s.
   for (int64_t i = threadIdx.x; i < vec_dim; i += blockDim.x) {
-    float4 v = x4[i];
+    float4 v = x4[i]; // load into registers
     sum_sq += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
   }
   // Tail loop for the (dim % 4) leftover scalars — without it, models

@@ -52,7 +52,7 @@ class RMSNormImpl : public torch::nn::Module {
   double eps_;
   bool elementwise_affine_;
 };
-
+//TODO: DOV: Rewrite not using torch?maybe we can add a scale parameter to the RMSNorm class
 TORCH_MODULE(RMSNorm);
 
 }  // namespace olmo_cpp

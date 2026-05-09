@@ -165,6 +165,7 @@ torch::Tensor TransformerImpl::forward_backbone(
     // Scale only applies to plain embeddings; multi-res has its own projections
     h = h * *embed_scale_;
   }
+  //TODO: DOV: maybe we can coalesce the scaling into the embedding_norm_ function
   h = (*embedding_norm_)(h);
 
   auto new_seq_len = input_ids.size(1);

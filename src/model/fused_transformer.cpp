@@ -128,12 +128,12 @@ void FusedTransformerImpl::init_weights(torch::optional<torch::Generator> gen) {
 torch::Tensor FusedTransformerImpl::forward_backbone(
     torch::Tensor input_ids,
     KVCache* kv_cache) {
+  // embed_scale_ is folded into the embedding weights at init (see
+  // init_weights), and the RMSNorm below is scale-invariant in its input,
+  // so the per-forward h * embed_scale_ multiply is redundant.
   auto h = use_multi_res_
       ? multi_res_embed_->forward(input_ids)
       : embeddings_(input_ids);
-  if (embed_scale_ && !use_multi_res_) {
-    h = h * *embed_scale_;
-  }
   h = (*embedding_norm_)(h);
 
   auto new_seq_len = input_ids.size(1);

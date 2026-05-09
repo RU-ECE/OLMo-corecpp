@@ -157,15 +157,12 @@ void TransformerImpl::init_weights(torch::optional<torch::Generator> gen) {
 torch::Tensor TransformerImpl::forward_backbone(
     torch::Tensor input_ids,
     KVCache* kv_cache) {
-  // Embed: multi-resolution (DC-MRE) or plain lookup
+  // Embed: multi-resolution (DC-MRE) or plain lookup. embed_scale_ is folded
+  // into the embedding weights at init (see init_weights), and RMSNorm right
+  // below cancels any residual input scale, so no runtime multiply is needed.
   auto h = use_multi_res_
       ? multi_res_embed_->forward(input_ids)
       : embeddings_(input_ids);
-  if (embed_scale_ && !use_multi_res_) {
-    // Scale only applies to plain embeddings; multi-res has its own projections
-    h = h * *embed_scale_;
-  }
-  //TODO: DOV: maybe we can coalesce the scaling into the embedding_norm_ function
   h = (*embedding_norm_)(h);
 
   auto new_seq_len = input_ids.size(1);

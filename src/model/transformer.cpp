@@ -69,7 +69,14 @@ TransformerImpl::TransformerImpl(const TransformerConfig& cfg)
       embed_scale_(cfg.embed_scale),
       config_(cfg),
       use_multi_res_(cfg.use_multi_res),
-      mtp_heads_(register_module("mtp_heads", torch::nn::ModuleList())) {
+      // mtp_heads_ default-constructs an empty ModuleList. We only
+      // register it as a submodule when there are actually heads — that
+      // keeps the serialized archive free of an empty "mtp_heads" entry
+      // and lets old checkpoints (pre-MTP) load cleanly under new code.
+      mtp_heads_(torch::nn::ModuleList()) {
+  if (cfg.num_mtp_heads > 0) {
+    register_module("mtp_heads", mtp_heads_);
+  }
 
   // Choose embedding: multi-resolution or plain
   if (cfg.use_multi_res) {

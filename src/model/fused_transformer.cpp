@@ -44,7 +44,13 @@ FusedTransformerImpl::FusedTransformerImpl(const TransformerConfig& cfg)
       embed_scale_(cfg.embed_scale),
       config_(cfg),
       use_multi_res_(cfg.use_multi_res),
-      mtp_heads_(register_module("mtp_heads", torch::nn::ModuleList())) {
+      mtp_heads_(torch::nn::ModuleList()) {
+  // Skip mtp_heads registration when MTP is disabled — same compatibility
+  // fix as in TransformerImpl. Old checkpoints saved before MTP existed
+  // load cleanly under the current code.
+  if (cfg.num_mtp_heads > 0) {
+    register_module("mtp_heads", mtp_heads_);
+  }
 
   // Choose embedding: multi-resolution or plain
   if (cfg.use_multi_res) {

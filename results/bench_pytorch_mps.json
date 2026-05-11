@@ -1,0 +1,16 @@
+{
+  "device": "mps",
+  "dtype": "fp32",
+  "note": "fallback_nn_transformer",
+  "batch": 1,
+  "prompt_len": 128,
+  "decode_len": 64,
+  "warmup": 2,
+  "iters": 3,
+  "ttft_ms_mean": 31.823222370197374,
+  "tpot_ms_mean": 40.08367382266442,
+  "tpot_ms_p50": 40.1955209672451,
+  "tpot_ms_p99": 46.478670679498464,
+  "throughput_tok_per_s": 24.947813027920915,
+  "params_M": 162.250752
+}

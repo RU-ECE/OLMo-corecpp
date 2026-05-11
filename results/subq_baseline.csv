@@ -1,0 +1,11 @@
+mode,stage,B,H,Hkv,T,D,dtype,iters,fwd_ms_mean,fwd_ms_p50,fwd_ms_p99,tok_per_s,hbm_GB,device,note
+dense,prefill,1,32,8,1024,128,fp32,2,6.98819,6.32267,6.32267,146533,0.0390625,cpu,sdpa_default
+dense,prefill,1,32,8,4096,128,fp32,2,80.5801,72.2648,72.2648,50831.4,0.15625,cpu,sdpa_default
+fa3,prefill,1,32,8,1024,128,fp32,2,22.9822,22.4741,22.4741,44556.2,0.0390625,cpu,sdpa_cudnn_only
+fa3,prefill,1,32,8,4096,128,fp32,2,371.586,343.946,343.946,11023,0.15625,cpu,sdpa_cudnn_only
+dense,decode,1,32,8,1024,128,fp32,2,0.318964,0.318333,0.318333,3135.15,0.0390625,cpu,sdpa_default
+dense,decode,1,32,8,4096,128,fp32,2,1.48184,1.4811,1.4811,674.837,0.15625,cpu,sdpa_default
+fa2,decode,1,32,8,1024,128,fp32,2,0.92599,0.914656,0.914656,1079.93,0.0390625,cpu,sdpa_flash_only
+fa2,decode,1,32,8,4096,128,fp32,2,4.60981,4.56871,4.56871,216.929,0.15625,cpu,sdpa_flash_only
+fa3,decode,1,32,8,1024,128,fp32,2,0.89463,0.893208,0.893208,1117.78,0.0390625,cpu,sdpa_cudnn_only
+fa3,decode,1,32,8,4096,128,fp32,2,2.77272,2.75767,2.75767,360.656,0.15625,cpu,sdpa_cudnn_only

@@ -1,0 +1,24 @@
+{
+  "batch": 1,
+  "decode_len": 64,
+  "device": "mps",
+  "iters": 3,
+  "prompt_len": 128,
+  "throughput_tok_per_s": 187.37747562535242,
+  "total_ms_mean": 358.69598633333334,
+  "tpot_ms_all": [
+    5.268185546875,
+    5.169929046875,
+    5.57234765625
+  ],
+  "tpot_ms_mean": 5.33682075,
+  "tpot_ms_p50": 5.186708,
+  "tpot_ms_p99": 7.256625,
+  "ttft_ms_all": [
+    17.0825,
+    17.013041,
+    17.322834
+  ],
+  "ttft_ms_mean": 17.139458333333334,
+  "warmup": 2
+}

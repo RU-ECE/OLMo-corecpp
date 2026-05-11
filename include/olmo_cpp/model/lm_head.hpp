@@ -43,7 +43,7 @@ class LMHeadImpl : public torch::nn::Module {
 
   torch::Tensor forward(torch::Tensor x);
 
-  torch::nn::Linear w_out() { return w_out_; }
+  torch::nn::Linear w_out() const { return w_out_; }
 
  private:
   std::optional<RMSNorm> norm_;

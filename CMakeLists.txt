@@ -221,6 +221,7 @@ set(OLMO_SOURCES
     src/backend/paged_attention.cpp  # fast-inference [9] (CPU ref + dispatch)
     src/backend/lm_head_gemv.cpp  # fast-inference [11]
     src/backend/flash_decode.cpp  # fast-inference [12]
+    src/backend/sparse_attn.cpp  # SubQ Phase-1: NSA-style content-selected attention
     src/backend/persistent_decode.cpp  # fast-inference [13] (stub)
     src/nn/quant.cpp  # fast-inference [14] FP8 + [15] INT4
     src/generate/draft_model_speculative.cpp  # fast-inference [17]
@@ -232,15 +233,33 @@ set(OLMO_SOURCES
     # Speculative decoding
     src/generate/speculative_decode.cpp
 )
+# Advanced parallelism strategies (PP / FSDP / CP / EP) are wired up at the
+# class/header level but never instantiated by main.cpp on this branch. They
+# carry no-op send/recv stubs that aren't safe to ship as "real" — pretending
+# they work hides bugs. Default OFF so a stock build doesn't compile the
+# stubs; flip ON when you actually wire one of them into the trainer and
+# replace its TODO body with a real c10d call. The standard DDP path (data
+# parallel + tensor parallel via NCCL allreduce) stays under OLMO_USE_DDP.
+option(OLMO_USE_ADVANCED_PARALLEL
+       "Build pipeline / FSDP / context / expert parallel (off; stubs only)" OFF)
+
 if(OLMO_USE_DDP AND GLOO_INCLUDE_DIR)
     list(APPEND OLMO_SOURCES
         src/distributed/ddp.cpp
         src/distributed/tensor_parallel.cpp
-        src/distributed/pipeline_parallel.cpp
-        src/distributed/fsdp.cpp
-        src/distributed/context_parallel.cpp
-        src/distributed/expert_parallel.cpp
     )
+    if(OLMO_USE_ADVANCED_PARALLEL)
+        list(APPEND OLMO_SOURCES
+            src/distributed/pipeline_parallel.cpp
+            src/distributed/fsdp.cpp
+            src/distributed/context_parallel.cpp
+            src/distributed/expert_parallel.cpp
+        )
+        message(STATUS "Advanced parallelism (PP/FSDP/CP/EP): ENABLED")
+    else()
+        message(STATUS "Advanced parallelism (PP/FSDP/CP/EP): DISABLED "
+                       "(set -DOLMO_USE_ADVANCED_PARALLEL=ON to compile stubs)")
+    endif()
 else()
     list(APPEND OLMO_SOURCES src/distributed/ddp_stub.cpp)
 endif()
@@ -541,6 +560,14 @@ target_compile_options(bench_chat PRIVATE -O3 -march=native)
 if(JSON_INCLUDE_DIR)
   target_compile_definitions(bench_chat PRIVATE HAS_NLOHMANN_JSON=1)
 endif()
+
+# Attention-kernel-isolated benchmark — used for the SubQ head-to-head.
+# Runs only the SDPA op (no model load) across a sweep of seq lens and modes
+# {dense, fa2, fa3, sparse} for stages {prefill, decode}. Emits CSV.
+add_executable(bench_attn tools/bench_attn.cpp)
+target_link_libraries(bench_attn PRIVATE olmo_cpp)
+target_include_directories(bench_attn PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(bench_attn PRIVATE -O3 -march=native)
 
 # Bucket-radix top-p kernel unit test (fast-inference [7]).
 # CPU-only; verifies the algorithm against a sort-based reference.

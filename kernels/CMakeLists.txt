@@ -10,6 +10,8 @@ add_library(olmo_kernels SHARED
     paged_attention.cu         # fast-inference [9]
     lm_head_gemv.cu            # fast-inference [11]
     flash_decode.cu            # fast-inference [12]
+    sparse_attn_decode.cu      # SubQ Phase-1: fused content-selected SDPA
+    quant_dequant.cu           # FP8 / INT4 AWQ device-resident dequant
 )
 target_include_directories(olmo_kernels PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/..

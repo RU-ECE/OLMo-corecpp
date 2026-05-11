@@ -61,6 +61,15 @@ class ForeachAdamW : public torch::optim::Optimizer {
   /// Global step counter — used as the bias-correction exponent t in
   /// (1 - beta^t). Shared across all param groups; grows monotonically.
   int64_t step_count_ = 0;
+  /// Running products beta1^t / beta2^t, updated incrementally per step
+  /// so we don't call std::pow(beta, step) every step. Initialized to 1.0
+  /// (matches t=0). The first ::step() multiplies by beta -> beta^1.
+  double  beta1_pow_ = 1.0;
+  double  beta2_pow_ = 1.0;
+  /// Last (beta1, beta2) seen — if the user changes betas mid-run we
+  /// rebuild the running powers from scratch via std::pow(beta, step_count_).
+  double  last_beta1_ = -1.0;
+  double  last_beta2_ = -1.0;
   // Scratch vectors reused across steps — we .clear() at the start of each
   // step so the capacity (sized to n_params on the first call) is retained
   // and subsequent push_backs allocate nothing. These hold tensor handles

@@ -22,9 +22,17 @@
  *   that get logged to console, W&B, or TensorBoard during training.
  */
 
-#include <torch/torch.h>
+#include <cstdint>
 #include <string>
 #include <unordered_map>
+
+// Forward-decl Tensor instead of pulling in <torch/torch.h>. Tensor is only
+// referenced by const-ref in the public API below; the .cpp includes the
+// full header. Skipping torch/torch.h saves ~5 MB / 200K LOC of transitive
+// includes per consumer of metrics.hpp — meaningful when this header is
+// pulled into eval orchestrators, training callbacks, and offline tools.
+namespace at { class Tensor; }
+namespace torch { using at::Tensor; }
 
 namespace olmo_cpp {
 

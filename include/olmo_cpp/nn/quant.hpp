@@ -61,4 +61,12 @@ torch::Tensor fp8_gemv(const Fp8Quantized& w, torch::Tensor x);
 /// GEMV against an INT4-quantized weight.
 torch::Tensor int4_gemv(const Int4Quantized& w, torch::Tensor x);
 
+#ifdef OLMO_HAS_CUDA_KERNELS
+/// CUDA dequant kernels — used internally by dequantize_fp8 /
+/// dequantize_int4_awq when the input is on a CUDA device. Replace the
+/// CPU scalar loops + roundtrip with one device-resident dispatch.
+torch::Tensor dequantize_fp8_cuda(const Fp8Quantized& q);
+torch::Tensor dequantize_int4_awq_cuda(const Int4Quantized& q);
+#endif
+
 }  // namespace olmo_cpp

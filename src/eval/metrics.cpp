@@ -26,6 +26,12 @@
  *   eval_data_path is set in the .conf.
  */
 #include "olmo_cpp/eval/metrics.hpp"
+
+// Bring in the full LibTorch headers for the .cpp implementation. The
+// header was trimmed to a Tensor forward-decl to keep its include cost
+// down; that means every translation unit that *implements* metrics
+// needs the full include here.
+#include <torch/torch.h>
 #include <cmath>
 
 namespace olmo_cpp {

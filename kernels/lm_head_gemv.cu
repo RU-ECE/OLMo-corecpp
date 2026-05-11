@@ -55,7 +55,17 @@ __global__ void lm_head_gemv_kernel(
       }
       for (; h < H; ++h) l += w_row[h] * sh_hidden[h];
     } else {
-      for (int h = 0; h < H; ++h) l += __bfloat162float(w_row[h]) * sh_hidden[h];
+      // BF16 path: pair-load via __nv_bfloat162 (one 32-bit load per pair
+      // instead of two 16-bit loads). __low2float / __high2float convert
+      // the two halves to FP32 for the dot accumulation in FP32.
+      int h = 0;
+      const auto* w_row2 = reinterpret_cast<const __nv_bfloat162*>(w_row);
+      for (; h + 2 <= H; h += 2) {
+        __nv_bfloat162 w2 = w_row2[h >> 1];
+        l += __low2float(w2)  * sh_hidden[h]
+           + __high2float(w2) * sh_hidden[h + 1];
+      }
+      for (; h < H; ++h) l += __bfloat162float(w_row[h]) * sh_hidden[h];
     }
     logits[row] = l;
   }

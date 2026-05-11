@@ -20,9 +20,12 @@
  */
 #include "olmo_cpp/eval/lm_evaluator.hpp"
 #include "olmo_cpp/data/token_dataset.hpp"
+#include "olmo_cpp/model/transformer.hpp"
+#include "olmo_cpp/model/fused_transformer.hpp"
 #include <iostream>
 #include <fstream>
 #include <string>
+#include <optional>
 
 #ifdef HAS_NLOHMANN_JSON
 #include <nlohmann/json.hpp>
@@ -39,14 +42,74 @@ LMEvaluator::LMEvaluator(const std::string& data_path, int64_t seq_len,
     : data_path_(data_path), seq_len_(seq_len),
       batch_size_(batch_size), max_batches_(max_batches) {}
 
-MetricMap LMEvaluator::evaluate(torch::nn::Module& /*model*/, torch::Device /*device*/) {
-  // NOTE: To properly evaluate, callers should use the concrete Transformer type.
-  // This base implementation loads data and reports dataset stats.
-  // The full eval loop is in train.cpp where we have access to the Transformer type.
+namespace {
+
+// Forward-and-loss on the concrete model type. The base torch::nn::Module
+// has no virtual `forward(input, labels)` so we dynamic_cast to the two
+// concrete model types this codebase ships.
+std::optional<double> forward_loss(torch::nn::Module& model,
+                                   const torch::Tensor& input,
+                                   const torch::Tensor& labels) {
+  if (auto* t = dynamic_cast<TransformerImpl*>(&model)) {
+    return t->forward(input, labels).item<double>();
+  }
+  if (auto* ft = dynamic_cast<FusedTransformerImpl*>(&model)) {
+    return ft->forward(input, labels).item<double>();
+  }
+  return std::nullopt;
+}
+
+}  // namespace
+
+MetricMap LMEvaluator::evaluate(torch::nn::Module& model, torch::Device device) {
   MetricMap metrics;
-  metrics["data_path_set"] = 1.0;
-  metrics["seq_len"] = static_cast<double>(seq_len_);
+  metrics["seq_len"]    = static_cast<double>(seq_len_);
   metrics["batch_size"] = static_cast<double>(batch_size_);
+
+  // Eval dataset uses shuffle=false so the same chunks are iterated in the
+  // same order every eval — gives a stable val-loss curve across calls.
+  TokenDataset ds(data_path_, seq_len_, /*shuffle=*/false);
+  if (ds.size() == 0) {
+    metrics["evaluator_status"] = -2.0;  // no data
+    return metrics;
+  }
+  ds.to_device(device);
+  ds.reset_epoch();
+
+  torch::NoGradGuard no_grad;
+
+  // Cap the eval at max_batches_ batches (or the full dataset if -1).
+  const int64_t n_chunks = ds.size();
+  int64_t budget = max_batches_;
+  if (budget < 0) budget = (n_chunks + batch_size_ - 1) / batch_size_;
+  budget = std::min<int64_t>(budget, (n_chunks + batch_size_ - 1) / batch_size_);
+
+  double total_loss = 0.0;
+  int64_t total_batches = 0;
+  bool model_unsupported = false;
+
+  for (int64_t b = 0; b < budget; ++b) {
+    auto [input, labels] = ds.get_batch(batch_size_, device);
+    auto loss_opt = forward_loss(model, input, labels);
+    if (!loss_opt) { model_unsupported = true; break; }
+    total_loss += *loss_opt;
+    ++total_batches;
+  }
+
+  if (model_unsupported) {
+    metrics["evaluator_status"] = -1.0;  // model type not supported
+    return metrics;
+  }
+  if (total_batches == 0) {
+    metrics["evaluator_status"] = 0.0;
+    return metrics;
+  }
+
+  const double avg_loss = total_loss / static_cast<double>(total_batches);
+  metrics["loss"]          = avg_loss;
+  metrics["perplexity"]    = std::exp(avg_loss);
+  metrics["bits_per_byte"] = avg_loss / std::log(2.0);
+  metrics["batches"]       = static_cast<double>(total_batches);
   return metrics;
 }
 

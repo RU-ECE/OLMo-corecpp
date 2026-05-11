@@ -2,6 +2,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <algorithm>
 
 namespace zwt::ops::k {
 
@@ -33,12 +34,33 @@ __global__ void k_add_bf16(__nv_bfloat16* out, const __nv_bfloat16* a,
   out[i] = f_to_bf(bf_to_f(a[i]) + bf_to_f(b[i]));
 }
 
-__global__ void k_add_bias_bf16(__nv_bfloat16* y, const __nv_bfloat16* bias,
-                                int64_t rows, int64_t cols) {
-  int64_t r = blockIdx.x;
-  int64_t c = blockIdx.y * blockDim.x + threadIdx.x;
-  if (r >= rows || c >= cols) return;
-  y[r * cols + c] = f_to_bf(bf_to_f(y[r * cols + c]) + bf_to_f(bias[c]));
+// 1-D grid-stride add_bias. The 2-D version that lived here before launched
+// rows*ceil(cols/256) blocks — for batch*seq=16K, cols=896 that's 65K
+// blocks each doing one elementwise op, which exceeds practical scheduling
+// width and burns launch overhead. Vectorize via __nv_bfloat162 to halve
+// the load/store transactions.
+__global__ void k_add_bias_bf162(__nv_bfloat162* __restrict__ y,
+                                 const __nv_bfloat162* __restrict__ bias,
+                                 int64_t total, int64_t cols2) {
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < total;
+       i += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    const int64_t c = i % cols2;
+    y[i] = __hadd2(y[i], bias[c]);
+  }
+}
+
+// Scalar fallback for cols that aren't even (shouldn't happen on this
+// codebase — every dim we hit is multiple of 64 — but keep it correct).
+__global__ void k_add_bias_bf16(__nv_bfloat16* __restrict__ y,
+                                const __nv_bfloat16* __restrict__ bias,
+                                int64_t total, int64_t cols) {
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < total;
+       i += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    const int64_t c = i % cols;
+    y[i] = f_to_bf(bf_to_f(y[i]) + bf_to_f(bias[c]));
+  }
 }
 
 __global__ void k_silu_mul_bf16(__nv_bfloat16* out, const __nv_bfloat16* gate,
@@ -116,10 +138,24 @@ void add_bf16(__nv_bfloat16* out, const __nv_bfloat16* a, const __nv_bfloat16* b
 
 void add_bias_bf16(__nv_bfloat16* y, const __nv_bfloat16* bias, int64_t rows,
                    int64_t cols, cudaStream_t s) {
-  dim3 block(256);
-  dim3 grid(static_cast<unsigned>(rows),
-            static_cast<unsigned>((cols + 255) / 256));
-  k_add_bias_bf16<<<grid, block, 0, s>>>(y, bias, rows, cols);
+  const int64_t total = rows * cols;
+  // Cap the grid at ~enough blocks to saturate H100's 132 SMs at occupancy 4
+  // (132*4=528). The grid-stride loop handles tensors larger than that.
+  const int64_t max_blocks = 1024;
+  if ((cols & 1) == 0) {
+    // Vectorize: pair BF16 → __nv_bfloat162 (2 BF16 per load/store).
+    const int64_t total2 = total >> 1;
+    const int64_t cols2  = cols  >> 1;
+    const int64_t blocks = std::min<int64_t>(max_blocks, (total2 + 255) / 256);
+    auto* y2    = reinterpret_cast<__nv_bfloat162*>(y);
+    auto* bias2 = reinterpret_cast<const __nv_bfloat162*>(bias);
+    k_add_bias_bf162<<<static_cast<unsigned>(blocks), 256, 0, s>>>(
+        y2, bias2, total2, cols2);
+  } else {
+    const int64_t blocks = std::min<int64_t>(max_blocks, (total + 255) / 256);
+    k_add_bias_bf16<<<static_cast<unsigned>(blocks), 256, 0, s>>>(
+        y, bias, total, cols);
+  }
 }
 
 void silu_mul_bf16(__nv_bfloat16* out, const __nv_bfloat16* gate,

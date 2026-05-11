@@ -22,12 +22,14 @@
 #include <cmath>
 
 #include "olmo_cpp/backend/paged_attention.hpp"
+#include "cuda_reduce.cuh"
 
 namespace olmo_cpp {
 
 namespace {
 
 constexpr int kThreads = 128;
+constexpr int kMaxWarps = (kThreads + 31) >> 5;
 
 // One block per (q_head, batch=1). Each block streams over n_tokens
 // cached positions, gathering K/V from pages via the page table, and
@@ -55,8 +57,10 @@ __global__ void paged_attention_decode_kernel(
                     : (q_head * n_kv_heads / n_q_heads);
 
   extern __shared__ float shmem[];
-  float* sh_q     = shmem;                         // [head_dim]
-  float* sh_accum = shmem + head_dim;              // [head_dim]
+  float* sh_q       = shmem;                         // [head_dim]
+  float* sh_accum   = shmem + head_dim;              // [head_dim]
+  // Warp scratch for the per-token Q·K reduction below.
+  float* sh_warpbuf = sh_accum + head_dim;           // [kMaxWarps]
 
   // Load Q row into shared memory.
   for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
@@ -81,34 +85,61 @@ __global__ void paged_attention_decode_kernel(
     const float* k_row = k_pool +
         (((static_cast<int64_t>(pg) * page_size) + in_block) * n_kv_heads + kv_head) * head_dim;
 
+    // Vectorize K read via float4 (head_dim is always a multiple of 4 in
+    // practice — 64, 128, 256). Halves the load instruction count and
+    // doubles HBM bandwidth utilization.
     float score = 0.0f;
-    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-      score += sh_q[i] * k_row[i];
+    if ((head_dim & 3) == 0) {
+      const auto* k4 = reinterpret_cast<const float4*>(k_row);
+      const auto* q4 = reinterpret_cast<const float4*>(sh_q);
+      const int hd4 = head_dim >> 2;
+      for (int i = threadIdx.x; i < hd4; i += blockDim.x) {
+        float4 kv = k4[i];
+        float4 qv = q4[i];
+        score += kv.x * qv.x + kv.y * qv.y + kv.z * qv.z + kv.w * qv.w;
+      }
+    } else {
+      for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        score += sh_q[i] * k_row[i];
+      }
     }
-
-    // Warp + block reduce score.
-    __shared__ float sh_score;
-    if (threadIdx.x == 0) sh_score = 0.0f;
-    __syncthreads();
-    atomicAdd(&sh_score, score);
-    __syncthreads();
-
-    float s = sh_score * sm_scale;
+    // Warp-tree reduction.
+    score = block_reduce_sum(score, threadIdx.x, blockDim.x, sh_warpbuf);
+    float s = score * sm_scale;
 
     // Online softmax: re-scale running accumulators by exp(m_old - m_new).
     float m_new = fmaxf(m, s);
-    float exp_diff = __expf(m - m_new);   // factor for the existing accumulator
-    float w        = __expf(s - m_new);   // factor for the new (Q,K) contribution
+    float exp_diff = __expf(m - m_new);
+    float w        = __expf(s - m_new);
 
     const float* v_row = v_pool +
         (((static_cast<int64_t>(pg) * page_size) + in_block) * n_kv_heads + kv_head) * head_dim;
 
-    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-      sh_accum[i] = sh_accum[i] * exp_diff + v_row[i] * w;
+    // Vectorized V update: pair-load (sh_accum, v_row) via float4. sh_accum
+    // is only written/read by the same lane each iteration, so no cross-
+    // thread visibility is needed between iterations — that's why the
+    // trailing __syncthreads() previously here is now elided. block_reduce_sum
+    // already ends with a sync before the next iteration starts.
+    if ((head_dim & 3) == 0) {
+      auto* a4 = reinterpret_cast<float4*>(sh_accum);
+      const auto* v4 = reinterpret_cast<const float4*>(v_row);
+      const int hd4 = head_dim >> 2;
+      for (int i = threadIdx.x; i < hd4; i += blockDim.x) {
+        float4 acc = a4[i];
+        float4 vv  = v4[i];
+        acc.x = acc.x * exp_diff + vv.x * w;
+        acc.y = acc.y * exp_diff + vv.y * w;
+        acc.z = acc.z * exp_diff + vv.z * w;
+        acc.w = acc.w * exp_diff + vv.w * w;
+        a4[i] = acc;
+      }
+    } else {
+      for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        sh_accum[i] = sh_accum[i] * exp_diff + v_row[i] * w;
+      }
     }
     l = l * exp_diff + w;
     m = m_new;
-    __syncthreads();
   }
 
   // Final normalization: divide by total weight.
@@ -147,7 +178,8 @@ torch::Tensor paged_attention_decode_cuda(
   const int n_kv_heads = static_cast<int>(k_c.size(2));
 
   auto out = torch::empty({n_q_heads, head_dim}, q_c.options());
-  const size_t shmem = static_cast<size_t>(2 * head_dim) * sizeof(float);
+  // Layout: q[D] + accum[D] + warp scratch[kMaxWarps].
+  const size_t shmem = static_cast<size_t>(2 * head_dim + kMaxWarps) * sizeof(float);
 
   paged_attention_decode_kernel<<<n_q_heads, kThreads, shmem>>>(
       q_c.data_ptr<float>(),

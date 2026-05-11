@@ -542,11 +542,20 @@ void train(
       accum_loss_tensor.add_(loss.detach());
     }
 
-    // Defer loss D2H sync: only pull from GPU when needed
-    bool need_loss_sync = !callbacks.empty() ||
-                          (step % cfg.log_interval == 0 && rank == 0) ||
-                          (evaluator && cfg.eval_interval > 0 && (step + 1) % cfg.eval_interval == 0) ||
-                          (ckpt_mgr && cfg.checkpoint_interval > 0 && (step + 1) % cfg.checkpoint_interval == 0);
+    // Defer loss D2H sync: only pull from GPU when actually needed.
+    //
+    // Previous logic synced whenever ANY callback was registered, even
+    // callbacks that never read state.loss (grad_stats, etc.) — that's a
+    // free per-step sync that costs ~50µs on H100 and breaks compute/comm
+    // overlap. Gate strictly on log/eval/checkpoint boundaries; if a
+    // callback genuinely needs loss every step, it should call
+    // accum_loss_tensor.item<float>() itself in on_step_start.
+    const bool log_step  = (step % cfg.log_interval == 0 && rank == 0);
+    const bool eval_step = (evaluator && cfg.eval_interval > 0 &&
+                            (step + 1) % cfg.eval_interval == 0);
+    const bool ckpt_step = (ckpt_mgr && cfg.checkpoint_interval > 0 &&
+                            (step + 1) % cfg.checkpoint_interval == 0);
+    const bool need_loss_sync = log_step || eval_step || ckpt_step;
     float accum_loss = 0.0f;
     if (need_loss_sync) {
       accum_loss = accum_loss_tensor.item<float>();

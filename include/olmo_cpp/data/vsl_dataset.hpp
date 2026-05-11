@@ -66,7 +66,13 @@ class VSLInstanceSource : public InstanceSource {
   int64_t pad_token_id_;
   int64_t current_step_ = 0;        // monotonically incremented inside next()
   int64_t current_seq_len_;         // length of the next emitted instance
-  std::vector<int64_t> buffer_;     // unconsumed tokens carried across docs
+  // Token ring: buffer_ holds raw tokens, head_ points to the next
+  // unconsumed token. Consuming advances head_ in O(1). Compaction (slide
+  // [head_, end()) to the front) runs only when head_ exceeds half the
+  // buffer's size, amortizing the shift to O(1) per consumed token vs the
+  // O(n) shift the previous erase()-based code paid every step.
+  std::vector<int64_t> buffer_;
+  size_t               head_ = 0;
 };
 
 }  // namespace olmo_cpp

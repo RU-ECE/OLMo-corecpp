@@ -29,6 +29,7 @@
  */
 #include "olmo_cpp/data/collator.hpp"
 #include <algorithm>
+#include <cstring>
 #include <stdexcept>
 
 namespace olmo_cpp {
@@ -81,26 +82,20 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> DataCollator::collate(
     const int64_t label_len = std::min(static_cast<int64_t>(labels.size()),
                                        max_len);
 
+    // Bulk memcpy beats element-by-element accessor writes — input_ids
+    // and labels are std::vector<int64_t>, exactly the dtype/layout of
+    // input_acc[b] / label_acc[b]. ComposableDataLoader already does this;
+    // bringing the legacy collator in line.
     if (padding_dir_ == PaddingDirection::Right) {
-      // Real tokens at the beginning, padding at the end
-      for (int64_t s = 0; s < seq_len; ++s) {
-        input_acc[b][s] = input_ids[s];
-        mask_acc[b][s] = 1;
-      }
-      for (int64_t s = 0; s < label_len; ++s) {
-        label_acc[b][s] = labels[s];
-      }
+      std::memcpy(&input_acc[b][0], input_ids.data(), seq_len * sizeof(int64_t));
+      std::fill_n(&mask_acc[b][0], seq_len, int64_t{1});
+      std::memcpy(&label_acc[b][0], labels.data(), label_len * sizeof(int64_t));
     } else {
-      // PaddingDirection::Left: padding at the beginning, real tokens at the end
-      int64_t offset = max_len - seq_len;
-      for (int64_t s = 0; s < seq_len; ++s) {
-        input_acc[b][offset + s] = input_ids[s];
-        mask_acc[b][offset + s] = 1;
-      }
-      int64_t label_offset = max_len - label_len;
-      for (int64_t s = 0; s < label_len; ++s) {
-        label_acc[b][label_offset + s] = labels[s];
-      }
+      const int64_t offset       = max_len - seq_len;
+      const int64_t label_offset = max_len - label_len;
+      std::memcpy(&input_acc[b][offset], input_ids.data(), seq_len * sizeof(int64_t));
+      std::fill_n(&mask_acc[b][offset], seq_len, int64_t{1});
+      std::memcpy(&label_acc[b][label_offset], labels.data(), label_len * sizeof(int64_t));
     }
   }
 

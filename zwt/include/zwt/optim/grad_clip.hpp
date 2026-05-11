@@ -65,6 +65,15 @@ class GradClipper {
   float*   d_scale_ = nullptr;  // 1 float
   float*   d_norm_  = nullptr;  // 1 float, unclipped
 
+  // Multi-Tensor-Apply chunk descriptors. Built once at construction so the
+  // clip kernels' grid is sized to total chunks (not n_tensors). For a 250M
+  // model with mixed param sizes (45M embedding ↔ 896-element norms) this
+  // gives uniform SM utilization vs the old "one block per tensor" pattern
+  // that wasted blocks on small tensors and starved big ones.
+  int*     d_chunk_to_tensor_ = nullptr;  // [n_chunks_]
+  int64_t* d_chunk_to_offset_ = nullptr;  // [n_chunks_]
+  int      n_chunks_          = 0;
+
   // CPU fallback: keep the param vector alive by raw pointer copy.
   // Trainer owns the params; clipper just reads.
   std::vector<Parameter*> cpu_params_;

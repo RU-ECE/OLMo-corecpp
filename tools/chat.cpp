@@ -361,13 +361,31 @@ int64_t sample_logits(torch::Tensor logits, double temperature,
     olmo_cpp::topp_radix_filter_cpu(probs, static_cast<float>(top_p), /*min_p=*/1.0e-5f);
   }
 
-  // Copy to std::vector before discrete_distribution to avoid holding tensor
-  // references (fixes MPS malloc/free crashes on Apple Silicon).
-  std::vector<double> probs_vec(static_cast<size_t>(vocab_size));
+  // Sampling: cumulative-probability + std::uniform_real_distribution +
+  // upper_bound binary search. The previous code allocated a fresh
+  // std::vector<double>(vocab_size) per token, copied float→double across
+  // the whole vocab, then constructed std::discrete_distribution which
+  // re-walks the vector to build its own probability table. For 50257
+  // vocab that's two ~200 KB allocs + a hash-map's worth of internal
+  // bookkeeping every token. The cumulative-search route walks the vocab
+  // ONCE into a thread-local scratch buffer (reused across tokens), then
+  // does a single binary search to draw the sample.
+  static thread_local std::vector<float> cdf_buf;
+  cdf_buf.resize(static_cast<size_t>(vocab_size));
   auto* p_probs = probs.data_ptr<float>();
-  for (int64_t i = 0; i < vocab_size; ++i) probs_vec[i] = static_cast<double>(p_probs[i]);
-  std::discrete_distribution<int64_t> dist(probs_vec.begin(), probs_vec.end());
-  return dist(gen);
+  float running = 0.0f;
+  for (int64_t i = 0; i < vocab_size; ++i) {
+    running += p_probs[i];
+    cdf_buf[static_cast<size_t>(i)] = running;
+  }
+  // Guard against an all-zero distribution (shouldn't happen after softmax,
+  // but top-p / top-k filtering can degenerate at extreme settings).
+  if (running <= 0.0f) return logits_cpu.argmax(-1).item<int64_t>();
+  std::uniform_real_distribution<float> u(0.0f, running);
+  const float r = u(gen);
+  const auto it = std::upper_bound(cdf_buf.begin(),
+                                   cdf_buf.begin() + vocab_size, r);
+  return std::distance(cdf_buf.begin(), it);
 }
 
 /// Speculative decoding with KV cache: draft k tokens via MTP heads, verify in batch.
@@ -444,23 +462,34 @@ int64_t speculative_decode_step(
   auto temp_tokens = all_tokens;
   temp_tokens.push_back(main_token);
 
-  // Stack all draft logits into one [num_drafts, V] tensor and do a single
-  // device->host copy instead of k separate ones. Sampling itself stays
-  // sequential because each step's rep_penalty depends on the previous
-  // draft (temp_tokens grows per iteration). Bandwidth win: 1 sync + 1
-  // transfer instead of k. (fast-inference [10a])
-  auto draft_logits_stacked = torch::stack(draft_logits_list);  // [k, V] on device
-  // One pinned D->H for the whole [k, V] block; subsequent loop iterations
-  // view rows out of this buffer. (fast-inference [12d])
-  auto draft_logits_cpu = to_pinned_host(draft_logits_stacked);
-
-  for (int64_t k = 0; k < num_drafts; ++k) {
-    auto dl = draft_logits_cpu.select(0, k);  // [V] view, no copy
-    int64_t draft_tok = sample_logits(dl, temperature, top_k, top_p,
+  // For num_drafts == 1 the stack/unstack is wasted work — stack
+  // allocates a [1, V] copy and select(0, 0) returns a view back. Just
+  // pinned-copy the single tensor. For k > 1 the stack is the right
+  // call: one D->H instead of k, and each select returns a view.
+  if (num_drafts == 1) {
+    auto dl0 = to_pinned_host(draft_logits_list[0]);
+    int64_t draft_tok = sample_logits(dl0, temperature, top_k, top_p,
                                       temp_tokens, repetition_penalty, rng);
     draft_tokens.push_back(draft_tok);
     temp_tokens.push_back(draft_tok);
-    if (draft_tok == eos_id) break;
+  } else {
+    // Stack all draft logits into one [num_drafts, V] tensor and do a
+    // single device->host copy instead of k separate ones. Sampling
+    // itself stays sequential because each step's rep_penalty depends on
+    // the previous draft (temp_tokens grows per iteration). Bandwidth
+    // win: 1 sync + 1 transfer instead of k. (fast-inference [10a])
+    auto draft_logits_stacked = torch::stack(draft_logits_list);  // [k, V] on device
+    // One pinned D->H for the whole [k, V] block; subsequent loop
+    // iterations view rows out of this buffer. (fast-inference [12d])
+    auto draft_logits_cpu = to_pinned_host(draft_logits_stacked);
+    for (int64_t k = 0; k < num_drafts; ++k) {
+      auto dl = draft_logits_cpu.select(0, k);  // [V] view, no copy
+      int64_t draft_tok = sample_logits(dl, temperature, top_k, top_p,
+                                        temp_tokens, repetition_penalty, rng);
+      draft_tokens.push_back(draft_tok);
+      temp_tokens.push_back(draft_tok);
+      if (draft_tok == eos_id) break;
+    }
   }
 
   total_drafted += static_cast<int64_t>(draft_tokens.size());

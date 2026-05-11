@@ -25,12 +25,14 @@
 #include <cstdint>
 
 #include "olmo_cpp/backend/flash_decode.hpp"
+#include "cuda_reduce.cuh"
 
 namespace olmo_cpp {
 
 namespace {
 
 constexpr int kThreads = 128;
+constexpr int kMaxWarps = (kThreads + 31) >> 5;  // 4 warps for 128 threads
 
 __global__ void flash_decode_kernel(
     const float* __restrict__ q,    // [n_q_heads, head_dim]
@@ -50,9 +52,11 @@ __global__ void flash_decode_kernel(
                     : (q_head * n_kv_heads / n_q_heads);
 
   extern __shared__ float shmem[];
-  float* sh_q     = shmem;
-  float* sh_accum = shmem + head_dim;
-  __shared__ float sh_score;
+  float* sh_q       = shmem;
+  float* sh_accum   = shmem + head_dim;
+  // Warp-reduction scratch (one float per warp). Reused for every per-token
+  // reduction in the loop below. Sized for the worst case kMaxWarps.
+  float* sh_warpbuf = sh_accum + head_dim;
 
   for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
     sh_q[i] = q[q_head * head_dim + i];
@@ -67,26 +71,56 @@ __global__ void flash_decode_kernel(
     const float* k_row = k + (t * n_kv_heads + kv_head) * head_dim;
     const float* v_row = v + (t * n_kv_heads + kv_head) * head_dim;
 
+    // Vectorize via float4 — head_dim is always a multiple of 4 here.
+    // Halves load instruction count and doubles HBM bandwidth.
     float score = 0.0f;
-    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-      score += sh_q[i] * k_row[i];
+    if ((head_dim & 3) == 0) {
+      const auto* k4 = reinterpret_cast<const float4*>(k_row);
+      const auto* q4 = reinterpret_cast<const float4*>(sh_q);
+      const int hd4 = head_dim >> 2;
+      for (int i = threadIdx.x; i < hd4; i += blockDim.x) {
+        float4 kv = k4[i];
+        float4 qv = q4[i];
+        score += kv.x * qv.x + kv.y * qv.y + kv.z * qv.z + kv.w * qv.w;
+      }
+    } else {
+      for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        score += sh_q[i] * k_row[i];
+      }
     }
-    if (threadIdx.x == 0) sh_score = 0.0f;
-    __syncthreads();
-    atomicAdd(&sh_score, score);
-    __syncthreads();
-    float s = sh_score * sm_scale;
+    // Warp-tree reduction.
+    score = block_reduce_sum(score, threadIdx.x, blockDim.x, sh_warpbuf);
+    float s = score * sm_scale;
 
     float m_new = fmaxf(m, s);
     float exp_diff = __expf(m - m_new);
     float w        = __expf(s - m_new);
 
-    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-      sh_accum[i] = sh_accum[i] * exp_diff + v_row[i] * w;
+    // Vectorized V update. Same observation as paged_attention: sh_accum is
+    // owned per-lane across iterations (each lane only touches indices it
+    // also wrote), so the trailing __syncthreads() that used to be here is
+    // redundant — block_reduce_sum's internal sync already pairs the
+    // iterations.
+    if ((head_dim & 3) == 0) {
+      auto* a4 = reinterpret_cast<float4*>(sh_accum);
+      const auto* v4 = reinterpret_cast<const float4*>(v_row);
+      const int hd4 = head_dim >> 2;
+      for (int i = threadIdx.x; i < hd4; i += blockDim.x) {
+        float4 acc = a4[i];
+        float4 vv  = v4[i];
+        acc.x = acc.x * exp_diff + vv.x * w;
+        acc.y = acc.y * exp_diff + vv.y * w;
+        acc.z = acc.z * exp_diff + vv.z * w;
+        acc.w = acc.w * exp_diff + vv.w * w;
+        a4[i] = acc;
+      }
+    } else {
+      for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        sh_accum[i] = sh_accum[i] * exp_diff + v_row[i] * w;
+      }
     }
     l = l * exp_diff + w;
     m = m_new;
-    __syncthreads();
   }
 
   float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
@@ -112,7 +146,8 @@ torch::Tensor flash_decode_cuda(torch::Tensor q, torch::Tensor k, torch::Tensor 
   const int64_t n_tokens = k_c.size(0);
 
   auto out = torch::empty({n_q_heads, head_dim}, q_c.options());
-  size_t shmem = static_cast<size_t>(2 * head_dim) * sizeof(float);
+  // Shared layout: q[D] + accum[D] + warp scratch[kMaxWarps].
+  size_t shmem = static_cast<size_t>(2 * head_dim + kMaxWarps) * sizeof(float);
 
   flash_decode_kernel<<<n_q_heads, kThreads, shmem>>>(
       q_c.data_ptr<float>(),

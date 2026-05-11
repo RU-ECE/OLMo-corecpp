@@ -74,6 +74,13 @@ Fp8Quantized quantize_fp8(torch::Tensor w) {
 }
 
 torch::Tensor dequantize_fp8(const Fp8Quantized& q) {
+#ifdef OLMO_HAS_CUDA_KERNELS
+  if (q.weight.is_cuda()) {
+    return dequantize_fp8_cuda(q);
+  }
+#endif
+  // CPU fallback (correctness reference). Stays scalar — used only by
+  // unit tests / non-CUDA builds where decoded weights are tiny.
   auto packed = q.weight.contiguous().cpu();
   float scale = q.scale.item<float>();
   auto out = torch::empty(packed.sizes(), torch::TensorOptions().dtype(torch::kFloat32));
@@ -120,6 +127,11 @@ Int4Quantized quantize_int4_awq(torch::Tensor w, int64_t group_size) {
 }
 
 torch::Tensor dequantize_int4_awq(const Int4Quantized& q) {
+#ifdef OLMO_HAS_CUDA_KERNELS
+  if (q.weight.is_cuda()) {
+    return dequantize_int4_awq_cuda(q);
+  }
+#endif
   auto packed = q.weight.contiguous().cpu();
   auto scales = q.scales.contiguous().cpu().to(torch::kFloat32);
   const int64_t V = packed.size(0);

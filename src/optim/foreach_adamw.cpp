@@ -146,10 +146,24 @@ torch::Tensor ForeachAdamW::step(LossClosure closure) {
 
     if (params_vec.empty()) continue;
 
-    // Bias correction factors
-    double bc1 = 1.0 - std::pow(beta1, step_count_);
-    double bc2 = 1.0 - std::pow(beta2, step_count_);
-    double bc2_sqrt = std::sqrt(bc2);
+    // Bias correction factors. Maintain beta1^t / beta2^t incrementally
+    // instead of calling std::pow(beta, step_count_) on every step. Two
+    // wrinkles: (a) on the very first step (step_count_ == 1) the running
+    // power must be beta^1, so we multiply *before* using; (b) if the user
+    // mutates the optimizer's beta values mid-run we have to rebuild from
+    // scratch because the running product is otherwise stale.
+    if (beta1 != last_beta1_ || beta2 != last_beta2_) {
+      beta1_pow_ = std::pow(beta1, static_cast<double>(step_count_));
+      beta2_pow_ = std::pow(beta2, static_cast<double>(step_count_));
+      last_beta1_ = beta1;
+      last_beta2_ = beta2;
+    } else {
+      beta1_pow_ *= beta1;
+      beta2_pow_ *= beta2;
+    }
+    const double bc1      = 1.0 - beta1_pow_;
+    const double bc2      = 1.0 - beta2_pow_;
+    const double bc2_sqrt = std::sqrt(bc2);
     // Fold bc2_sqrt into step_size and eps to eliminate one kernel launch:
     //   p -= (lr/bc1) * m / (sqrt(v)/bc2_sqrt + eps)
     // = p -= (lr*bc2_sqrt/bc1) * m / (sqrt(v) + eps*bc2_sqrt)

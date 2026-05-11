@@ -29,14 +29,35 @@
  */
 
 #include <torch/torch.h>
+#include <memory>
 #include <optional>
 #include <unordered_map>
 
 namespace olmo_cpp {
 
+// Shared dtype-cast cache. RoPEBuffers holds a shared_ptr to one of these
+// so when the trainer broadcasts the buffer struct to every layer
+// (`assign(n_layers, bufs)` in transformer.cpp), every layer's view shares
+// the *same* cast cache. Without this, the first layer's apply() fills its
+// own cache slot but layers 1..n_layers-1 each pay the cast independently.
+struct RoPECastCache {
+  torch::Tensor pos_sin_cast;
+  torch::Tensor pos_cos_cast;
+  torch::Dtype  dtype = torch::kFloat32;
+};
+
 struct RoPEBuffers {
-  torch::Tensor pos_sin;  // (seq_len, head_dim)
+  torch::Tensor pos_sin;  // (seq_len, head_dim) — built in compute dtype
+                          // (typically FP32 for stability).
   torch::Tensor pos_cos;
+  // Lazy per-target-dtype cache. Scaled RoPE variants build the master
+  // buffers in FP32 unconditionally for numerical stability; under bf16
+  // training/inference, downstream apply() needs a bf16-cast version on
+  // every call. Caching that cast here turns repeated `.to(q.dtype())`
+  // ops into a single cast on the first miss.
+  // shared_ptr so all layer-views point at one cache — first miss fills it,
+  // every subsequent layer hits.
+  std::shared_ptr<RoPECastCache> cast = std::make_shared<RoPECastCache>();
 };
 
 /// Rotary Position Embedding (RoPE)

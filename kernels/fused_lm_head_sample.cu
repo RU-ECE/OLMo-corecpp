@@ -178,10 +178,17 @@ __global__ void fused_lm_head_sample_kernel(
       }
       for (; h < H; ++h) l += w_row[h] * sh_hidden[h];
     } else {
-      // BF16 path: scalar (no vectorization for simplicity in this draft).
-      for (int h = 0; h < H; ++h) {
-        l += __bfloat162float(w_row[h]) * sh_hidden[h];
+      // BF16 path: pair-load via __nv_bfloat162 — one 32-bit load per
+      // pair vs two 16-bit loads. Same vectorization pattern as
+      // lm_head_gemv.cu.
+      int h = 0;
+      const auto* w_row2 = reinterpret_cast<const __nv_bfloat162*>(w_row);
+      for (; h + 2 <= H; h += 2) {
+        __nv_bfloat162 w2 = w_row2[h >> 1];
+        l += __low2float(w2)  * sh_hidden[h]
+           + __high2float(w2) * sh_hidden[h + 1];
       }
+      for (; h < H; ++h) l += __bfloat162float(w_row[h]) * sh_hidden[h];
     }
 
     float g = gumbel_from_philox(seed, position, static_cast<uint32_t>(row));

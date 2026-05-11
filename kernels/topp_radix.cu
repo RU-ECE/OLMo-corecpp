@@ -55,6 +55,7 @@
 #include <cstdint>
 
 #include "olmo_cpp/backend/topp_radix.hpp"
+#include "cuda_reduce.cuh"
 
 namespace olmo_cpp {
 
@@ -62,6 +63,7 @@ namespace {
 
 constexpr int kNumBuckets = 16;
 constexpr int kThreads = 256;
+constexpr int kMaxWarps = (kThreads + 31) >> 5;  // 8 warps for 256 threads
 
 // Map a positive probability to its log-magnitude bucket.
 //   bucket 0  -> [0.5, 1.0]
@@ -78,8 +80,14 @@ __device__ __forceinline__ int prob_to_bucket(float p, float min_p) {
   return b;
 }
 
-// Pass 1: histogram. Each block builds a partial histogram in shared
-// memory, then one warp atomically merges it into the global histogram.
+// Pass 1: histogram. Each thread keeps its histogram in registers (16
+// buckets × {int count, float mass} = 128 bytes), then a block-wide
+// warp-tree reduction sums them up. The previous code did
+// atomicAdd-on-shared per vocab element, serializing tens of thousands
+// of ops on 16 shared-memory locations. Per-thread register
+// accumulation eliminates that contention entirely; the only atomics
+// remaining are 2*B writes per BLOCK to the global histogram (one per
+// bucket, by thread 0).
 __global__ void topp_histogram_kernel(
     const float* __restrict__ probs,
     int64_t V,
@@ -87,34 +95,43 @@ __global__ void topp_histogram_kernel(
     int* __restrict__ global_count,    // [B] int counts
     float* __restrict__ global_mass) { // [B] float sums
 
-  __shared__ int   sh_count[kNumBuckets];
-  __shared__ float sh_mass[kNumBuckets];
+  // Per-thread local histogram in registers.
+  int   local_count[kNumBuckets] = {0};
+  float local_mass[kNumBuckets]  = {0.0f};
 
-  // Initialize shared histogram.
-  if (threadIdx.x < kNumBuckets) {
-    sh_count[threadIdx.x] = 0;
-    sh_mass[threadIdx.x]  = 0.0f;
-  }
-  __syncthreads();
-
-  // Grid-stride loop over the vocab. Each thread bins its slice.
+  // Grid-stride loop over the vocab. Each thread bins its slice into its
+  // own register-resident histogram — zero shared/global atomics in this
+  // hot loop.
   int64_t idx    = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-
   for (int64_t i = idx; i < V; i += stride) {
     float p = probs[i];
     int b = prob_to_bucket(p, min_p);
     if (b < kNumBuckets) {
-      atomicAdd(&sh_count[b], 1);
-      atomicAdd(&sh_mass[b], p);
+      local_count[b] += 1;
+      local_mass[b]  += p;
     }
   }
-  __syncthreads();
 
-  // First warp reduces the per-block histogram into the global histogram.
-  if (threadIdx.x < kNumBuckets) {
-    atomicAdd(&global_count[threadIdx.x], sh_count[threadIdx.x]);
-    atomicAdd(&global_mass[threadIdx.x],  sh_mass[threadIdx.x]);
+  // Block-wide tree reduction, one bucket at a time. cuda_reduce.cuh's
+  // helper takes float; for the int counts we just cast through float
+  // (vocab fits in 50K entries → far below 2^24, exact).
+  __shared__ float sh_warpbuf[kMaxWarps];
+  for (int b = 0; b < kNumBuckets; ++b) {
+    const float c = block_reduce_sum(static_cast<float>(local_count[b]),
+                                     threadIdx.x, blockDim.x, sh_warpbuf);
+    const float m = block_reduce_sum(local_mass[b],
+                                     threadIdx.x, blockDim.x, sh_warpbuf);
+    if (threadIdx.x == 0) {
+      // One global atomic per bucket per block. With ~10s of blocks per
+      // launch this is cheap relative to V global atomics in the old
+      // pattern.
+      atomicAdd(&global_count[b], static_cast<int>(c));
+      atomicAdd(&global_mass[b],  m);
+    }
+    // block_reduce_sum's final write to sh_warpbuf[0] needs a sync before
+    // we reuse the buffer for the next bucket.
+    __syncthreads();
   }
 }
 

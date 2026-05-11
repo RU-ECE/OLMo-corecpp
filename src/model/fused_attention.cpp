@@ -163,26 +163,24 @@ torch::Tensor FusedAttentionImpl::forward(
   torch::Tensor attn_out;
 
   if (sliding_window_size_ > 0 && S > 1) {
-    // Reuse cached mask when dimensions haven't changed
+    // Reuse cached mask when dimensions haven't changed. Same fix as in
+    // attention.cpp: build the band mask via tril/triu (one kernel each)
+    // instead of two arange tensors and a chain of boolean ops, and use
+    // rank-0 zero/-inf scalars in torch::where to skip allocating two SxS
+    // tensors only to throw one away.
     if (S != cached_mask_S_ || full_S != cached_mask_full_S_) {
-      auto rows = torch::arange(S, torch::TensorOptions().dtype(torch::kLong).device(x.device())).unsqueeze(1);
-      auto cols = torch::arange(full_S, torch::TensorOptions().dtype(torch::kLong).device(x.device())).unsqueeze(0);
-      auto offset = full_S - S;
+      const auto offset = full_S - S;
+      auto bool_opts = torch::TensorOptions().dtype(torch::kBool).device(x.device());
+      auto ones      = torch::ones({S, full_S}, bool_opts);
+      auto allowed   = torch::tril(ones, offset)
+                         & torch::triu(ones, offset - sliding_window_size_);
 
-      auto mask = (cols >= (rows + offset - sliding_window_size_)) & (cols <= (rows + offset));
-      if (is_causal) {
-        mask = mask & (cols <= (rows + offset));
-      }
-
-      // Mask dtype must match the activation dtype, otherwise SDPA with BF16
-      // q/k/v and an FP32 mask will throw the same dtype-mismatch error we
-      // already fixed in DC-MRE.
       auto mask_opts = torch::TensorOptions().dtype(x.dtype()).device(x.device());
       cached_attn_mask_ = torch::where(
-          mask,
-          torch::zeros({S, full_S}, mask_opts),
-          torch::full({S, full_S}, -std::numeric_limits<float>::infinity(), mask_opts));
-      cached_mask_S_ = S;
+          allowed,
+          torch::zeros({}, mask_opts),
+          torch::full({}, -std::numeric_limits<float>::infinity(), mask_opts));
+      cached_mask_S_      = S;
       cached_mask_full_S_ = full_S;
     }
 

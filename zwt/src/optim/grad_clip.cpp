@@ -23,6 +23,20 @@ void scale_fp32_many(float** ptrs, const int64_t* sizes, int n_tensors,
                      float alpha, cudaStream_t s);
 void scale_fp32_many_dev(float** ptrs, const int64_t* sizes, int n_tensors,
                          const float* alpha_dev, cudaStream_t s);
+int  chunk_size_fp32();
+void sumsq_fp32_mta(float** ptrs, const int64_t* sizes,
+                    const int* chunk_to_tensor,
+                    const int64_t* chunk_to_offset,
+                    int n_chunks, float* out, cudaStream_t s);
+void scale_fp32_mta(float** ptrs, const int64_t* sizes,
+                    const int* chunk_to_tensor,
+                    const int64_t* chunk_to_offset,
+                    int n_chunks, float alpha, cudaStream_t s);
+void scale_fp32_mta_dev(float** ptrs, const int64_t* sizes,
+                        const int* chunk_to_tensor,
+                        const int64_t* chunk_to_offset,
+                        int n_chunks, const float* alpha_dev,
+                        cudaStream_t s);
 void compute_clip_scale(const float* sumsq_dev, float max_norm,
                         float* scale_dev, float* norm_out_dev,
                         cudaStream_t s);
@@ -62,6 +76,33 @@ GradClipper::GradClipper(const std::vector<Parameter*>& params) {
                       cudaMemcpyHostToDevice));
   ZWT_CUDA(cudaMemcpy(d_sizes_, s_h.data(), sizeof(int64_t) * n_,
                       cudaMemcpyHostToDevice));
+
+  // Build MTA chunk descriptors. For each tensor of size s, we emit
+  // ceil(s / chunk_size) chunks. Each chunk gets a (tensor_id, offset)
+  // entry so the kernel's grid is sized to total chunks rather than
+  // total tensors — uniform SM utilization regardless of param size mix.
+  const int chunk = k::chunk_size_fp32();
+  std::vector<int>     chunk_to_tensor;
+  std::vector<int64_t> chunk_to_offset;
+  for (int t = 0; t < n_; ++t) {
+    const int64_t sz = s_h[t];
+    int64_t off = 0;
+    while (off < sz) {
+      chunk_to_tensor.push_back(t);
+      chunk_to_offset.push_back(off);
+      off += chunk;
+    }
+  }
+  n_chunks_ = static_cast<int>(chunk_to_tensor.size());
+  if (n_chunks_ > 0) {
+    ZWT_CUDA(cudaMalloc(&d_chunk_to_tensor_, sizeof(int)     * n_chunks_));
+    ZWT_CUDA(cudaMalloc(&d_chunk_to_offset_, sizeof(int64_t) * n_chunks_));
+    ZWT_CUDA(cudaMemcpy(d_chunk_to_tensor_, chunk_to_tensor.data(),
+                        sizeof(int)     * n_chunks_, cudaMemcpyHostToDevice));
+    ZWT_CUDA(cudaMemcpy(d_chunk_to_offset_, chunk_to_offset.data(),
+                        sizeof(int64_t) * n_chunks_, cudaMemcpyHostToDevice));
+  }
+
   // Initialize scale=1, norm=0 so that an early pull_last_norm before the
   // first clip() returns sensible defaults.
   float one = 1.f;
@@ -78,13 +119,16 @@ GradClipper::GradClipper(GradClipper&& o) noexcept {
 GradClipper& GradClipper::operator=(GradClipper&& o) noexcept {
   if (this != &o) {
     release_();
-    n_       = o.n_;       o.n_       = 0;
-    device_  = o.device_;
-    d_ptrs_  = o.d_ptrs_;  o.d_ptrs_  = nullptr;
-    d_sizes_ = o.d_sizes_; o.d_sizes_ = nullptr;
-    d_sumsq_ = o.d_sumsq_; o.d_sumsq_ = nullptr;
-    d_scale_ = o.d_scale_; o.d_scale_ = nullptr;
-    d_norm_  = o.d_norm_;  o.d_norm_  = nullptr;
+    n_                 = o.n_;                 o.n_                 = 0;
+    device_            = o.device_;
+    d_ptrs_            = o.d_ptrs_;            o.d_ptrs_            = nullptr;
+    d_sizes_           = o.d_sizes_;           o.d_sizes_           = nullptr;
+    d_sumsq_           = o.d_sumsq_;           o.d_sumsq_           = nullptr;
+    d_scale_           = o.d_scale_;           o.d_scale_           = nullptr;
+    d_norm_            = o.d_norm_;            o.d_norm_            = nullptr;
+    d_chunk_to_tensor_ = o.d_chunk_to_tensor_; o.d_chunk_to_tensor_ = nullptr;
+    d_chunk_to_offset_ = o.d_chunk_to_offset_; o.d_chunk_to_offset_ = nullptr;
+    n_chunks_          = o.n_chunks_;          o.n_chunks_          = 0;
     cpu_params_ = std::move(o.cpu_params_);
     cpu_norm_   = o.cpu_norm_;
   }
@@ -95,15 +139,18 @@ GradClipper::~GradClipper() { release_(); }
 
 void GradClipper::release_() {
 #ifdef USE_CUDA
-  if (d_ptrs_)  cudaFree(d_ptrs_);
-  if (d_sizes_) cudaFree(d_sizes_);
-  if (d_sumsq_) cudaFree(d_sumsq_);
-  if (d_scale_) cudaFree(d_scale_);
-  if (d_norm_)  cudaFree(d_norm_);
+  if (d_ptrs_)            cudaFree(d_ptrs_);
+  if (d_sizes_)           cudaFree(d_sizes_);
+  if (d_sumsq_)           cudaFree(d_sumsq_);
+  if (d_scale_)           cudaFree(d_scale_);
+  if (d_norm_)            cudaFree(d_norm_);
+  if (d_chunk_to_tensor_) cudaFree(d_chunk_to_tensor_);
+  if (d_chunk_to_offset_) cudaFree(d_chunk_to_offset_);
 #endif
   d_ptrs_ = nullptr; d_sizes_ = nullptr;
   d_sumsq_ = nullptr; d_scale_ = nullptr; d_norm_ = nullptr;
-  n_ = 0;
+  d_chunk_to_tensor_ = nullptr; d_chunk_to_offset_ = nullptr;
+  n_ = 0; n_chunks_ = 0;
 }
 
 void GradClipper::clip(float max_norm) {
@@ -114,11 +161,15 @@ void GradClipper::clip(float max_norm) {
     cudaStream_t s = reinterpret_cast<cudaStream_t>(
         compute_stream(device_).handle);
     // Three-kernel sequence, capture-safe (no host syncs, no async malloc).
+    // Use the MTA path so the grid scales with total chunks, giving uniform
+    // SM utilization even with a wide param-size distribution.
     k::zero_scalar_fp32(d_sumsq_, s);
-    k::sumsq_fp32_many(d_ptrs_, d_sizes_, n_, d_sumsq_, s);
+    k::sumsq_fp32_mta(d_ptrs_, d_sizes_, d_chunk_to_tensor_, d_chunk_to_offset_,
+                      n_chunks_, d_sumsq_, s);
     k::compute_clip_scale(d_sumsq_, max_norm, d_scale_, d_norm_, s);
     if (max_norm > 0.f) {
-      k::scale_fp32_many_dev(d_ptrs_, d_sizes_, n_, d_scale_, s);
+      k::scale_fp32_mta_dev(d_ptrs_, d_sizes_, d_chunk_to_tensor_,
+                            d_chunk_to_offset_, n_chunks_, d_scale_, s);
     }
     return;
 #endif

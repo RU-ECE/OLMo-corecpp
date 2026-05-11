@@ -102,7 +102,7 @@ void VSLInstanceSource::set_step(int64_t step) {
 }
 
 bool VSLInstanceSource::has_next() const {
-  return !buffer_.empty() || source_->has_next();
+  return (buffer_.size() > head_) || source_->has_next();
 }
 
 Instance VSLInstanceSource::next() {
@@ -110,37 +110,51 @@ Instance VSLInstanceSource::next() {
   current_seq_len_ = compute_seq_len(current_step_);
   ++current_step_;
 
-  // Fill buffer from documents until we have enough tokens
-  while (static_cast<int64_t>(buffer_.size()) < current_seq_len_ + 1 &&
-         source_->has_next()) {
+  // Fill buffer from documents until we have enough unconsumed tokens.
+  // Compaction step: when head_ has eaten more than half the buffer and
+  // we're about to grow further, slide the live window to the front so the
+  // buffer doesn't grow unbounded.
+  auto live = [this]() -> int64_t {
+    return static_cast<int64_t>(buffer_.size() - head_);
+  };
+  while (live() < current_seq_len_ + 1 && source_->has_next()) {
+    if (head_ > 0 && head_ * 2 >= buffer_.size()) {
+      // Compact: move live window to the front and drop the consumed prefix.
+      buffer_.erase(buffer_.begin(),
+                    buffer_.begin() + static_cast<std::ptrdiff_t>(head_));
+      head_ = 0;
+    }
     Document doc = source_->next();
     buffer_.insert(buffer_.end(), doc.tokens.begin(), doc.tokens.end());
   }
 
   Instance inst;
 
-  if (static_cast<int64_t>(buffer_.size()) >= current_seq_len_ + 1) {
-    // Enough tokens: create input/labels pair
-    inst.input_ids.assign(buffer_.begin(),
-                          buffer_.begin() + current_seq_len_);
-    inst.labels.assign(buffer_.begin() + 1,
-                       buffer_.begin() + current_seq_len_ + 1);
-    buffer_.erase(buffer_.begin(), buffer_.begin() + current_seq_len_);
-  } else if (!buffer_.empty()) {
-    // Not enough tokens: use what we have and pad
-    int64_t available = static_cast<int64_t>(buffer_.size());
-    int64_t real_len = available - 1;
+  if (live() >= current_seq_len_ + 1) {
+    // Enough tokens: create input/labels pair from [head_, head_ + seq_len].
+    inst.input_ids.assign(buffer_.begin() + static_cast<std::ptrdiff_t>(head_),
+                          buffer_.begin() + static_cast<std::ptrdiff_t>(head_) + current_seq_len_);
+    inst.labels.assign(buffer_.begin() + static_cast<std::ptrdiff_t>(head_) + 1,
+                       buffer_.begin() + static_cast<std::ptrdiff_t>(head_) + current_seq_len_ + 1);
+    head_ += static_cast<size_t>(current_seq_len_);
+  } else if (live() > 0) {
+    // Not enough tokens: use what we have and pad. Read from the live
+    // window starting at head_, then drain the buffer.
+    const int64_t available = live();
+    const int64_t real_len  = available - 1;
 
     if (real_len <= 0) {
-      // Not enough for even one input/label pair
+      // Not enough for even one input/label pair.
       inst.input_ids.resize(current_seq_len_, pad_token_id_);
       inst.labels.resize(current_seq_len_, -100);
       buffer_.clear();
+      head_ = 0;
       return inst;
     }
 
-    inst.input_ids.assign(buffer_.begin(), buffer_.begin() + real_len);
-    inst.labels.assign(buffer_.begin() + 1, buffer_.begin() + real_len + 1);
+    const auto begin = buffer_.begin() + static_cast<std::ptrdiff_t>(head_);
+    inst.input_ids.assign(begin, begin + real_len);
+    inst.labels.assign(begin + 1, begin + real_len + 1);
 
     // Pad to current_seq_len_
     while (static_cast<int64_t>(inst.input_ids.size()) < current_seq_len_) {
@@ -149,6 +163,7 @@ Instance VSLInstanceSource::next() {
     }
 
     buffer_.clear();
+    head_ = 0;
   } else {
     throw std::runtime_error("VSLInstanceSource: no more tokens available");
   }

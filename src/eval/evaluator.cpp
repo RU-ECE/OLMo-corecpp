@@ -20,12 +20,34 @@
  *   Periodic monitoring. Inactive between eval points.
  */
 #include "olmo_cpp/eval/evaluator.hpp"
+#include "olmo_cpp/model/transformer.hpp"
+#include "olmo_cpp/model/fused_transformer.hpp"
 #include <iostream>
+#include <optional>
 
 namespace olmo_cpp {
 
 void MultiTaskEvaluator::add_task(EvalTask task) {
   tasks_.push_back(std::move(task));
+}
+
+// Run forward + loss on the concrete model type. Returns nullopt when
+// `model` is neither Transformer nor FusedTransformer (the only types that
+// expose a (input_ids, labels) -> scalar-loss forward). The base
+// torch::nn::Module has no virtual `forward` to call into, so without a
+// dynamic_cast we cannot compute loss generically.
+static std::optional<double> run_forward_loss(torch::nn::Module& model,
+                                              const torch::Tensor& input,
+                                              const torch::Tensor& labels) {
+  if (auto* t = dynamic_cast<TransformerImpl*>(&model)) {
+    auto loss = t->forward(input, labels);
+    return loss.item<double>();
+  }
+  if (auto* ft = dynamic_cast<FusedTransformerImpl*>(&model)) {
+    auto loss = ft->forward(input, labels);
+    return loss.item<double>();
+  }
+  return std::nullopt;
 }
 
 MetricMap MultiTaskEvaluator::evaluate(torch::nn::Module& model, torch::Device device) {
@@ -34,39 +56,36 @@ MetricMap MultiTaskEvaluator::evaluate(torch::nn::Module& model, torch::Device d
 
   for (const auto& task : tasks_) {
     double total_loss = 0.0;
-    int64_t total_correct = 0;
-    int64_t total_tokens = 0;
     int64_t num_batches = 0;
+    bool any_failed = false;
 
     for (const auto& [input, labels] : task.data) {
       auto inp = input.to(device);
       auto lab = labels.to(device);
-
-      // Get model parameters for manual forward pass
-      // Use torch::nn::functional for loss computation on logits
-      // NOTE: Callers should cast to their concrete model type for forward()
-      // This base implementation computes cross-entropy on the task data pairs
-      // assuming output tensors are provided as labels
-      auto V = lab.max().item<int64_t>() + 1;  // vocab size estimate
-      auto loss_val = 0.0;  // placeholder
-      total_loss += loss_val;
+      auto loss_opt = run_forward_loss(model, inp, lab);
+      if (!loss_opt) { any_failed = true; break; }
+      total_loss += *loss_opt;
       num_batches++;
     }
 
-    double avg_loss = (num_batches > 0) ? total_loss / num_batches : 0.0;
-    std::string prefix = task.name + "/";
+    const std::string prefix = task.name + "/";
+    if (any_failed || num_batches == 0) {
+      // Honest failure signal — no fake zero loss. Caller can detect this
+      // by the absence of usual loss/perplexity keys.
+      all_metrics[prefix + "evaluator_status"] =
+          any_failed ? -1.0 /*forward unsupported*/ : 0.0 /*no batches*/;
+      continue;
+    }
+
+    const double avg_loss = total_loss / num_batches;
 
     for (const auto& metric : task.metric_names) {
-      if (metric == "perplexity") {
-        all_metrics[prefix + "perplexity"] = perplexity(avg_loss);
-      } else if (metric == "accuracy") {
-        all_metrics[prefix + "accuracy"] =
-            (total_tokens > 0) ? static_cast<double>(total_correct) / total_tokens : 0.0;
-      } else if (metric == "loss") {
-        all_metrics[prefix + "loss"] = avg_loss;
-      } else if (metric == "bits_per_byte") {
-        all_metrics[prefix + "bits_per_byte"] = bits_per_byte(avg_loss);
-      }
+      if (metric == "perplexity")        all_metrics[prefix + "perplexity"]    = perplexity(avg_loss);
+      else if (metric == "loss")         all_metrics[prefix + "loss"]          = avg_loss;
+      else if (metric == "bits_per_byte") all_metrics[prefix + "bits_per_byte"] = bits_per_byte(avg_loss);
+      // "accuracy" requires per-token argmax — out of scope for this generic
+      // evaluator. Use a model-specific evaluator (e.g. LMEvaluator) if the
+      // task needs token-level accuracy.
     }
   }
 

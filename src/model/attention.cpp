@@ -113,26 +113,31 @@ torch::Tensor AttentionImpl::forward(
   torch::Tensor attn_out;
 
   if (sliding_window_size_ > 0 && S > 1) {
-    // Reuse cached mask when dimensions haven't changed
+    // Reuse cached mask when dimensions haven't changed.
     if (S != cached_mask_S_ || full_S != cached_mask_full_S_) {
-      auto rows = torch::arange(S, torch::TensorOptions().dtype(torch::kLong).device(x.device())).unsqueeze(1);
-      auto cols = torch::arange(full_S, torch::TensorOptions().dtype(torch::kLong).device(x.device())).unsqueeze(0);
-      auto offset = full_S - S;
-
-      auto mask = (cols >= (rows + offset - sliding_window_size_)) & (cols <= (rows + offset));
-      if (is_causal) {
-        mask = mask & (cols <= (rows + offset));
-      }
+      // The mask we want is the band of diagonals [offset - window, offset]
+      // (causal upper bound at offset, lower bound at offset - window). Build
+      // it as a single bool kernel via tril/triu so we don't allocate two
+      // arange tensors and pile up boolean ops. The previous implementation
+      // also had a no-op refinement: the original `mask` already enforced
+      // `cols <= (rows + offset)`, so the `if (is_causal)` clause re-ANDed
+      // an identical condition for free.
+      const auto offset = full_S - S;
+      auto bool_opts = torch::TensorOptions().dtype(torch::kBool).device(x.device());
+      auto ones      = torch::ones({S, full_S}, bool_opts);
+      auto allowed   = torch::tril(ones, offset)
+                         & torch::triu(ones, offset - sliding_window_size_);
 
       // Mask dtype must match the activation dtype so SDPA doesn't reject a
       // BF16 q/k/v with an FP32 attention bias (same class of bug as the one
-      // that killed 7B startup).
+      // that killed 7B startup). torch::where with rank-0 tensors avoids the
+      // alloc-of-two-SxS-tensors-then-discard pattern the old code used.
       auto mask_opts = torch::TensorOptions().dtype(x.dtype()).device(x.device());
       cached_attn_mask_ = torch::where(
-          mask,
-          torch::zeros({S, full_S}, mask_opts),
-          torch::full({S, full_S}, -std::numeric_limits<float>::infinity(), mask_opts));
-      cached_mask_S_ = S;
+          allowed,
+          torch::zeros({}, mask_opts),
+          torch::full({}, -std::numeric_limits<float>::infinity(), mask_opts));
+      cached_mask_S_      = S;
       cached_mask_full_S_ = full_S;
     }
 

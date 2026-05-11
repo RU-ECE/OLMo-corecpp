@@ -77,30 +77,38 @@ static std::pair<torch::Tensor, torch::Tensor> apply_rope_to_qk(
   int64_t q_abs_start = start_pos ? *start_pos : (k_len - q_len);
   int64_t k_abs_start = start_pos ? *start_pos : 0;
 
+  // Pick the source buffer in the right dtype. If q/k are already in the
+  // master compute dtype (typically FP32), use pos_sin/pos_cos directly.
+  // Otherwise lazily cast the *whole* buffer once and slice from the
+  // cached copy on every subsequent call. The cast cache is shared across
+  // all layer-views via shared_ptr so the first layer to hit a new dtype
+  // fills it for the rest of the model.
+  const auto q_st = q.scalar_type();
+  const auto& src_sin = (q_st == bufs.pos_sin.scalar_type())
+                            ? bufs.pos_sin
+                            : ([&]() -> const torch::Tensor& {
+                                auto& c = *bufs.cast;
+                                if (c.dtype != q_st || !c.pos_sin_cast.defined()) {
+                                  c.pos_sin_cast = bufs.pos_sin.to(q_st);
+                                  c.pos_cos_cast = bufs.pos_cos.to(q_st);
+                                  c.dtype        = q_st;
+                                }
+                                return c.pos_sin_cast;
+                              })();
+  const auto& src_cos = (q_st == bufs.pos_cos.scalar_type())
+                            ? bufs.pos_cos
+                            : bufs.cast->pos_cos_cast;
+
   // Slice the buffer rows for our position window and unsqueeze leading
   // dims so they broadcast across batch and head dimensions.
-  auto sin_q = bufs.pos_sin.slice(0, q_abs_start, q_abs_start + q_len)
-                   .unsqueeze(0)
-                   .unsqueeze(0);
-  auto cos_q = bufs.pos_cos.slice(0, q_abs_start, q_abs_start + q_len)
-                   .unsqueeze(0)
-                   .unsqueeze(0);
-  auto sin_k = bufs.pos_sin.slice(0, k_abs_start, k_abs_start + k_len)
-                   .unsqueeze(0)
-                   .unsqueeze(0);
-  auto cos_k = bufs.pos_cos.slice(0, k_abs_start, k_abs_start + k_len)
-                   .unsqueeze(0)
-                   .unsqueeze(0);
-
-  // Buffers are already on the correct device from get_buffers(). We may
-  // still need a one-shot dtype cast — scaled variants build buffers in
-  // FP32 unconditionally, while q/k may be bf16 under AMP.
-  if (sin_q.dtype() != q.dtype()) {
-    sin_q = sin_q.to(q.dtype());
-    cos_q = cos_q.to(q.dtype());
-    sin_k = sin_k.to(k.dtype());
-    cos_k = cos_k.to(k.dtype());
-  }
+  auto sin_q = src_sin.slice(0, q_abs_start, q_abs_start + q_len)
+                   .unsqueeze(0).unsqueeze(0);
+  auto cos_q = src_cos.slice(0, q_abs_start, q_abs_start + q_len)
+                   .unsqueeze(0).unsqueeze(0);
+  auto sin_k = src_sin.slice(0, k_abs_start, k_abs_start + k_len)
+                   .unsqueeze(0).unsqueeze(0);
+  auto cos_k = src_cos.slice(0, k_abs_start, k_abs_start + k_len)
+                   .unsqueeze(0).unsqueeze(0);
 
   auto q_rot = apply_rotary_fn(q, sin_q, cos_q);
   auto k_rot = apply_rotary_fn(k, sin_k, cos_k);

@@ -77,24 +77,27 @@ bool GradScaler::unscale_and_check(torch::optim::Optimizer& optimizer) {
 
   if (grads.empty()) return true;
 
-  // Batched unscale: 1 fused kernel launch instead of N individual mul_ calls
-  at::_foreach_mul_(grads, static_cast<double>(inv_scale));
+  // Single fused multi-tensor kernel that does BOTH the unscale and the
+  // non-finite check. This is the primitive PyTorch's own GradScaler uses
+  // internally — replaces the previous (already-improved) path of:
+  //   1× foreach_mul_  (1 kernel launch over all grads)
+  //   N× isfinite + N× .all()  (N kernel launches, one per grad)
+  //   1× stack + 1× all()  (2 more kernels)
+  // with a single _amp_foreach_non_finite_check_and_unscale_ call —
+  // O(launches) drops from N+3 to 1, and `found_inf` lives on-device until
+  // the host syncs at .item<bool>() below, so the unscale and the check
+  // overlap with the next backward when called from a graph-captured loop.
+  auto found_inf_tensor = torch::zeros(
+      {1}, torch::TensorOptions().dtype(torch::kFloat32).device(grads[0].device()));
+  auto inv_scale_tensor = torch::full(
+      {1}, static_cast<double>(inv_scale),
+      torch::TensorOptions().dtype(torch::kFloat32).device(grads[0].device()));
+  at::_amp_foreach_non_finite_check_and_unscale_(
+      grads, found_inf_tensor, inv_scale_tensor);
 
-  // Per-grad isfinite().all() produces a 0-dim bool per grad; stack them
-  // and reduce once on-device. The previous implementation materialized a
-  // single flat tensor of every gradient (O(model_bytes) alloc + copy!) just
-  // to run one isfinite — unacceptable even on cold paths.
-  static thread_local std::vector<torch::Tensor> finite_flags;
-  finite_flags.clear();
-  finite_flags.reserve(grads.size());
-  for (const auto& g : grads) {
-    finite_flags.push_back(torch::isfinite(g).all());
-  }
-  auto all_finite = torch::stack(finite_flags).all();
-
-  if (!all_finite.item<bool>()) {
+  if (found_inf_tensor.item<float>() != 0.0f) {
     found_inf_ = true;
-    // Zero out all grads in one fused kernel
+    // Zero out all grads in one fused kernel.
     at::_foreach_mul_(grads, 0.0);
   }
 

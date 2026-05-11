@@ -256,10 +256,19 @@ std::vector<uint32_t> BPETokenizer::bpe_encode_chunk(const std::string& chunk) {
     return ids;
   }
 
-  // Helper: get merge rank for a pair, returns INT_MAX if not a valid merge
+  // Helper: get merge rank for a pair, returns INT_MAX if not a valid merge.
+  // Reuse a thread_local key buffer so we don't allocate a new std::string
+  // on every call. The unordered_map lookup itself still hashes the bytes
+  // but the per-call malloc/free pair is gone — at thousands of get_rank
+  // calls per encoded chunk that's measurable.
+  thread_local std::string key_buf;
   auto get_rank = [this](const std::string& a, const std::string& b) -> int {
-    std::string key = a + '\0' + b;
-    auto it = merge_ranks_.find(key);
+    key_buf.clear();
+    key_buf.reserve(a.size() + b.size() + 1);
+    key_buf.append(a);
+    key_buf.push_back('\0');
+    key_buf.append(b);
+    auto it = merge_ranks_.find(key_buf);
     return (it != merge_ranks_.end()) ? it->second : INT_MAX;
   };
 
@@ -289,9 +298,12 @@ std::vector<uint32_t> BPETokenizer::bpe_encode_chunk(const std::string& chunk) {
     int cur_rank = get_rank(left->token, left->next->token);
     if (cur_rank != rank) continue;  // stale entry
 
-    // Merge left and left->next
+    // Merge left and left->next. `append` extends left->token in place;
+    // the `+` operator we used previously always allocated a new string
+    // big enough for both halves, then move-assigned it back, so for
+    // long runs we paid O(merges × token_len) in allocator overhead.
     Node* right = left->next;
-    left->token = left->token + right->token;
+    left->token.append(right->token);
     left->next = right->next;
     if (right->next) right->next->prev = left;
 

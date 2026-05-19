@@ -38,6 +38,8 @@
 #include <ATen/ops/_foreach_addcmul.h>
 #include <ATen/ops/_foreach_addcdiv.h>
 #include <ATen/ops/_foreach_sqrt.h>
+#include <ATen/ops/_fused_adamw.h>
+#include <ATen/Functions.h>
 #include <cmath>
 
 namespace olmo_cpp {
@@ -145,6 +147,38 @@ torch::Tensor ForeachAdamW::step(LossClosure closure) {
     }
 
     if (params_vec.empty()) continue;
+
+    // Item P: when available, dispatch the whole AdamW step (param decay,
+    // moment updates, denom, parameter update) as a single fused CUDA
+    // kernel via at::_fused_adamw_. Replaces the seven _foreach_*
+    // launches below with one. PyTorch ships this for CUDA-resident
+    // tensors only; falls back to the unfused path otherwise.
+#if !defined(OLMO_DISABLE_FUSED_ADAMW)
+    if (!params_vec.empty() && params_vec.front().is_cuda()) {
+      // Per-param step counter tensor. _fused_adamw_ wants TensorList of
+      // 0-D step tensors. We share a single step value across all params
+      // by reusing one tensor (the API still accepts a list).
+      auto step_t = torch::tensor(static_cast<int64_t>(step_count_),
+                                   torch::TensorOptions().dtype(torch::kFloat32)
+                                       .device(params_vec.front().device()));
+      std::vector<at::Tensor> step_list(params_vec.size(), step_t);
+      std::vector<at::Tensor> max_exp_avg_sq_empty;  // amsgrad=false; unused
+      at::_fused_adamw_(
+          params_vec, grads_vec, exp_avg_vec, exp_avg_sq_vec,
+          max_exp_avg_sq_empty,
+          step_list,
+          /*lr=*/lr,
+          /*beta1=*/beta1,
+          /*beta2=*/beta2,
+          /*weight_decay=*/weight_decay,
+          /*eps=*/eps,
+          /*amsgrad=*/false,
+          /*maximize=*/false,
+          /*grad_scale=*/c10::nullopt,
+          /*found_inf=*/c10::nullopt);
+      continue;
+    }
+#endif
 
     // Bias correction factors. Maintain beta1^t / beta2^t incrementally
     // instead of calling std::pow(beta, step_count_) on every step. Two

@@ -179,6 +179,18 @@ struct TransformerConfig {
   /// Enable FP8 GEMMs on H100+ (Transformer Engine path).
   bool use_float8 = false;
 
+  // === Mixed-precision per layer (item T.2) ===
+  // Per-component dtype overrides. When set, AttentionImpl / FeedForwardImpl /
+  // LMHead use the specified dtype on their hot path instead of the autocast
+  // default. Empty string = use autocast policy. Recognized values: "bf16",
+  // "fp16", "fp32", "fp8", "int8", "int4". Sensible defaults: embedding +
+  // LM head stay in bf16 (vocab projection is brittle under aggressive quant),
+  // attention/FFN can go FP8 or INT4 on hopper/blackwell respectively.
+  std::string attn_dtype = "";          // empty = autocast default
+  std::string ffn_dtype = "";
+  std::string embed_dtype = "";
+  std::string lm_head_dtype = "";
+
   // === Multi-Resolution Embedding (DC-MRE) ===
   // Enhances structural tokenizer with dual-codebook + morphological features.
   /// Master switch for DC-MRE — adds char-trigram + phrase auxiliary streams.

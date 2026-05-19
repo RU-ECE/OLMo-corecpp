@@ -235,6 +235,9 @@ set(OLMO_SOURCES
     src/backend/fused_ffn.cpp       # I (fused SwiGLU FFN dispatcher)
     src/backend/cublas_direct.cpp   # L (direct cuBLASLt fast path)
     src/optim/eight_bit_adamw.cpp   # O (8-bit Adam moment states)
+    src/backend/int4_kv.cpp         # U (INT4 KV codec)
+    src/backend/tma_loads.cpp       # W (Blackwell TMA descriptor builder)
+    src/backend/fp8_cublaslt.cpp    # S (FP8 cuBLASLt entry point)
     # Seed and profiling infrastructure
     src/seed.cpp
     src/profiler.cpp

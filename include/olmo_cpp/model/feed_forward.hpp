@@ -31,7 +31,9 @@
  *   in every transformer forward pass.
  */
 
+#include "olmo_cpp/float8/float8.hpp"
 #include <torch/torch.h>
+#include <memory>
 
 namespace olmo_cpp {
 
@@ -45,6 +47,12 @@ class FeedForwardImpl : public torch::nn::Module {
 
   torch::Tensor forward(torch::Tensor x);
 
+  /// Opt into FP8 (E4M3) STE emulation around each Linear's matmul. Off
+  /// by default; the block's constructor flips it on when
+  /// cfg.use_float8 is true. Allocates one Float8ScaleState pair (input
+  /// + weight) per Linear; the disabled path pays zero extra memory.
+  void enable_float8(bool on);
+
  private:
   // Standard path: separate gate (w1) and up (w3)
   torch::nn::Linear w1_{nullptr};
@@ -57,6 +65,12 @@ class FeedForwardImpl : public torch::nn::Module {
   torch::nn::Linear w2_{nullptr};
 
   bool fused_ = false;
+
+  // FP8 emulation state (I-5 / T-6). One amax tracker per Linear's input
+  // and weight; populated by enable_float8(true).
+  bool use_float8_ = false;
+  std::unique_ptr<Float8ScaleState> fp8_w1x_, fp8_w3x_, fp8_gux_, fp8_w2x_;
+  std::unique_ptr<Float8ScaleState> fp8_w1w_, fp8_w3w_, fp8_guw_, fp8_w2w_;
 };
 
 TORCH_MODULE(FeedForward);

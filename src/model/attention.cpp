@@ -64,6 +64,21 @@ AttentionImpl::AttentionImpl(const TransformerConfig& cfg, int64_t /*layer_idx*/
   // RoPE module is always created (gated at forward by rope_bufs != null).
   rope_ = RotaryEmbedding(cfg.get_head_dim(), cfg.rope_theta);
   register_module("rope", rope_.value());
+
+  // FP8 emulation state (I-5 / T-6). One amax-history tracker per Linear's
+  // input and per Linear's weight. Allocated only when FP8 is enabled in
+  // the config so the disabled path pays zero extra memory.
+  use_float8_ = cfg.use_float8;
+  if (use_float8_) {
+    fp8_qx_ = std::make_unique<Float8ScaleState>(16);
+    fp8_kx_ = std::make_unique<Float8ScaleState>(16);
+    fp8_vx_ = std::make_unique<Float8ScaleState>(16);
+    fp8_ox_ = std::make_unique<Float8ScaleState>(16);
+    fp8_qw_ = std::make_unique<Float8ScaleState>(16);
+    fp8_kw_ = std::make_unique<Float8ScaleState>(16);
+    fp8_vw_ = std::make_unique<Float8ScaleState>(16);
+    fp8_ow_ = std::make_unique<Float8ScaleState>(16);
+  }
 }
 
 torch::Tensor AttentionImpl::forward(
@@ -74,9 +89,20 @@ torch::Tensor AttentionImpl::forward(
   auto B = x.size(0);
   auto S = x.size(1);
 
-  auto q = w_q_(x);
-  auto k = w_k_(x);
-  auto v = w_v_(x);
+  // FP8 emulation gate: when active, route each linear through the
+  // straight-through quantize/dequantize path. Forward sees fp8-rounded
+  // activations + weights; gradient passes through unchanged (STE).
+  auto linear_maybe_fp8 = [&](torch::nn::Linear& lin,
+                              Float8ScaleState* sx, Float8ScaleState* sw,
+                              const torch::Tensor& in) -> torch::Tensor {
+    if (!use_float8_) return lin(in);
+    return float8_linear_emulated(in, lin->weight,
+                                  lin->bias.defined() ? lin->bias : torch::Tensor(),
+                                  *sx, *sw);
+  };
+  auto q = linear_maybe_fp8(w_q_, fp8_qx_.get(), fp8_qw_.get(), x);
+  auto k = linear_maybe_fp8(w_k_, fp8_kx_.get(), fp8_kw_.get(), x);
+  auto v = linear_maybe_fp8(w_v_, fp8_vx_.get(), fp8_vw_.get(), x);
 
   // QK-norm before reshape
   if (q_norm_ && !use_head_qk_norm_) q = (*q_norm_)(q);
@@ -149,7 +175,11 @@ torch::Tensor AttentionImpl::forward(
   }
 
   attn_out = attn_out.transpose(1, 2).reshape({B, S, -1});
-  return w_out_(attn_out);
+  return use_float8_
+      ? float8_linear_emulated(attn_out, w_out_->weight,
+                               w_out_->bias.defined() ? w_out_->bias : torch::Tensor(),
+                               *fp8_ox_, *fp8_ow_)
+      : w_out_(attn_out);
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -169,9 +199,17 @@ torch::Tensor AttentionImpl::forward_paged(
   auto B = x.size(0);
   auto S = x.size(1);
 
-  auto q = w_q_(x);
-  auto k = w_k_(x);
-  auto v = w_v_(x);
+  auto linear_maybe_fp8 = [&](torch::nn::Linear& lin,
+                              Float8ScaleState* sx, Float8ScaleState* sw,
+                              const torch::Tensor& in) -> torch::Tensor {
+    if (!use_float8_) return lin(in);
+    return float8_linear_emulated(in, lin->weight,
+                                  lin->bias.defined() ? lin->bias : torch::Tensor(),
+                                  *sx, *sw);
+  };
+  auto q = linear_maybe_fp8(w_q_, fp8_qx_.get(), fp8_qw_.get(), x);
+  auto k = linear_maybe_fp8(w_k_, fp8_kx_.get(), fp8_kw_.get(), x);
+  auto v = linear_maybe_fp8(w_v_, fp8_vx_.get(), fp8_vw_.get(), x);
 
   if (q_norm_ && !use_head_qk_norm_) q = (*q_norm_)(q);
   if (k_norm_ && !use_head_qk_norm_) k = (*k_norm_)(k);
@@ -218,7 +256,11 @@ torch::Tensor AttentionImpl::forward_paged(
         paged->n_tokens_tensor(),
         sm_scale);                                                // [n_heads, head_dim]
     auto attn_out_one = attn_flat.view({B, S, n_heads_ * head_dim_});
-    return w_out_(attn_out_one);
+    return use_float8_
+        ? float8_linear_emulated(attn_out_one, w_out_->weight,
+                                 w_out_->bias.defined() ? w_out_->bias : torch::Tensor(),
+                                 *fp8_ox_, *fp8_ow_)
+        : w_out_(attn_out_one);
   }
 
   auto [full_k, full_v] = paged->materialize(layer_idx);

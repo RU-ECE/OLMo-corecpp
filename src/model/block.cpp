@@ -59,7 +59,11 @@ ReorderedNormTransformerBlockImpl::ReorderedNormTransformerBlockImpl(
     : attention_(register_module("attention", Attention(cfg, block_idx))),
       attention_norm_(register_module("attention_norm", RMSNorm(cfg.d_model, cfg.layer_norm_eps))),
       feed_forward_norm_(register_module("feed_forward_norm", RMSNorm(cfg.d_model, cfg.layer_norm_eps))),
-      feed_forward_(register_module("feed_forward", FeedForward(cfg.d_model, cfg.get_hidden_size(), false))) {}
+      feed_forward_(register_module("feed_forward", FeedForward(cfg.d_model, cfg.get_hidden_size(), false))) {
+  // I-5 / T-6: AttentionImpl reads cfg.use_float8 itself; FeedForwardImpl
+  // doesn't take cfg, so we wire its FP8 toggle from here.
+  if (cfg.use_float8) feed_forward_->enable_float8(true);
+}
 
 torch::Tensor ReorderedNormTransformerBlockImpl::forward(
     torch::Tensor x,

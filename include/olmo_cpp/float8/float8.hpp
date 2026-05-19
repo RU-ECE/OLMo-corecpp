@@ -117,4 +117,27 @@ struct MXFP8Config {
 /// per-block amax-derived scale, and stores per-block scales alongside data.
 Float8Tensor quantize_mxfp8(const torch::Tensor& tensor, const MXFP8Config& config);
 
+/// Drop-in replacement for `torch::nn::functional::linear` that emulates
+/// FP8 (E4M3) at the inputs AND the weight via STE quantize-then-
+/// dequantize-then-matmul. Forward sees the quantized activations and
+/// weights; backward passes the gradient through unchanged (the standard
+/// straight-through estimator trick: `x + (x_dq - x).detach()` matches
+/// `x` in value if we re-arrange but propagates gradient as identity).
+///
+/// `input_scale` and `weight_scale` are rolling-window amax trackers
+/// owned by the caller (one pair per Linear layer). They get updated
+/// in-place each call, supplying the delayed-scaling scale factor that
+/// would be plumbed to hardware FP8 on Hopper.
+///
+/// Use this free function rather than swapping `torch::nn::Linear` for
+/// `Float8Linear` so checkpoint state_dict keys remain unchanged — the
+/// caller still holds a plain Linear and just routes its weight + bias
+/// through here when `cfg.use_float8 == true`.
+torch::Tensor float8_linear_emulated(
+    torch::Tensor input,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    Float8ScaleState& input_scale,
+    Float8ScaleState& weight_scale);
+
 }  // namespace olmo_cpp

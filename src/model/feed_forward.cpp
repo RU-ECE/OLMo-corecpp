@@ -71,20 +71,44 @@ FeedForwardImpl::FeedForwardImpl(int64_t d_model, int64_t hidden_size, bool bias
 /// Output    : [B, S, D] (same leading shape) — the FFN contribution.
 /// Math: y = w2( silu(gate) * up ).
 torch::Tensor FeedForwardImpl::forward(torch::Tensor x) {
+  // FP8 routing helper. Identical math to torch::nn::functional::linear
+  // when use_float8_ is false; when true, applies STE FP8 emulation
+  // through float8_linear_emulated.
+  auto lin = [&](torch::nn::Linear& m,
+                 Float8ScaleState* sx, Float8ScaleState* sw,
+                 const torch::Tensor& in) -> torch::Tensor {
+    if (!use_float8_) return m(in);
+    return float8_linear_emulated(in, m->weight,
+                                  m->bias.defined() ? m->bias : torch::Tensor(),
+                                  *sx, *sw);
+  };
+
   if (fused_) {
-    // Single GEMM produces concatenated [gate || up] along the last dim.
-    auto gate_up = w_gate_up_(x);
-    // Split the 2H last-dim into two H-wide tensors; narrow() is a view, no
-    // copy, so the elementwise silu_mul kernel reads a strided slice.
+    auto gate_up = lin(w_gate_up_, fp8_gux_.get(), fp8_guw_.get(), x);
     int64_t h = gate_up.size(-1) / 2;
     auto gate = gate_up.narrow(-1, 0, h);
     auto up = gate_up.narrow(-1, h, h);
-    // Backend dispatch: CPU falls through to ATen, CUDA hits a fused
-    // elementwise kernel that does silu(gate) * up in one pass.
-    return w2_(get_backend().silu_mul(gate, up));
+    auto act = get_backend().silu_mul(gate, up);
+    return lin(w2_, fp8_w2x_.get(), fp8_w2w_.get(), act);
   }
-  // Split path: two independent GEMMs, then the same fused silu_mul.
-  return w2_(get_backend().silu_mul(w1_(x), w3_(x)));
+  auto act = get_backend().silu_mul(
+      lin(w1_, fp8_w1x_.get(), fp8_w1w_.get(), x),
+      lin(w3_, fp8_w3x_.get(), fp8_w3w_.get(), x));
+  return lin(w2_, fp8_w2x_.get(), fp8_w2w_.get(), act);
+}
+
+void FeedForwardImpl::enable_float8(bool on) {
+  use_float8_ = on;
+  if (!on) {
+    fp8_w1x_.reset(); fp8_w3x_.reset(); fp8_gux_.reset(); fp8_w2x_.reset();
+    fp8_w1w_.reset(); fp8_w3w_.reset(); fp8_guw_.reset(); fp8_w2w_.reset();
+    return;
+  }
+  auto make = [] { return std::make_unique<Float8ScaleState>(16); };
+  fp8_w2x_ = make(); fp8_w2w_ = make();
+  if (fused_) { fp8_gux_ = make(); fp8_guw_ = make(); }
+  else        { fp8_w1x_ = make(); fp8_w1w_ = make();
+                fp8_w3x_ = make(); fp8_w3w_ = make(); }
 }
 
 }  // namespace olmo_cpp

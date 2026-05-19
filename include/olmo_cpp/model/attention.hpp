@@ -36,8 +36,10 @@
 #include "olmo_cpp/model/layer_norm.hpp"
 #include "olmo_cpp/model/paged_kv_cache.hpp"
 #include "olmo_cpp/model/rope.hpp"
+#include "olmo_cpp/float8/float8.hpp"
 #include <torch/torch.h>
 #include <optional>
+#include <memory>
 
 namespace olmo_cpp {
 
@@ -112,6 +114,15 @@ class AttentionImpl : public torch::nn::Module {
   int64_t cached_mask_full_S_ = 0;
   /// Cached additive (-inf / 0) sliding-window mask, dtype-matched to acts.
   torch::Tensor cached_attn_mask_;
+
+  /// FP8 emulation (I-5 / T-6). When cfg.use_float8 is true, each Q/K/V/out
+  /// projection routes through float8_linear_emulated using these per-
+  /// Linear scale trackers. Held by unique_ptr so the per-call updates
+  /// (mutating amax_history) work with the otherwise-const attention call
+  /// pattern. unique_ptr-empty when FP8 is disabled.
+  bool use_float8_ = false;
+  std::unique_ptr<Float8ScaleState> fp8_qx_, fp8_kx_, fp8_vx_, fp8_ox_;
+  std::unique_ptr<Float8ScaleState> fp8_qw_, fp8_kw_, fp8_vw_, fp8_ow_;
 };
 
 /// Holder type macro from LibTorch — defines `Attention` as a shared-ptr

@@ -138,23 +138,29 @@ torch::Tensor Float8LinearImpl::forward(torch::Tensor input) {
   if (!enabled_) {
     return inner_(input);
   }
+  return float8_linear_emulated(input, inner_->weight,
+                                inner_->bias.defined() ? inner_->bias : torch::Tensor(),
+                                input_scale_, weight_scale_);
+}
 
-  // Quantize input and weight to E4M3, compute in full precision
-  // (True fp8 matmul requires hardware support; this emulates the quantization noise)
-  auto input_q = quantize_to_float8(input.detach(), Float8Format::E4M3, &input_scale_);
-  auto weight_q = quantize_to_float8(inner_->weight.detach(), Float8Format::E4M3, &weight_scale_);
-
-  // Dequantize and compute matmul (simulated fp8)
-  auto input_deq = input_q.dequantize(input.scalar_type());
-  auto weight_deq = weight_q.dequantize(inner_->weight.scalar_type());
-
-  // Use STE (straight-through estimator): forward uses quantized, backward uses original
-  auto output = torch::nn::functional::linear(
-      input + (input_deq - input).detach(),
-      inner_->weight + (weight_deq - inner_->weight).detach(),
-      inner_->bias.defined() ? inner_->bias : torch::Tensor());
-
-  return output;
+// Free-function variant for callers that hold a plain torch::nn::Linear
+// and want to opt into FP8 emulation without swapping module types
+// (preserves checkpoint key names). Mirrors Float8LinearImpl::forward's
+// STE math.
+torch::Tensor float8_linear_emulated(
+    torch::Tensor input,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    Float8ScaleState& input_scale,
+    Float8ScaleState& weight_scale) {
+  auto input_q  = quantize_to_float8(input.detach(),  Float8Format::E4M3, &input_scale);
+  auto weight_q = quantize_to_float8(weight.detach(), Float8Format::E4M3, &weight_scale);
+  auto input_deq  = input_q.dequantize(input.scalar_type());
+  auto weight_deq = weight_q.dequantize(weight.scalar_type());
+  return torch::nn::functional::linear(
+      input  + (input_deq  - input ).detach(),
+      weight + (weight_deq - weight).detach(),
+      bias.defined() ? bias : torch::Tensor());
 }
 
 // ---------------------------------------------------------------------------

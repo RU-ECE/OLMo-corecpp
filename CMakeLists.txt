@@ -227,6 +227,7 @@ set(OLMO_SOURCES
     src/generate/draft_model_speculative.cpp  # fast-inference [17]
     src/model/paged_kv_cache.cpp  # fast-inference [1] partial (concat shim)
     src/model/block_manager.cpp  # fast-inference [9] (page allocator)
+    src/model/shared_block_pool.cpp  # fast-inference [I-7] (ref-counted shared pool)
     # Seed and profiling infrastructure
     src/seed.cpp
     src/profiler.cpp
@@ -589,6 +590,14 @@ add_executable(test_paged_kv tools/test_paged_kv.cpp)
 target_link_libraries(test_paged_kv PRIVATE olmo_cpp)
 target_include_directories(test_paged_kv PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(test_paged_kv PRIVATE -O3 -march=native)
+
+# SharedBlockPool unit test (fast-inference [I-7]).
+# CPU-only; verifies alloc/dec_ref, content-hash lookup, hash chaining,
+# and cross-request prefix sharing all hold.
+add_executable(test_prefix_cache tools/test_prefix_cache.cpp)
+target_link_libraries(test_prefix_cache PRIVATE olmo_cpp)
+target_include_directories(test_prefix_cache PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(test_prefix_cache PRIVATE -O3 -march=native)
 
 # Fused LM-head + Gumbel-max sampler unit test (fast-inference [6]).
 # CPU-only; verifies determinism, distribution match vs softmax, and

@@ -19,15 +19,61 @@
 
 #include <torch/torch.h>
 #include <algorithm>
+#include <cmath>
+#include <numeric>
+#include <vector>
 
 namespace olmo_cpp {
 
 namespace {
 
-// Greedy argmax of a 1D logits row. Same semantics as chat.cpp's
-// rejection-test argmax in speculative verification.
 int64_t argmax_1d(torch::Tensor logits_1d) {
   return logits_1d.argmax(-1).item<int64_t>();
+}
+
+// Apply temperature, top_k, top_p filtering and produce a normalized
+// std::vector<double> probability distribution. Used at both draft
+// generation time and target-side acceptance time so the two
+// distributions are directly comparable for rejection sampling.
+//
+// Behavior matches sample_logits() in tools/chat.cpp; pulled into this
+// translation unit to keep speculative decoding self-contained.
+std::vector<double> filtered_probs(torch::Tensor logits_1d,
+                                   double temperature,
+                                   int64_t top_k,
+                                   double top_p) {
+  auto x = logits_1d.cpu().contiguous().to(torch::kFloat32);
+  const int64_t V = x.size(0);
+  if (temperature > 0.0) {
+    x = x / temperature;
+  }
+  if (top_k > 0 && top_k < V) {
+    auto [vals, _] = x.topk(top_k);
+    auto thresh = vals.index({top_k - 1}).item<float>();
+    x = torch::where(x < thresh,
+                     torch::full_like(x, -std::numeric_limits<float>::infinity()),
+                     x);
+  }
+  auto probs = torch::softmax(x, -1);
+  if (top_p < 1.0) {
+    auto [sorted, sorted_idx] = probs.sort(-1, /*descending=*/true);
+    auto cumul = sorted.cumsum(-1);
+    auto mask = (cumul - sorted) > top_p;
+    sorted.index_put_({mask}, 0.0f);
+    probs.zero_();
+    probs.scatter_(-1, sorted_idx, sorted);
+    auto sum = probs.sum().item<float>();
+    if (sum > 0) probs = probs / sum;
+  }
+  std::vector<double> out(static_cast<size_t>(V));
+  auto p_ptr = probs.data_ptr<float>();
+  for (int64_t i = 0; i < V; ++i) out[static_cast<size_t>(i)] = p_ptr[i];
+  return out;
+}
+
+int64_t sample_from(const std::vector<double>& probs, std::mt19937& rng) {
+  std::discrete_distribution<int64_t> dist(probs.begin(), probs.end());
+  return dist(rng);
 }
 
 }  // namespace
@@ -36,26 +82,40 @@ int64_t draft_model_speculative_step(
     DraftModelSpeculativeState& state,
     std::vector<int64_t>& all_tokens,
     torch::Device device,
-    double /*temperature*/,
-    int64_t /*top_k*/,
-    double /*top_p*/,
-    double /*repetition_penalty*/,
-    std::mt19937& /*rng*/,
+    double temperature,
+    int64_t top_k,
+    double top_p,
+    double /*repetition_penalty*/,    // applied at sample time by caller; not used here
+    std::mt19937& rng,
     BPETokenizer& tokenizer) {
 
   torch::NoGradGuard no_grad;
-  int64_t eos_id = static_cast<int64_t>(tokenizer.eos_id());
+  const int64_t eos_id = static_cast<int64_t>(tokenizer.eos_id());
+  const bool greedy = (temperature <= 0.0);
 
-  // Step 1: draft model produces draft_len tokens autoregressively.
+  // Step 1: draft model produces draft_len tokens autoregressively. We
+  // also keep the full probability distribution at each draft step so
+  // rejection sampling at step 3 has the q_i side of min(1, p_i/q_i).
   std::vector<int64_t> drafts;
+  std::vector<std::vector<double>> draft_probs;  // q distributions per step
   drafts.reserve(static_cast<size_t>(state.draft_len));
+  draft_probs.reserve(static_cast<size_t>(state.draft_len));
 
   int64_t cur = all_tokens.back();
   for (int64_t k = 0; k < state.draft_len; ++k) {
     auto inp = torch::tensor({cur}, torch::kInt64).unsqueeze(0).to(device);
     auto logits = (*state.draft_model)->forward(inp, c10::nullopt, -100, &state.draft_kv);
     auto next = logits.select(1, 0).squeeze(0);
-    int64_t tok = argmax_1d(next);  // greedy draft for now
+
+    int64_t tok;
+    if (greedy) {
+      tok = argmax_1d(next);
+      draft_probs.emplace_back();  // not used in greedy path
+    } else {
+      auto probs = filtered_probs(next, temperature, top_k, top_p);
+      tok = sample_from(probs, rng);
+      draft_probs.push_back(std::move(probs));
+    }
     drafts.push_back(tok);
     if (tok == eos_id) break;
     cur = tok;
@@ -63,9 +123,7 @@ int64_t draft_model_speculative_step(
   state.total_drafted += static_cast<int64_t>(drafts.size());
 
   // Step 2: target model verifies [last_token, draft_0, ..., draft_{k-1}]
-  //         in a single batched forward. The verify input length is
-  //         1 + drafts.size() because we feed last_token to get the
-  //         logits at position 0, then drafts to get logits at 1..k.
+  // in a single batched forward.
   std::vector<int64_t> verify_in;
   verify_in.reserve(1 + drafts.size());
   verify_in.push_back(all_tokens.back());
@@ -74,52 +132,98 @@ int64_t draft_model_speculative_step(
   auto vinp = torch::tensor(at::IntArrayRef(verify_in.data(), verify_in.size()),
                             torch::kInt64).unsqueeze(0).to(device);
 
-  auto target_snap = state.target_kv.snapshot();
+  const int64_t target_snap = state.target_kv.snapshot();
   auto vlogits = (*state.target_model)->forward(vinp, c10::nullopt, -100, &state.target_kv);
   auto vlogits_cpu = vlogits.cpu().contiguous();
 
-  // Step 3: walk verify positions, accept while target's argmax matches
-  // the draft. On first mismatch, take target's choice and stop.
+  // Step 3: walk verify positions and decide acceptance.
   int64_t accepted = 0;
-  int64_t main_tok = argmax_1d(vlogits_cpu.select(0, 0).select(0, 0));
+
+  // Position 0 is the target's distribution after consuming last_token —
+  // unambiguous main prediction, always accepted.
+  int64_t main_tok;
+  if (greedy) {
+    main_tok = argmax_1d(vlogits_cpu.select(0, 0).select(0, 0));
+  } else {
+    auto p_main = filtered_probs(vlogits_cpu.select(0, 0).select(0, 0),
+                                 temperature, top_k, top_p);
+    main_tok = sample_from(p_main, rng);
+  }
   all_tokens.push_back(main_tok);
   ++accepted;
-
   if (main_tok == eos_id) {
-    // No further accepts possible.
-    int64_t draft_kv_target = state.draft_kv.snapshot();
-    (void)draft_kv_target;
     state.total_accepted += 0;
     return accepted;
   }
 
+  // Positions 1..k correspond to the target's distribution after
+  // consuming each draft token. Rejection sampling per Chen et al. 2023:
+  //   p_i = target prob of drafts[i]
+  //   q_i = draft prob of drafts[i]
+  //   accept with prob min(1, p_i/q_i)
+  //   on reject: sample from normalize(max(0, p - q))
+  std::uniform_real_distribution<double> uni(0.0, 1.0);
   int64_t drafts_accepted = 0;
   for (int64_t k = 0; k < static_cast<int64_t>(drafts.size()); ++k) {
-    int64_t target_choice = argmax_1d(vlogits_cpu.select(0, 0).select(0, k + 1));
-    if (target_choice == drafts[k]) {
-      all_tokens.push_back(drafts[k]);
-      ++accepted;
-      ++drafts_accepted;
-      if (drafts[k] == eos_id) break;
+    auto vrow = vlogits_cpu.select(0, 0).select(0, k + 1);
+    if (greedy) {
+      int64_t target_choice = argmax_1d(vrow);
+      if (target_choice == drafts[k]) {
+        all_tokens.push_back(drafts[k]);
+        ++accepted;
+        ++drafts_accepted;
+        if (drafts[k] == eos_id) break;
+      } else {
+        all_tokens.push_back(target_choice);
+        ++accepted;
+        break;
+      }
     } else {
-      // Reject. Use target's choice; stop here.
-      all_tokens.push_back(target_choice);
-      ++accepted;
-      break;
+      auto p = filtered_probs(vrow, temperature, top_k, top_p);
+      const auto& q = draft_probs[static_cast<size_t>(k)];
+      const double p_i = p[static_cast<size_t>(drafts[k])];
+      const double q_i = q.empty() ? 1.0 : q[static_cast<size_t>(drafts[k])];
+      const double accept_prob = q_i > 0.0 ? std::min(1.0, p_i / q_i) : 1.0;
+      const double u = uni(rng);
+      if (u < accept_prob) {
+        all_tokens.push_back(drafts[k]);
+        ++accepted;
+        ++drafts_accepted;
+        if (drafts[k] == eos_id) break;
+      } else {
+        // Reject. Sample from residual distribution max(0, p - q),
+        // renormalized. Per Chen et al., this preserves the target
+        // distribution under expectation.
+        std::vector<double> resid(p.size(), 0.0);
+        double sum = 0.0;
+        for (size_t v = 0; v < p.size(); ++v) {
+          const double qv = (v < q.size()) ? q[v] : 0.0;
+          const double r = p[v] - qv;
+          if (r > 0.0) { resid[v] = r; sum += r; }
+        }
+        int64_t new_tok;
+        if (sum > 0.0) {
+          for (auto& r : resid) r /= sum;
+          new_tok = sample_from(resid, rng);
+        } else {
+          // Degenerate: p ⊆ q. Fall back to sampling from p directly.
+          new_tok = sample_from(p, rng);
+        }
+        all_tokens.push_back(new_tok);
+        ++accepted;
+        break;
+      }
     }
   }
   state.total_accepted += drafts_accepted;
 
-  // Rollback target KV to keep only the accepted positions.
-  int64_t target_keep = target_snap + accepted;
+  // KV rollbacks: keep only the accepted positions on both models.
+  const int64_t target_keep = target_snap + accepted;
   if (target_keep < state.target_kv.seq_len()) state.target_kv.rollback(target_keep);
 
-  // Roll the draft KV back to where the accepted tokens end. Each drafted
-  // token added one position to the draft_kv. We accepted (drafts_accepted)
-  // of those, plus the main_tok which the draft model didn't see yet —
-  // so the draft KV should be rolled back to drop only the *rejected*
-  // drafts.
-  int64_t draft_drop = static_cast<int64_t>(drafts.size()) - drafts_accepted;
+  // The draft model wrote drafts.size() positions to its KV; we accepted
+  // drafts_accepted of them. Drop the rejected tail.
+  const int64_t draft_drop = static_cast<int64_t>(drafts.size()) - drafts_accepted;
   if (draft_drop > 0) {
     state.draft_kv.rollback(state.draft_kv.seq_len() - draft_drop);
   }

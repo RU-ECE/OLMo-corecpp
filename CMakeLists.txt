@@ -652,6 +652,14 @@ target_link_libraries(test_fused_qkv_rope PRIVATE olmo_cpp)
 target_include_directories(test_fused_qkv_rope PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(test_fused_qkv_rope PRIVATE -O3 -march=native)
 
+# CUDA-only parity: exercises the WMMA UB fix, AutogradCUDA wrappers,
+# and fused-LM-head-CE / QKV+RoPE / FFN on real hardware. Compiles
+# everywhere; main() bails with exit code 2 if CUDA isn't available.
+add_executable(test_cuda_parity tools/test_cuda_parity.cpp)
+target_link_libraries(test_cuda_parity PRIVATE olmo_cpp)
+target_include_directories(test_cuda_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(test_cuda_parity PRIVATE -O3 -march=native)
+
 # Fused LM-head + Gumbel-max sampler unit test (fast-inference [6]).
 # CPU-only; verifies determinism, distribution match vs softmax, and
 # temperature-sharpening behavior.

@@ -49,9 +49,16 @@ class CUDABackend : public IBackend {
   /// Fused RoPE via custom CUDA kernel
   torch::Tensor apply_rope(torch::Tensor t, torch::Tensor sin, torch::Tensor cos) override;
 
-  /// Fused residual add + RMSNorm in single kernel (saves full d_model read/write)
+  /// Fused residual add + RMSNorm in single kernel (saves full d_model read/write).
+  /// Semantics: out = rms_norm(x + residual). Used by add-then-norm patterns.
   torch::Tensor residual_rms_norm(torch::Tensor x, torch::Tensor residual,
                                    torch::Tensor weight, double eps) override;
+
+  /// Fused norm-then-add (item H): out = residual + rms_norm(x) * weight.
+  /// Used by the reordered-norm pattern in OLMo-2 / LLaMA-2 blocks where the
+  /// sublayer output is normalized before merging back into the residual.
+  torch::Tensor rms_norm_add(torch::Tensor x, torch::Tensor residual,
+                              torch::Tensor weight, double eps) override;
 };
 
 /// Activate the CUDA fused backend globally

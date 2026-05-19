@@ -349,6 +349,86 @@ __global__ void residual_rms_norm_f32_kernel(
   }
 }
 
+// ---- FP32 rms_norm_add: out = residual + rms_norm(x) * weight ----
+//
+// Semantics differ from residual_rms_norm above:
+//   residual_rms_norm : out = rms_norm(x + residual)             ← add-then-norm
+//   rms_norm_add      : out = residual + rms_norm(x) * weight    ← norm-then-add
+//
+// rms_norm_add matches reordered-norm transformer blocks (OLMo-2, LLaMA-2)
+// where the sublayer output is normalized BEFORE being merged back into the
+// residual stream. Two kernel-launches collapse to one; the bf16 variant
+// keeps the I/O dtype while doing the reduction in fp32 (essential because
+// summing thousands of squared values in bf16 silently underflows). This is
+// item H from the optimization roadmap.
+
+__global__ void rms_norm_add_f32_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ residual,
+    const float* __restrict__ weight,
+    float* __restrict__ out,
+    int64_t dim,
+    float eps) {
+  int64_t row = blockIdx.x;
+  const float* row_x   = x + row * dim;
+  const float* row_res = residual + row * dim;
+  float* row_out       = out + row * dim;
+
+  float sum_sq = 0.0f;
+  for (int64_t i = threadIdx.x; i < dim; i += blockDim.x) {
+    float v = row_x[i];
+    sum_sq += v * v;
+  }
+  sum_sq = blockReduceSum(sum_sq);
+
+  __shared__ float s_scale;
+  if (threadIdx.x == 0) {
+    s_scale = rsqrtf(sum_sq / static_cast<float>(dim) + eps);
+  }
+  __syncthreads();
+  float scale = s_scale;
+
+  for (int64_t i = threadIdx.x; i < dim; i += blockDim.x) {
+    float normed = row_x[i] * scale;
+    if (weight) normed *= weight[i];
+    row_out[i] = row_res[i] + normed;
+  }
+}
+
+__global__ void rms_norm_add_bf16_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ residual,
+    const __nv_bfloat16* __restrict__ weight,
+    __nv_bfloat16* __restrict__ out,
+    int64_t dim,
+    float eps) {
+  int64_t row = blockIdx.x;
+  const __nv_bfloat16* row_x   = x + row * dim;
+  const __nv_bfloat16* row_res = residual + row * dim;
+  __nv_bfloat16* row_out       = out + row * dim;
+
+  float sum_sq = 0.0f;
+  for (int64_t i = threadIdx.x; i < dim; i += blockDim.x) {
+    float v = __bfloat162float(row_x[i]);
+    sum_sq += v * v;
+  }
+  sum_sq = blockReduceSum(sum_sq);
+
+  __shared__ float s_scale;
+  if (threadIdx.x == 0) {
+    s_scale = rsqrtf(sum_sq / static_cast<float>(dim) + eps);
+  }
+  __syncthreads();
+  float scale = s_scale;
+
+  for (int64_t i = threadIdx.x; i < dim; i += blockDim.x) {
+    float normed = __bfloat162float(row_x[i]) * scale;
+    if (weight) normed *= __bfloat162float(weight[i]);
+    float ri = __bfloat162float(row_res[i]);
+    row_out[i] = __float2bfloat16(ri + normed);
+  }
+}
+
 // ---- BF16 residual + RMSNorm ----
 
 __global__ void residual_rms_norm_bf16_kernel(
@@ -470,10 +550,49 @@ std::vector<torch::Tensor> residual_rms_norm_cuda_impl(
   return {out, residual_out};
 }
 
+// rms_norm_add dispatch (item H): one-pass `out = residual + rms_norm(x) * weight`.
+torch::Tensor rms_norm_add_cuda_impl(
+    const torch::Tensor& x,
+    const torch::Tensor& residual,
+    const c10::optional<torch::Tensor>& weight,
+    double eps) {
+  TORCH_CHECK(x.is_cuda() && residual.is_cuda(),
+              "rms_norm_add_cuda_impl: inputs must be CUDA");
+  TORCH_CHECK(x.sizes() == residual.sizes(),
+              "rms_norm_add_cuda_impl: x and residual must have the same shape");
+  auto x_contig   = x.contiguous();
+  auto res_contig = residual.contiguous();
+  const int64_t dim  = x_contig.size(-1);
+  const int64_t rows = x_contig.numel() / dim;
+  auto out = torch::empty_like(x_contig);
+  c10::cuda::CUDAGuard guard(x.device());
+  int threads = (dim <= 256) ? 128 : 256;
+
+  if (x.scalar_type() == torch::kBFloat16) {
+    TORCH_CHECK(residual.scalar_type() == torch::kBFloat16,
+                "rms_norm_add_cuda_impl: x is bf16 but residual is not");
+    rms_norm_add_bf16_kernel<<<rows, threads>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x_contig.data_ptr<at::BFloat16>()),
+        reinterpret_cast<const __nv_bfloat16*>(res_contig.data_ptr<at::BFloat16>()),
+        weight.has_value() ? reinterpret_cast<const __nv_bfloat16*>(weight->data_ptr<at::BFloat16>()) : nullptr,
+        reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
+        dim, static_cast<float>(eps));
+  } else {
+    rms_norm_add_f32_kernel<<<rows, threads>>>(
+        x_contig.data_ptr<float>(),
+        res_contig.data_ptr<float>(),
+        weight.has_value() ? weight->data_ptr<float>() : nullptr,
+        out.data_ptr<float>(),
+        dim, static_cast<float>(eps));
+  }
+  return out;
+}
+
 // Library registration
 TORCH_LIBRARY(olmo_ops, m) {
   m.def("rms_norm(Tensor x, Tensor? weight, float eps=1e-6) -> Tensor");
   m.def("residual_rms_norm(Tensor x, Tensor residual, Tensor? weight, float eps=1e-6) -> Tensor[]");
+  m.def("rms_norm_add(Tensor x, Tensor residual, Tensor? weight, float eps=1e-6) -> Tensor");
   m.def("apply_rope(Tensor x, Tensor cos, Tensor sin) -> Tensor");
   m.def("silu_mul(Tensor gate, Tensor up) -> Tensor");
   m.def("apply_rope_qk(Tensor q, Tensor k, Tensor cos_q, Tensor sin_q, Tensor cos_k, Tensor sin_k) -> Tensor[]");
@@ -482,4 +601,5 @@ TORCH_LIBRARY(olmo_ops, m) {
 TORCH_LIBRARY_IMPL(olmo_ops, CUDA, m) {
   m.impl("rms_norm", rms_norm_cuda_impl);
   m.impl("residual_rms_norm", residual_rms_norm_cuda_impl);
+  m.impl("rms_norm_add", rms_norm_add_cuda_impl);
 }

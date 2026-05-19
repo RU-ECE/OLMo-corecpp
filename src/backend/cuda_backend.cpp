@@ -137,6 +137,26 @@ torch::Tensor CUDABackend::residual_rms_norm(torch::Tensor x, torch::Tensor resi
   return IBackend::residual_rms_norm(x, residual, weight, eps);
 }
 
+/// Dispatch fused `out = residual + rms_norm(x) * weight` (item H).
+/// Different op from residual_rms_norm above: norm-then-add vs add-then-norm.
+/// Used by RMSNormImpl::forward_add, which is the per-block residual merge
+/// in reordered-norm transformer blocks.
+torch::Tensor CUDABackend::rms_norm_add(torch::Tensor x, torch::Tensor residual,
+                                          torch::Tensor weight, double eps) {
+#ifdef OLMO_HAS_CUDA_KERNELS
+  using FnType = torch::Tensor(
+      const torch::Tensor&, const torch::Tensor&,
+      const c10::optional<torch::Tensor>&, double);
+  static const auto op = resolve_op("olmo_ops::rms_norm_add");
+  if (op.has_value() && x.is_cuda() && supported_dtype(x.scalar_type())) {
+    c10::optional<torch::Tensor> w = weight.defined()
+        ? c10::optional<torch::Tensor>(weight) : c10::nullopt;
+    return op->typed<FnType>().call(x, residual, w, eps);
+  }
+#endif
+  return IBackend::rms_norm_add(x, residual, weight, eps);
+}
+
 /// Public entry point: install CUDABackend as the global IBackend.
 /// Called once from main.cpp when the configured device is CUDA.
 void use_cuda_backend() {

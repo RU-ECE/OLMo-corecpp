@@ -1,37 +1,38 @@
 # scripts/race/configs/race_250m_python.yaml
 #
-# 250M-class Python side of the race. Same backbone as race_250m_cpp.conf.
-# No MTP — that's the C++ side's only architectural addition.
-# Total params: ~257M (matches the C++ backbone exactly).
+# 250M-class Python side. Same backbone as race_250m_cpp.conf.
+# No MTP, no extras — that's the architectural asymmetry by design.
 #
-# Field names follow OLMo-core's YAML schema. The race script
-# (05_train_python.sh) calls whatever entry point the user's
-# OLMo-corecpp/ ships; this YAML is documented in the conventions
-# OLMo-core's TransformerConfig + TrainerConfig already use.
+# Backbone param count = ~257 M (matches the C++ backbone exactly):
+#   2*50257*1024 embed/lm_head             : 102.9 M    (UNTIED — C++ doesn't tie)
+#   12 × (4*1024² + 3*1024*2816 + 2*1024)  : 154.2 M
+#
+# Field names follow OLMo-core's TransformerConfig/TrainerConfig schema.
 
 model:
   d_model: 1024
-  n_layers: 16
+  n_layers: 12
   n_heads: 16
   n_kv_heads: 16
   vocab_size: 50257
   max_sequence_length: 1024
   rope_theta: 10000.0
-  weight_tying: true
+
+  # IMPORTANT: false — matches the C++ side which doesn't support tying.
+  weight_tying: false
 
   mlp_hidden_size: 2816
   activation_type: swiglu
   layer_norm_type: rms
   layer_norm_eps: 1.0e-6
 
-  # No MTP / no extras. Matches the C++ backbone bitwise on params.
   attention_type: default
   block_type: reordered_norm
   use_qk_norm: false
 
 training:
   device_train_microbatch_size: 4
-  global_train_batch_size: 32   # grad_accum_steps=8 × microbatch=4
+  global_train_batch_size: 32     # microbatch=4 × grad_accum=8
   max_duration:
     value: 1000
     unit: steps
@@ -57,5 +58,4 @@ data:
     - data/race_tokens.npy
   sequence_length: 1024
 
-# Where the training loop will deposit its logs / checkpoints.
 save_folder: scripts/race/results/python_ckpt

@@ -157,12 +157,26 @@ torch::Tensor dequantize_int4_awq(const Int4Quantized& q) {
 }
 
 torch::Tensor fp8_gemv(const Fp8Quantized& w, torch::Tensor x) {
-  // Reference: dequant + matmul. The fast path is in kernels/quant_gemv.cu.
+#ifdef OLMO_HAS_CUDA_KERNELS
+  if (w.weight.is_cuda()) {
+    return fp8_gemv_cuda(w, x);
+  }
+#endif
+  // CPU reference: dequant the entire weight + matmul. Slow but the
+  // baseline against which the fused kernel is validated. The "fused"
+  // win is on the CUDA path — there, the weight is never materialized
+  // in HBM; the kernel reads the packed E4M3 bytes, dequantizes in
+  // shared/registers, and accumulates into the GEMV output directly.
   auto W = dequantize_fp8(w);
   return torch::matmul(W, x.contiguous().to(torch::kFloat32));
 }
 
 torch::Tensor int4_gemv(const Int4Quantized& w, torch::Tensor x) {
+#ifdef OLMO_HAS_CUDA_KERNELS
+  if (w.weight.is_cuda()) {
+    return int4_gemv_cuda(w, x);
+  }
+#endif
   auto W = dequantize_int4_awq(w);
   return torch::matmul(W, x.contiguous().to(torch::kFloat32));
 }

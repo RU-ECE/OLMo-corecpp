@@ -154,4 +154,164 @@ torch::Tensor dequantize_int4_awq_cuda(const Int4Quantized& q) {
   return out;
 }
 
+// ─── Fused dequant-in-GEMV kernels ────────────────────────────────────────
+//
+// Both kernels compute y[i] = sum_j dequant(W[i, j]) * x[j] WITHOUT
+// materializing the dequantized weight in HBM. One block per output
+// element; threads in a block stride over the input dim, dequantize on
+// the fly, accumulate, and do a block-reduce at the end.
+//
+// Memory bandwidth analysis (the main reason fused GEMV wins): naive
+// path moves 4*in bytes (dequantized fp32 weight) per output element;
+// fused FP8 path moves 1*in bytes (packed E4M3); fused INT4 path moves
+// 0.5*in bytes (packed nibbles). So FP8 GEMV is 4x faster, INT4 GEMV
+// is 8x faster than naive when bandwidth-bound.
+
+namespace {
+
+// Block-reduce sum of one float per thread into thread 0.
+__device__ __forceinline__ float block_reduce_sum_f(float v) {
+  __shared__ float scratch[32];  // one slot per warp; up to 1024 threads = 32 warps
+  const int lane = threadIdx.x & 31;
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  for (int off = 16; off > 0; off >>= 1) {
+    v += __shfl_xor_sync(0xffffffff, v, off);
+  }
+  if (lane == 0) scratch[warp] = v;
+  __syncthreads();
+  if (warp == 0) {
+    const int n_warps = (blockDim.x + 31) >> 5;
+    v = (lane < n_warps) ? scratch[lane] : 0.0f;
+    for (int off = 16; off > 0; off >>= 1) {
+      v += __shfl_xor_sync(0xffffffff, v, off);
+    }
+  }
+  return v;  // valid in (warp=0, lane=0)
+}
+
+}  // namespace
+
+// FP8 GEMV: y = W_fp8 * x   (per-tensor scale).
+//
+// Inputs:
+//   W_packed : [out, in] uint8 (E4M3 bits)
+//   x        : [in]      fp32
+//   scale    : scalar fp32 (per-tensor)
+// Output:
+//   y        : [out] fp32
+__global__ void fp8_gemv_kernel(
+    const uint8_t* __restrict__ W,
+    const float*   __restrict__ x,
+    float scale,
+    int in_features,
+    float*         __restrict__ y) {
+  const int row = blockIdx.x;
+  const uint8_t* W_row = W + static_cast<int64_t>(row) * in_features;
+  float acc = 0.0f;
+  for (int j = threadIdx.x; j < in_features; j += blockDim.x) {
+    acc += e4m3_to_f32(W_row[j]) * x[j];
+  }
+  acc *= scale;
+  acc = block_reduce_sum_f(acc);
+  if (threadIdx.x == 0) y[row] = acc;
+}
+
+// INT4 AWQ GEMV: y = W_int4 * x  (per-group scale along in_features).
+//
+// Inputs:
+//   W_packed   : [out, in/2] uint8 (two int4 nibbles per byte)
+//   x          : [in]        fp32
+//   scales     : [out, in/group_size] bf16 (or fp16 — we cast to bf16 in
+//                the wrapper for fast __bfloat162float intrinsic)
+//   group_size : along in_features
+// Output:
+//   y          : [out] fp32
+__global__ void int4_awq_gemv_kernel(
+    const uint8_t* __restrict__ W,
+    const float*   __restrict__ x,
+    const __nv_bfloat16* __restrict__ scales,
+    int in_features,
+    int group_size,
+    float*         __restrict__ y) {
+  const int row = blockIdx.x;
+  const int in_half = in_features >> 1;            // bytes per row
+  const int groups_per_row = in_features / group_size;
+
+  const uint8_t* W_row     = W + static_cast<int64_t>(row) * in_half;
+  const __nv_bfloat16* S_row = scales + static_cast<int64_t>(row) * groups_per_row;
+
+  float acc = 0.0f;
+  // Each thread strides 2-nibbles-per-byte. j indexes BYTES.
+  for (int b = threadIdx.x; b < in_half; b += blockDim.x) {
+    const uint8_t byte = W_row[b];
+    const int q_lo = static_cast<int>(byte & 0x0F) - 8;   // even input index
+    const int q_hi = static_cast<int>(byte >> 4)   - 8;   // odd input index
+    const int j_lo = b * 2;
+    const int j_hi = j_lo + 1;
+    // Same group for both nibbles in this byte (since group_size is a
+    // multiple of 2 in practice).
+    const int g_lo = j_lo / group_size;
+    const int g_hi = j_hi / group_size;
+    const float s_lo = __bfloat162float(S_row[g_lo]);
+    const float s_hi = (g_hi == g_lo) ? s_lo : __bfloat162float(S_row[g_hi]);
+    acc += static_cast<float>(q_lo) * s_lo * x[j_lo];
+    acc += static_cast<float>(q_hi) * s_hi * x[j_hi];
+  }
+  acc = block_reduce_sum_f(acc);
+  if (threadIdx.x == 0) y[row] = acc;
+}
+
+torch::Tensor fp8_gemv_cuda(const Fp8Quantized& w, torch::Tensor x) {
+  TORCH_CHECK(w.weight.is_cuda() && x.is_cuda(),
+              "fp8_gemv_cuda: weight and x must be CUDA");
+  TORCH_CHECK(w.weight.dim() == 2 && x.dim() == 1,
+              "fp8_gemv_cuda: W must be 2D, x must be 1D");
+  c10::cuda::CUDAGuard guard(w.weight.device());
+
+  const auto W = w.weight.contiguous();
+  const auto xc = x.contiguous().to(torch::kFloat32);
+  const int64_t out_features = W.size(0);
+  const int64_t in_features  = W.size(1);
+  TORCH_CHECK(xc.size(0) == in_features, "fp8_gemv_cuda: x/W shape mismatch");
+
+  auto y = torch::empty({out_features},
+      torch::TensorOptions().dtype(torch::kFloat32).device(W.device()));
+  const float scale = w.scale.item<float>();
+  const int threads = 128;
+  fp8_gemv_kernel<<<static_cast<int>(out_features), threads>>>(
+      W.data_ptr<uint8_t>(),
+      xc.data_ptr<float>(),
+      scale,
+      static_cast<int>(in_features),
+      y.data_ptr<float>());
+  return y;
+}
+
+torch::Tensor int4_gemv_cuda(const Int4Quantized& w, torch::Tensor x) {
+  TORCH_CHECK(w.weight.is_cuda() && x.is_cuda(),
+              "int4_gemv_cuda: weight and x must be CUDA");
+  TORCH_CHECK(w.weight.dim() == 2 && x.dim() == 1,
+              "int4_gemv_cuda: W must be 2D, x must be 1D");
+  c10::cuda::CUDAGuard guard(w.weight.device());
+
+  const auto W = w.weight.contiguous();
+  const auto xc = x.contiguous().to(torch::kFloat32);
+  const auto S  = w.scales.contiguous().to(torch::kBFloat16);
+  const int64_t out_features = W.size(0);
+  const int64_t in_features  = W.size(1) * 2;
+  TORCH_CHECK(xc.size(0) == in_features, "int4_gemv_cuda: x/W shape mismatch");
+
+  auto y = torch::empty({out_features},
+      torch::TensorOptions().dtype(torch::kFloat32).device(W.device()));
+  const int threads = 128;
+  int4_awq_gemv_kernel<<<static_cast<int>(out_features), threads>>>(
+      W.data_ptr<uint8_t>(),
+      xc.data_ptr<float>(),
+      reinterpret_cast<const __nv_bfloat16*>(S.data_ptr<at::BFloat16>()),
+      static_cast<int>(in_features),
+      static_cast<int>(w.group_size),
+      y.data_ptr<float>());
+  return y;
+}
+
 }  // namespace olmo_cpp

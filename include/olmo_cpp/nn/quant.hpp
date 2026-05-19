@@ -67,6 +67,13 @@ torch::Tensor int4_gemv(const Int4Quantized& w, torch::Tensor x);
 /// CPU scalar loops + roundtrip with one device-resident dispatch.
 torch::Tensor dequantize_fp8_cuda(const Fp8Quantized& q);
 torch::Tensor dequantize_int4_awq_cuda(const Int4Quantized& q);
+
+/// Fused dequant-in-GEMV: y = W * x where W is FP8 / INT4 packed.
+/// The CUDA kernels never materialize a dequantized W in HBM. One CUDA
+/// block per output row; threads stride over the input dim, dequant on
+/// the fly, accumulate, and block-reduce the partial sum.
+torch::Tensor fp8_gemv_cuda(const Fp8Quantized& w, torch::Tensor x);
+torch::Tensor int4_gemv_cuda(const Int4Quantized& w, torch::Tensor x);
 #endif
 
 }  // namespace olmo_cpp

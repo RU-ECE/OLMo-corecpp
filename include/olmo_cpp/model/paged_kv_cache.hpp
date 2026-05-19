@@ -152,4 +152,21 @@ std::unique_ptr<IPagedKVCache> make_paged_kv_cache(
     torch::Device device,
     torch::Dtype dtype);
 
+/// Same as make_paged_kv_cache, but K/V writes go through the graph-safe
+/// paged_kv_write_dyn kernel instead of torch::Tensor::index_put_. Required
+/// when the caller plans to capture forward_paged in a CUDA graph: the
+/// index_put_ scatter hardcodes destination addresses at launch time, so
+/// captured graphs would always write to the same slot. The dyn write
+/// kernel reads `start = n_tokens - S` from the cache's stable n_tokens
+/// scalar at kernel entry, so the captured launch tracks logical_len_ as
+/// the cache grows.
+std::unique_ptr<IPagedKVCache> make_paged_kv_cache_graph_safe(
+    int64_t n_layers,
+    int64_t n_kv_heads,
+    int64_t head_dim,
+    int64_t page_size,
+    int64_t max_pages,
+    torch::Device device,
+    torch::Dtype dtype);
+
 }  // namespace olmo_cpp

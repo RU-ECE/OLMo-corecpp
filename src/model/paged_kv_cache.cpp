@@ -18,6 +18,7 @@
 #include "olmo_cpp/model/paged_kv_cache.hpp"
 #include "olmo_cpp/model/kv_cache.hpp"
 #include "olmo_cpp/model/block_manager.hpp"
+#include "olmo_cpp/backend/paged_attention.hpp"
 
 #include <stdexcept>
 #include <algorithm>
@@ -93,12 +94,14 @@ class PagedKVCache : public IPagedKVCache {
                int64_t page_size,
                int64_t max_pages,
                torch::Device device,
-               torch::Dtype dtype)
+               torch::Dtype dtype,
+               bool use_dyn_write)
       : mgr_(n_layers, n_kv_heads, head_dim, page_size, max_pages, device, dtype),
         n_layers_(n_layers),
         page_size_(page_size),
         max_pages_(max_pages),
-        device_(device) {
+        device_(device),
+        use_dyn_write_(use_dyn_write) {
     // Stable-address mirrors of the host-side cursor + page table. The
     // capture-friendly kernel (paged_attention_decode_dyn) reads from
     // these tensors at launch time; storage must outlive any captured
@@ -240,9 +243,28 @@ class PagedKVCache : public IPagedKVCache {
                           torch::Tensor v,
                           int64_t start,
                           int64_t end) {
-    // Destination: k_pool[layer][pg, slot, :, :] for each global position in
-    // [start, end). Build (pg, slot) index tensors and do one bulk index_put_.
     const int64_t S = end - start;
+    if (S == 0) return;
+
+    auto& k_pool = mgr_.k_pool(layer);
+    auto& v_pool = mgr_.v_pool(layer);
+
+    // Graph-safe path: source/dest both computed from the stable n_tokens
+    // tensor inside the kernel. Caller must have already updated n_tokens_t_
+    // for THIS step before calling write_layer_slots_ (we set logical_len_
+    // = step_end on layer 0 above, which writes n_tokens_t_).
+    if (use_dyn_write_) {
+      // k, v come in as [1, n_kv_heads, S, head_dim]. The kernel wants
+      // [S, n_kv_heads, head_dim].
+      auto k_src = k.select(0, 0).permute({1, 0, 2}).contiguous();
+      auto v_src = v.select(0, 0).permute({1, 0, 2}).contiguous();
+      paged_kv_write_dyn(k_src, v_src, k_pool, v_pool,
+                         page_table_t_, n_tokens_t_);
+      return;
+    }
+
+    // Legacy index_put_ path. Not graph-capture-safe (destination
+    // addresses are baked into the captured launch) but correct.
     const auto& pt = mgr_.page_table();
 
     // Build host-side index vectors. n_blocks is small (~ ceil(max_seq/16))
@@ -267,8 +289,6 @@ class PagedKVCache : public IPagedKVCache {
     auto k_src = k.select(0, 0).permute({1, 0, 2}).contiguous();  // [S, n_kv_heads, head_dim]
     auto v_src = v.select(0, 0).permute({1, 0, 2}).contiguous();
 
-    auto& k_pool = mgr_.k_pool(layer);
-    auto& v_pool = mgr_.v_pool(layer);
     // index_put_ with two index tensors performs gather-style scatter:
     // k_pool[pg_t[i], slot_t[i], :, :] = k_src[i]   for i in [0, S).
     k_pool.index_put_({pg_t, slot_t}, k_src.to(k_pool.dtype()));
@@ -313,6 +333,7 @@ class PagedKVCache : public IPagedKVCache {
   int64_t max_pages_;
   int64_t logical_len_ = 0;
   torch::Device device_;
+  bool use_dyn_write_ = false;
   // Stable-address mirrors for graph-capture-friendly launches. Updated
   // in place — never reallocated — so any captured kernel launch holds a
   // valid device pointer across replays.
@@ -331,7 +352,21 @@ std::unique_ptr<IPagedKVCache> make_paged_kv_cache(
     torch::Device device,
     torch::Dtype dtype) {
   return std::make_unique<PagedKVCache>(
-      n_layers, n_kv_heads, head_dim, page_size, max_pages, device, dtype);
+      n_layers, n_kv_heads, head_dim, page_size, max_pages, device, dtype,
+      /*use_dyn_write=*/false);
+}
+
+std::unique_ptr<IPagedKVCache> make_paged_kv_cache_graph_safe(
+    int64_t n_layers,
+    int64_t n_kv_heads,
+    int64_t head_dim,
+    int64_t page_size,
+    int64_t max_pages,
+    torch::Device device,
+    torch::Dtype dtype) {
+  return std::make_unique<PagedKVCache>(
+      n_layers, n_kv_heads, head_dim, page_size, max_pages, device, dtype,
+      /*use_dyn_write=*/true);
 }
 
 }  // namespace olmo_cpp

@@ -30,6 +30,7 @@
 using olmo_cpp::IPagedKVCache;
 using olmo_cpp::KVCache;
 using olmo_cpp::make_paged_kv_cache;
+using olmo_cpp::make_paged_kv_cache_graph_safe;
 
 namespace {
 
@@ -64,19 +65,15 @@ torch::Tensor rand_kv(int64_t n_kv_heads, int64_t S, int64_t head_dim,
 
 }  // namespace
 
-int main() {
-  torch::manual_seed(0);
-
-  const int64_t n_layers   = 4;
-  const int64_t n_kv_heads = 2;
-  const int64_t head_dim   = 8;
-  const int64_t page_size  = 4;
-  const int64_t max_pages  = 64;
-  auto device = torch::kCPU;
-  auto dtype  = torch::kFloat32;
-
-  auto paged = make_paged_kv_cache(n_layers, n_kv_heads, head_dim,
-                                   page_size, max_pages, device, dtype);
+// Run the test body against an arbitrary IPagedKVCache. The reference path
+// uses olmo_cpp::KVCache directly. Returns 0 on success, throws Failure on
+// mismatch.
+int run_equivalence_test(std::unique_ptr<IPagedKVCache> paged,
+                         int64_t n_layers,
+                         int64_t n_kv_heads,
+                         int64_t head_dim,
+                         torch::Device device,
+                         const std::string& label) {
   KVCache reference(n_layers, device);
 
   // Step sequence: one prefill of 9 tokens (spans 3 pages with leftover),
@@ -84,7 +81,7 @@ int main() {
   std::vector<int64_t> step_sizes = {9};
   for (int i = 0; i < 12; ++i) step_sizes.push_back(1);
 
-  try {
+  {
     int64_t total = 0;
     for (size_t step = 0; step < step_sizes.size(); ++step) {
       const int64_t S = step_sizes[step];
@@ -138,8 +135,39 @@ int main() {
     paged->clear();
     if (paged->seq_len() != 0) throw Failure{"clear did not reset cursor"};
 
-    std::cout << "PagedKVCache OK: " << step_sizes.size() << " steps, "
-              << "final paged seq_len after re-clear = " << paged->seq_len() << "\n";
+    std::cout << label << " OK: " << step_sizes.size() << " steps, "
+              << "final seq_len after re-clear = " << paged->seq_len() << "\n";
+  }
+  return 0;
+}
+
+int main() {
+  torch::manual_seed(0);
+
+  const int64_t n_layers   = 4;
+  const int64_t n_kv_heads = 2;
+  const int64_t head_dim   = 8;
+  const int64_t page_size  = 4;
+  const int64_t max_pages  = 64;
+  auto device = torch::kCPU;
+  auto dtype  = torch::kFloat32;
+
+  try {
+    // Legacy index_put_ write path.
+    auto paged_legacy = make_paged_kv_cache(
+        n_layers, n_kv_heads, head_dim, page_size, max_pages, device, dtype);
+    run_equivalence_test(std::move(paged_legacy), n_layers, n_kv_heads, head_dim,
+                         device, "PagedKVCache[index_put_]");
+
+    // Graph-safe paged_kv_write_dyn path. Same seed, same K/V; should
+    // produce bitwise-identical materialize() output to the legacy path.
+    torch::manual_seed(0);  // reset so rand_kv produces same sequence
+    auto paged_dyn = make_paged_kv_cache_graph_safe(
+        n_layers, n_kv_heads, head_dim, page_size, max_pages, device, dtype);
+    run_equivalence_test(std::move(paged_dyn), n_layers, n_kv_heads, head_dim,
+                         device, "PagedKVCache[paged_kv_write_dyn]");
+
+    std::cout << "all paths OK\n";
     return 0;
   } catch (const Failure& f) {
     std::cerr << "FAIL: " << f.what << "\n";

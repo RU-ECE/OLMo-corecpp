@@ -240,6 +240,121 @@ torch::Tensor paged_attention_decode_cuda(
   return out.to(q.dtype());
 }
 
+// ── Graph-safe paged K/V write kernel ─────────────────────────────────────
+//
+// One CUDA thread block per (i, head_block) pair. Each thread copies one
+// element of the per-head [head_dim] slice from k_src/v_src to the right
+// k_pool/v_pool slot. `start` is computed from a device-side read of
+// n_tokens at kernel entry, so the captured launch keeps writing to the
+// correct slot as the cache grows on replay.
+__global__ void paged_kv_write_kernel_dyn(
+    const float* __restrict__ k_src,         // [S, n_kv_heads, head_dim]
+    const float* __restrict__ v_src,
+    float* __restrict__ k_pool,              // [max_pages, page_size, n_kv_heads, head_dim]
+    float* __restrict__ v_pool,
+    const int32_t* __restrict__ page_table,  // [max_pages]
+    const int32_t* __restrict__ n_tokens_ptr,
+    int S,
+    int n_kv_heads,
+    int head_dim,
+    int page_size,
+    int max_pages
+) {
+  const int i      = blockIdx.x;        // source row in [0, S)
+  const int kv_h   = blockIdx.y;        // kv head in [0, n_kv_heads)
+  if (i >= S || kv_h >= n_kv_heads) return;
+
+  // start = n_tokens - S. All threads in this block read the same scalar.
+  __shared__ int sh_start;
+  if (threadIdx.x == 0) {
+    sh_start = (*n_tokens_ptr) - S;
+  }
+  __syncthreads();
+
+  const int global_pos = sh_start + i;
+  const int blk        = global_pos / page_size;
+  const int slot       = global_pos % page_size;
+  const int pg         = page_table[blk];
+  // Defensive: skip if pg out of range. Should never trigger.
+  if (pg < 0 || pg >= max_pages) return;
+
+  const int64_t src_base =
+      (static_cast<int64_t>(i) * n_kv_heads + kv_h) * head_dim;
+  const int64_t dst_base =
+      (((static_cast<int64_t>(pg) * page_size) + slot) * n_kv_heads + kv_h) * head_dim;
+
+  // Each thread copies head_dim/blockDim.x consecutive elements. Vectorize
+  // through float4 when head_dim is a multiple of 4 (it always is in
+  // practice: 64, 128, 256).
+  if ((head_dim & 3) == 0) {
+    const auto* k4_src = reinterpret_cast<const float4*>(k_src + src_base);
+    const auto* v4_src = reinterpret_cast<const float4*>(v_src + src_base);
+    auto*       k4_dst = reinterpret_cast<float4*>(k_pool + dst_base);
+    auto*       v4_dst = reinterpret_cast<float4*>(v_pool + dst_base);
+    const int hd4 = head_dim >> 2;
+    for (int j = threadIdx.x; j < hd4; j += blockDim.x) {
+      k4_dst[j] = k4_src[j];
+      v4_dst[j] = v4_src[j];
+    }
+  } else {
+    for (int j = threadIdx.x; j < head_dim; j += blockDim.x) {
+      k_pool[dst_base + j] = k_src[src_base + j];
+      v_pool[dst_base + j] = v_src[src_base + j];
+    }
+  }
+}
+
+void paged_kv_write_dyn_cuda(
+    torch::Tensor k_src,
+    torch::Tensor v_src,
+    torch::Tensor k_pool,
+    torch::Tensor v_pool,
+    torch::Tensor page_table,
+    torch::Tensor n_tokens) {
+  TORCH_CHECK(k_src.is_cuda() && v_src.is_cuda() && k_pool.is_cuda() && v_pool.is_cuda()
+              && page_table.is_cuda() && n_tokens.is_cuda(),
+              "paged_kv_write_dyn_cuda: all tensors must be on the same CUDA device");
+  TORCH_CHECK(k_src.dim() == 3 && v_src.dim() == 3,
+              "k_src / v_src must be [S, n_kv_heads, head_dim]");
+  TORCH_CHECK(k_pool.dim() == 4 && v_pool.dim() == 4,
+              "k_pool / v_pool must be [max_pages, page_size, n_kv_heads, head_dim]");
+  TORCH_CHECK(n_tokens.scalar_type() == torch::kInt32 && n_tokens.numel() == 1,
+              "n_tokens must be int32 scalar");
+
+  c10::cuda::CUDAGuard guard(k_pool.device());
+
+  auto ks = k_src.contiguous().to(torch::kFloat32);
+  auto vs = v_src.contiguous().to(torch::kFloat32);
+  // The pools may be fp16/bf16 in the future; for now require float32 in
+  // the dyn write path to keep the kernel single-dtype. AttentionImpl casts
+  // on input as needed.
+  TORCH_CHECK(k_pool.scalar_type() == torch::kFloat32 &&
+              v_pool.scalar_type() == torch::kFloat32,
+              "paged_kv_write_dyn_cuda: pools must be float32 in this build");
+  auto pt = page_table.contiguous().to(torch::kInt32);
+  auto nt = n_tokens.contiguous();
+
+  const int S          = static_cast<int>(ks.size(0));
+  const int n_kv_heads = static_cast<int>(ks.size(1));
+  const int head_dim   = static_cast<int>(ks.size(2));
+  const int max_pages  = static_cast<int>(k_pool.size(0));
+  const int page_size  = static_cast<int>(k_pool.size(1));
+
+  if (S == 0) return;
+
+  dim3 grid(S, n_kv_heads);
+  const int kThreads = 32;  // small per-block work; head_dim is the inner loop bound
+
+  paged_kv_write_kernel_dyn<<<grid, kThreads>>>(
+      ks.data_ptr<float>(),
+      vs.data_ptr<float>(),
+      k_pool.data_ptr<float>(),
+      v_pool.data_ptr<float>(),
+      pt.data_ptr<int32_t>(),
+      nt.data_ptr<int32_t>(),
+      S, n_kv_heads, head_dim, page_size, max_pages);
+}
+
 // Graph-capture-friendly launcher. Mirrors paged_attention_decode_cuda
 // exactly except for the dynamic n_tokens read.
 torch::Tensor paged_attention_decode_dyn_cuda(

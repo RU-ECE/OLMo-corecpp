@@ -123,4 +123,66 @@ torch::Tensor paged_attention_decode_dyn(
   return paged_attention_decode_dyn_cpu(q, k_pool, v_pool, page_table, n_tokens, sm_scale);
 }
 
+// ── Graph-safe paged K/V write ────────────────────────────────────────────
+
+void paged_kv_write_dyn_cpu(
+    torch::Tensor k_src,
+    torch::Tensor v_src,
+    torch::Tensor k_pool,
+    torch::Tensor v_pool,
+    torch::Tensor page_table,
+    torch::Tensor n_tokens) {
+  TORCH_CHECK(k_src.is_cpu() && v_src.is_cpu() && k_pool.is_cpu() && v_pool.is_cpu()
+              && page_table.is_cpu() && n_tokens.is_cpu(),
+              "paged_kv_write_dyn_cpu: all tensors must be CPU");
+  TORCH_CHECK(k_src.dim() == 3 && v_src.dim() == 3,
+              "k_src / v_src must be [S, n_kv_heads, head_dim]");
+  TORCH_CHECK(k_pool.dim() == 4 && v_pool.dim() == 4,
+              "k_pool / v_pool must be [max_pages, page_size, n_kv_heads, head_dim]");
+  TORCH_CHECK(n_tokens.numel() == 1, "n_tokens must be a scalar");
+
+  const int64_t S          = k_src.size(0);
+  const int64_t n_kv_heads = k_src.size(1);
+  const int64_t head_dim   = k_src.size(2);
+  const int64_t max_pages  = k_pool.size(0);
+  const int64_t page_size  = k_pool.size(1);
+  TORCH_CHECK(k_pool.size(2) == n_kv_heads && k_pool.size(3) == head_dim,
+              "k_pool dims must match k_src");
+
+  const int32_t n_tok = n_tokens.to(torch::kInt32).item<int32_t>();
+  const int32_t start = n_tok - static_cast<int32_t>(S);
+  TORCH_CHECK(start >= 0, "paged_kv_write_dyn_cpu: n_tokens < S");
+
+  auto pt = page_table.contiguous().to(torch::kInt32);
+  auto pt_a = pt.accessor<int32_t, 1>();
+
+  for (int64_t i = 0; i < S; ++i) {
+    const int32_t global_pos = start + static_cast<int32_t>(i);
+    const int32_t blk        = global_pos / static_cast<int32_t>(page_size);
+    const int32_t slot       = global_pos % static_cast<int32_t>(page_size);
+    const int32_t pg         = pt_a[blk];
+    TORCH_CHECK(pg >= 0 && pg < max_pages, "paged_kv_write_dyn_cpu: page out of range");
+    // [n_kv_heads, head_dim] slice each side. Cast handles dtype mismatch
+    // (e.g. bf16 pool + fp32 src) without an explicit pre-copy.
+    k_pool[pg][slot].copy_(k_src[i].to(k_pool.dtype()));
+    v_pool[pg][slot].copy_(v_src[i].to(v_pool.dtype()));
+  }
+}
+
+void paged_kv_write_dyn(
+    torch::Tensor k_src,
+    torch::Tensor v_src,
+    torch::Tensor k_pool,
+    torch::Tensor v_pool,
+    torch::Tensor page_table,
+    torch::Tensor n_tokens) {
+#ifdef OLMO_HAS_CUDA_KERNELS
+  if (k_pool.is_cuda()) {
+    paged_kv_write_dyn_cuda(k_src, v_src, k_pool, v_pool, page_table, n_tokens);
+    return;
+  }
+#endif
+  paged_kv_write_dyn_cpu(k_src, v_src, k_pool, v_pool, page_table, n_tokens);
+}
+
 }  // namespace olmo_cpp

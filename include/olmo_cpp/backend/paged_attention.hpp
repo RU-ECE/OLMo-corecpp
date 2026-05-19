@@ -98,4 +98,49 @@ torch::Tensor paged_attention_decode_dyn_cpu(
     torch::Tensor n_tokens,
     float sm_scale);
 
+// ── Graph-safe paged K/V write ────────────────────────────────────────────
+//
+// Writes `k_src`, `v_src` (S consecutive new positions) into the per-layer
+// page pool. The destination (page, slot) for each source row is computed
+// at runtime from `(n_tokens - S + i) / page_size`, where n_tokens is read
+// from a 0-D int32 tensor on the same device. This is the write-side analog
+// of paged_attention_decode_dyn: keep n_tokens in a stable-address tensor,
+// update it between graph replays, and the captured launch keeps writing to
+// the right slot as the cache grows.
+//
+//   k_src       : [S, n_kv_heads, head_dim]  (or its float32 view)
+//   v_src       : same shape
+//   k_pool      : [max_pages, page_size, n_kv_heads, head_dim] — written in place
+//   v_pool      : same — written in place
+//   page_table  : [>= ceil(n_tokens / page_size)] int32 on the same device
+//   n_tokens    : 0-D int32 — the seq_len AFTER this write
+//
+// Mutates k_pool / v_pool. Returns nothing meaningful (just for chainability
+// the existing torch wrappers return void).
+void paged_kv_write_dyn(
+    torch::Tensor k_src,
+    torch::Tensor v_src,
+    torch::Tensor k_pool,
+    torch::Tensor v_pool,
+    torch::Tensor page_table,
+    torch::Tensor n_tokens);
+
+#ifdef OLMO_HAS_CUDA_KERNELS
+void paged_kv_write_dyn_cuda(
+    torch::Tensor k_src,
+    torch::Tensor v_src,
+    torch::Tensor k_pool,
+    torch::Tensor v_pool,
+    torch::Tensor page_table,
+    torch::Tensor n_tokens);
+#endif
+
+void paged_kv_write_dyn_cpu(
+    torch::Tensor k_src,
+    torch::Tensor v_src,
+    torch::Tensor k_pool,
+    torch::Tensor v_pool,
+    torch::Tensor page_table,
+    torch::Tensor n_tokens);
+
 }  // namespace olmo_cpp

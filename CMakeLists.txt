@@ -20,6 +20,10 @@ set(CMAKE_CXX_STANDARD 17)
 # Link-time optimization for better inlining across translation units
 # Disabled on Linux/GCC due to cross-library LTO linker issues with vendored deps
 option(OLMO_ENABLE_LTO "Enable link-time optimization" OFF)
+
+# Profile-guided optimization (item CC.2). Disabled by default; the
+# two-stage workflow is documented at the top of cmake/PGO.cmake.
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/PGO.cmake OPTIONAL)
 if(OLMO_ENABLE_LTO)
     include(CheckIPOSupported)
     check_ipo_supported(RESULT ipo_supported OUTPUT ipo_error)
@@ -238,6 +242,7 @@ set(OLMO_SOURCES
     src/backend/int4_kv.cpp         # U (INT4 KV codec)
     src/backend/tma_loads.cpp       # W (Blackwell TMA descriptor builder)
     src/backend/fp8_cublaslt.cpp    # S (FP8 cuBLASLt entry point)
+    src/generate/tree_speculative.cpp  # 8.1 (tree speculative)
     # Seed and profiling infrastructure
     src/seed.cpp
     src/profiler.cpp

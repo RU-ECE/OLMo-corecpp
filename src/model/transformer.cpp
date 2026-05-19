@@ -253,54 +253,66 @@ torch::Tensor TransformerImpl::forward(
     KVCache* kv_cache) {
 
   auto h = forward_backbone(input_ids, kv_cache);
-  auto logits = lm_head_(h);
 
-  if (labels.has_value()) {
-    // Main CE loss
-    auto main_loss = torch::nn::functional::cross_entropy(
-        logits.view({-1, config_.vocab_size}),
-        labels->view(-1),
-        torch::nn::functional::CrossEntropyFuncOptions().ignore_index(ignore_index).reduction(torch::kMean));
-
-    // MTP auxiliary losses
-    if (config_.num_mtp_heads > 0) {
-      auto mtp_loss_sum = torch::zeros({}, logits.options());
-      int64_t valid_heads = 0;
-
-      for (int64_t k = 0; k < config_.num_mtp_heads; ++k) {
-        // MTP head k predicts token at position t+k+1 (shifted by k extra)
-        // So its target labels are labels shifted left by k positions
-        int64_t shift = k + 1;  // head 0 already predicts t+1 (main), head k predicts t+k+1
-        int64_t seq_len = labels->size(1);
-
-        if (shift >= seq_len) continue;  // not enough sequence for this head
-
-        // Hidden states for positions [0, seq_len - shift)
-        auto h_trimmed = h.narrow(1, 0, seq_len - shift);
-        // Labels for positions [shift, seq_len) — these are the t+k+1 targets
-        auto labels_shifted = labels->narrow(1, shift, seq_len - shift);
-
-        auto head = mtp_heads_->ptr<MTPHeadImpl>(k);
-        auto mtp_h = head->forward(h_trimmed);
-        auto mtp_logits = lm_head_(mtp_h);
-
-        auto mtp_loss = torch::nn::functional::cross_entropy(
-            mtp_logits.reshape({-1, config_.vocab_size}),
-            labels_shifted.reshape(-1),
-            torch::nn::functional::CrossEntropyFuncOptions().ignore_index(ignore_index).reduction(torch::kMean));
-
-        mtp_loss_sum = mtp_loss_sum + mtp_loss;
-        ++valid_heads;
-      }
-
-      if (valid_heads > 0) {
-        main_loss = main_loss + config_.mtp_loss_weight * mtp_loss_sum / static_cast<double>(valid_heads);
-      }
-    }
-
-    return main_loss;
+  if (!labels.has_value()) {
+    // Inference path: just main logits, no MTP loss.
+    return lm_head_(h);
   }
-  return logits;
+
+  const int64_t seq_len_full = h.size(1);
+  const int64_t B = h.size(0);
+  const int64_t d = h.size(2);
+  const int64_t K = config_.num_mtp_heads;
+
+  // B (optimization roadmap): stack the main head input (h itself) and each
+  // MTP head's transform output along a new leading dim, then run the LM head
+  // ONCE on the combined tensor. cuBLAS sees a single [(K+1)*B*S, d] × [d, V]
+  // GEMM instead of K+1 separate calls — bigger M-dim tiles better and the
+  // dispatcher overhead is paid once.
+  //
+  // Each MTP head is given the FULL h (length seq_len_full) rather than a
+  // narrowed view; we discard the leading positions of its logits before
+  // computing CE. The wasted compute is (k+1)/seq_len ≈ 0.1% per head at
+  // seq_len ≈ 1024 — far below the gain from a single fused GEMM.
+  std::vector<torch::Tensor> heads_inputs;
+  heads_inputs.reserve(static_cast<size_t>(K + 1));
+  heads_inputs.push_back(h);                                  // main head: identity
+  for (int64_t k = 0; k < K; ++k) {
+    auto head = mtp_heads_->ptr<MTPHeadImpl>(k);
+    heads_inputs.push_back(head->forward(h));                 // [B, S, d]
+  }
+  auto stacked = torch::stack(heads_inputs, /*dim=*/0);       // [K+1, B, S, d]
+  auto stacked_flat = stacked.view({(K + 1) * B * seq_len_full, d});
+  auto all_logits_flat = lm_head_(stacked_flat);              // ONE GEMM
+  auto all_logits = all_logits_flat.view({K + 1, B, seq_len_full, config_.vocab_size});
+
+  auto main_logits = all_logits.select(0, 0);                 // [B, S, V]
+  auto main_loss = torch::nn::functional::cross_entropy(
+      main_logits.reshape({-1, config_.vocab_size}),
+      labels->reshape(-1),
+      torch::nn::functional::CrossEntropyFuncOptions().ignore_index(ignore_index).reduction(torch::kMean));
+
+  if (K > 0) {
+    auto mtp_loss_sum = torch::zeros({}, main_logits.options());
+    int64_t valid_heads = 0;
+    for (int64_t k = 0; k < K; ++k) {
+      const int64_t shift = k + 1;
+      if (shift >= seq_len_full) continue;
+      // Slice this head's logits to the valid prediction range [0, S-shift).
+      auto mtp_logits = all_logits.select(0, k + 1).narrow(1, 0, seq_len_full - shift);
+      auto labels_shifted = labels->narrow(1, shift, seq_len_full - shift);
+      auto mtp_loss = torch::nn::functional::cross_entropy(
+          mtp_logits.reshape({-1, config_.vocab_size}),
+          labels_shifted.reshape(-1),
+          torch::nn::functional::CrossEntropyFuncOptions().ignore_index(ignore_index).reduction(torch::kMean));
+      mtp_loss_sum = mtp_loss_sum + mtp_loss;
+      ++valid_heads;
+    }
+    if (valid_heads > 0) {
+      main_loss = main_loss + config_.mtp_loss_weight * mtp_loss_sum / static_cast<double>(valid_heads);
+    }
+  }
+  return main_loss;
 }
 
 std::vector<torch::Tensor> TransformerImpl::forward_mtp_draft(torch::Tensor hidden_state) {
@@ -313,15 +325,32 @@ std::vector<torch::Tensor> TransformerImpl::forward_mtp_draft(torch::Tensor hidd
 
   std::vector<torch::Tensor> draft_logits;
   draft_logits.reserve(static_cast<size_t>(config_.num_mtp_heads));
+  if (config_.num_mtp_heads == 0) return draft_logits;
 
+  // B (item from optimization roadmap): stack all MTP head outputs along a
+  // new leading dim and project through lm_head in ONE GEMM instead of
+  // k separate calls. At S=1 the stacked GEMM is [K, 1, 1, d] → [K, 1, 1, V],
+  // a tiny tensor; cuBLAS prefers the bigger M dim. Numerically identical
+  // to running them in a loop.
+  std::vector<torch::Tensor> inputs;
+  inputs.reserve(static_cast<size_t>(config_.num_mtp_heads));
   for (int64_t k = 0; k < config_.num_mtp_heads; ++k) {
     auto head = mtp_heads_->ptr<MTPHeadImpl>(k);
-    auto mtp_h = head->forward(hidden_state);
-    auto logits = lm_head_(mtp_h);
-    // logits shape: [1, 1, vocab_size] → squeeze to [vocab_size]
-    draft_logits.push_back(logits.squeeze(0).squeeze(0));
+    inputs.push_back(head->forward(hidden_state));    // [B=1, S=1, d]
   }
+  auto stacked = torch::stack(inputs, /*dim=*/0);     // [K, 1, 1, d]
+  const int64_t K = stacked.size(0);
+  const int64_t B = stacked.size(1);
+  const int64_t S = stacked.size(2);
+  const int64_t d = stacked.size(3);
+  auto stacked_flat = stacked.view({K * B * S, d});
+  auto all_logits_flat = lm_head_(stacked_flat);                       // ONE GEMM
+  auto all_logits = all_logits_flat.view({K, B, S, config_.vocab_size}); // [K, 1, 1, V]
 
+  for (int64_t k = 0; k < K; ++k) {
+    // logits[k]: [1, 1, V] → squeeze to [V]
+    draft_logits.push_back(all_logits.select(0, k).squeeze(0).squeeze(0));
+  }
   return draft_logits;
 }
 

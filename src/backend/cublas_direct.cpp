@@ -98,6 +98,9 @@ struct CachedPlan {
   cublasLtMatrixLayout_t aLayout = nullptr;
   cublasLtMatrixLayout_t bLayout = nullptr;
   cublasLtMatrixLayout_t cLayout = nullptr;
+  cublasLtMatmulAlgo_t   algo{};
+  bool                   has_algo = false;
+  size_t                 ws_bytes = 0;
   ~CachedPlan() {
     if (desc)    cublasLtMatmulDescDestroy(desc);
     if (aLayout) cublasLtMatrixLayoutDestroy(aLayout);
@@ -105,6 +108,50 @@ struct CachedPlan {
     if (cLayout) cublasLtMatrixLayoutDestroy(cLayout);
   }
 };
+
+// D5 — workspace for cuBLASLt algos that need scratch. One buffer per
+// device, allocated lazily on first use; the same buffer is passed to
+// every matmul, which is safe because the GPU serialises kernel
+// launches on a stream.
+struct WorkspaceCache {
+  void*  ptr = nullptr;
+  size_t size = 0;
+  std::mutex mu;
+};
+static WorkspaceCache& workspace_cache() {
+  static WorkspaceCache w;
+  return w;
+}
+static void* ensure_workspace(size_t bytes) {
+  auto& w = workspace_cache();
+  std::lock_guard<std::mutex> lock(w.mu);
+  if (w.size >= bytes) return w.ptr;
+  if (w.ptr) cudaFree(w.ptr);
+  cudaMalloc(&w.ptr, bytes);
+  w.size = bytes;
+  return w.ptr;
+}
+
+// D5 — heuristic preference object. Built once per process; the
+// max-workspace cap caps the algos cuBLAS may pick.
+constexpr size_t kMaxWorkspaceBytes = 4 * 1024 * 1024;   // 4 MB
+struct PrefHolder {
+  cublasLtMatmulPreference_t pref = nullptr;
+  PrefHolder() {
+    cublasLtMatmulPreferenceCreate(&pref);
+    size_t cap = kMaxWorkspaceBytes;
+    cublasLtMatmulPreferenceSetAttribute(
+        pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+        &cap, sizeof(cap));
+  }
+  ~PrefHolder() {
+    if (pref) cublasLtMatmulPreferenceDestroy(pref);
+  }
+};
+static PrefHolder& heuristic_pref() {
+  static PrefHolder p;
+  return p;
+}
 
 struct PlanCache {
   std::unordered_map<PlanKey, std::shared_ptr<CachedPlan>, PlanKeyHash> map;
@@ -140,6 +187,24 @@ std::shared_ptr<CachedPlan> get_or_create_plan(
   cublasLtMatrixLayoutCreate(&plan->aLayout, dtype, ldA_rows, ldA_cols, ldA);
   cublasLtMatrixLayoutCreate(&plan->bLayout, dtype, ldB_rows, ldB_cols, ldB);
   cublasLtMatrixLayoutCreate(&plan->cLayout, dtype, ldC_rows, ldC_cols, ldC);
+
+  // D5 — ask cuBLAS for the best algorithm for this shape. Store it
+  // on the plan; subsequent matmuls pass it directly to cublasLtMatmul.
+  cublasLtMatmulHeuristicResult_t result = {};
+  int returned_count = 0;
+  cublasStatus_t s = cublasLtMatmulAlgoGetHeuristic(
+      get_handle(),
+      plan->desc,
+      plan->aLayout, plan->bLayout, plan->cLayout, plan->cLayout,
+      heuristic_pref().pref,
+      /*requestedAlgoCount=*/1,
+      &result, &returned_count);
+  if (s == CUBLAS_STATUS_SUCCESS && returned_count > 0) {
+    plan->algo = result.algo;
+    plan->has_algo = true;
+    plan->ws_bytes = result.workspaceSize;
+  }
+
   cache.map.emplace(key, plan);
   return plan;
 }
@@ -198,6 +263,7 @@ torch::Tensor fast_linear(torch::Tensor x,
         N, M, N);
 
     float alpha = 1.0f, beta = 0.0f;
+    void*  ws_ptr = plan->ws_bytes > 0 ? ensure_workspace(plan->ws_bytes) : nullptr;
     cublasLtMatmul(handle, plan->desc,
                     &alpha,
                     w_c.data_ptr(), plan->aLayout,
@@ -205,7 +271,8 @@ torch::Tensor fast_linear(torch::Tensor x,
                     &beta,
                     out2.data_ptr(), plan->cLayout,
                     out2.data_ptr(), plan->cLayout,
-                    nullptr, nullptr, 0,
+                    plan->has_algo ? &plan->algo : nullptr,
+                    ws_ptr, plan->ws_bytes,
                     c10::cuda::getCurrentCUDAStream().stream());
 
     auto out_shape = x_c.sizes().vec();
@@ -268,6 +335,7 @@ torch::Tensor fast_matmul(torch::Tensor a,
         N, M, N);
 
     float alpha = 1.0f, beta = 0.0f;
+    void*  ws_ptr = plan->ws_bytes > 0 ? ensure_workspace(plan->ws_bytes) : nullptr;
     cublasLtMatmul(handle, plan->desc,
                     &alpha,
                     b_c.data_ptr(), plan->aLayout,
@@ -275,7 +343,8 @@ torch::Tensor fast_matmul(torch::Tensor a,
                     &beta,
                     out.data_ptr(), plan->cLayout,
                     out.data_ptr(), plan->cLayout,
-                    nullptr, nullptr, 0,
+                    plan->has_algo ? &plan->algo : nullptr,
+                    ws_ptr, plan->ws_bytes,
                     c10::cuda::getCurrentCUDAStream().stream());
     return out;
   }

@@ -610,6 +610,10 @@ int main(int argc, char** argv) {
   bool use_paged_kv = false;
   int64_t paged_page_size = 16;
   int64_t paged_max_seq   = 2048;
+  // fast-inference [6]: chunked prefill. Split a long prompt into
+  // chunks of this size and feed each through forward_paged. 0 disables
+  // (single full-length prefill).
+  int64_t prefill_chunk_size = 0;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -641,6 +645,8 @@ int main(int argc, char** argv) {
       paged_page_size = std::stoll(argv[++i]);
     else if (arg == "--paged-max-seq" && i + 1 < argc)
       paged_max_seq = std::stoll(argv[++i]);
+    else if (arg == "--prefill-chunk-size" && i + 1 < argc)
+      prefill_chunk_size = std::stoll(argv[++i]);
   }
 
   if (checkpoint_path.empty() || config_path.empty() || vocab_path.empty() || merges_path.empty()) {
@@ -668,7 +674,10 @@ int main(int argc, char** argv) {
               << "  --paged-kv                 (use paged KV cache on non-speculative decode;\n"
               << "                              required precondition for whole-step CUDA graphs)\n"
               << "  --page-size <n>            (paged KV page size in tokens; default 16)\n"
-              << "  --paged-max-seq <n>        (paged KV cap on cached seq length; default 2048)\n";
+              << "  --paged-max-seq <n>        (paged KV cap on cached seq length; default 2048)\n"
+              << "  --prefill-chunk-size <n>   (chunked prefill: split prompt into N-token\n"
+              << "                              chunks; 0 = full prefill in one call; only\n"
+              << "                              effective with --paged-kv)\n";
     return 1;
   }
 
@@ -1001,14 +1010,35 @@ int main(int argc, char** argv) {
             model->n_layers(), n_kv_heads, head_dim,
             paged_page_size, max_pages, device, model_dtype);
 
-        // Prefill.
+        // Prefill — optionally chunked. fast-inference [6].
+        //
+        // Without chunking: one forward_paged([1, prompt_len]) call. With
+        // chunking: ceil(prompt_len / chunk_size) calls, each writing its
+        // K/V into the page pool and using the previously-written prefix
+        // via paged->materialize() inside attention. The chunked-prefill
+        // mask in AttentionImpl::forward_paged is what makes this safe.
+        //
+        // The chunk size dial gates the trade-off between (a) one-shot
+        // prefill peak memory / latency and (b) interleaving prefill
+        // with concurrent decode steps in a future continuous-batching
+        // scheduler (fast-inference [2]). Today it just exercises the
+        // path; in a multi-request setting it's the lever that prevents
+        // a long prompt from starving running decodes.
         {
-          auto input = torch::from_blob(all_tokens.data(), {1, prompt_len},
-                                        torch::TensorOptions().dtype(torch::kInt64))
-                           .clone()
-                           .to(device);
           torch::NoGradGuard no_grad;
-          auto logits = model->forward_paged(input, paged.get());
+          const int64_t chunk = (prefill_chunk_size > 0 && prefill_chunk_size < prompt_len)
+                                    ? prefill_chunk_size
+                                    : prompt_len;
+          torch::Tensor logits;
+          for (int64_t off = 0; off < prompt_len; off += chunk) {
+            const int64_t this_chunk = std::min(chunk, prompt_len - off);
+            auto input = torch::from_blob(all_tokens.data() + off, {1, this_chunk},
+                                          torch::TensorOptions().dtype(torch::kInt64))
+                             .clone()
+                             .to(device);
+            logits = model->forward_paged(input, paged.get());
+          }
+          // Sample from the last chunk's last position only.
           auto next_logits = logits.select(1, logits.size(1) - 1).squeeze(0);
           int64_t next_id = sample_logits(next_logits, temperature, top_k, top_p,
                                           all_tokens, repetition_penalty, rng);

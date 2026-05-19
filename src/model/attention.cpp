@@ -226,10 +226,18 @@ torch::Tensor AttentionImpl::forward_paged(
   }
 
   const int64_t total_S = k.size(2);
-  // Same is_causal heuristic as forward(): use built-in causal when the new
-  // sequence covers the entire cached range (prefill); otherwise rely on the
-  // append order (no explicit mask needed for decode).
-  bool is_causal = (S > 1) && (total_S == S);
+  // Three cases:
+  //  (a) S == 1: decode. q's single position attends to all of [0, total_S).
+  //      SDPA with is_causal=false is correct (the new K/V is at the end).
+  //  (b) S > 1, prefix == 0 (i.e. total_S == S): unchunked prefill. SDPA's
+  //      is_causal handles the standard square causal mask.
+  //  (c) S > 1, prefix > 0 (total_S > S): chunked prefill. q's position i
+  //      corresponds to absolute position prefix + i and must mask out k[j]
+  //      for j > prefix + i. We build the shifted-causal mask explicitly
+  //      rather than rely on SDPA's L<S is_causal semantics, which only
+  //      landed in PyTorch 2.1+ and is brittle across backends.
+  const int64_t prefix_len = total_S - S;
+  bool is_causal = (S > 1) && (prefix_len == 0);
 
   torch::Tensor attn_out;
   if (sliding_window_size_ > 0 && S > 1) {
@@ -239,6 +247,23 @@ torch::Tensor AttentionImpl::forward_paged(
       auto ones      = torch::ones({S, total_S}, bool_opts);
       auto allowed   = torch::tril(ones, offset)
                          & torch::triu(ones, offset - sliding_window_size_);
+      auto mask_opts = torch::TensorOptions().dtype(x.dtype()).device(x.device());
+      cached_attn_mask_ = torch::where(
+          allowed,
+          torch::zeros({}, mask_opts),
+          torch::full({}, -std::numeric_limits<float>::infinity(), mask_opts));
+      cached_mask_S_      = S;
+      cached_mask_full_S_ = total_S;
+    }
+    attn_out = at::scaled_dot_product_attention(q, k, v, cached_attn_mask_, 0.0, false);
+  } else if (S > 1 && prefix_len > 0) {
+    // Chunked-prefill mask: rows [0, S), cols [0, total_S). Allow
+    // k[j] iff j <= prefix_len + i. Build once per (S, total_S) pair —
+    // cached_attn_mask_ is reused if dims unchanged across calls.
+    if (S != cached_mask_S_ || total_S != cached_mask_full_S_) {
+      auto bool_opts = torch::TensorOptions().dtype(torch::kBool).device(x.device());
+      auto ones      = torch::ones({S, total_S}, bool_opts);
+      auto allowed   = torch::tril(ones, prefix_len);   // diag offset = prefix_len
       auto mask_opts = torch::TensorOptions().dtype(x.dtype()).device(x.device());
       cached_attn_mask_ = torch::where(
           allowed,

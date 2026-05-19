@@ -234,6 +234,7 @@ set(OLMO_SOURCES
     src/backend/fused_qkv_rope.cpp  # G (fused QKV + reshape + RoPE dispatcher)
     src/backend/fused_ffn.cpp       # I (fused SwiGLU FFN dispatcher)
     src/backend/cublas_direct.cpp   # L (direct cuBLASLt fast path)
+    src/optim/eight_bit_adamw.cpp   # O (8-bit Adam moment states)
     # Seed and profiling infrastructure
     src/seed.cpp
     src/profiler.cpp

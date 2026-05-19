@@ -91,11 +91,17 @@ __global__ void fused_qkv_rope_wmma_kernel(
     // All threads in the warp pass the same pointer (per WMMA contract).
     wmma::store_matrix_sync(my_wmma, c, kWmmaN, wmma::mem_row_major);
     __syncwarp();
-    // Cooperative narrow + scatter into the bf16 output tile.
-    for (int idx = lane; idx < kWmmaM * kWmmaN; idx += 32) {
-      const int i = idx / kWmmaN;
-      const int j = idx % kWmmaN;
-      sh_out[i * F + ct * kWmmaN + j] = __float2bfloat16(my_wmma[idx]);
+    // B2 — paired fp32→bf16 conversion + 4-byte store.
+    constexpr int kPairs = kWmmaM * kWmmaN / 2;
+    for (int p = lane; p < kPairs; p += 32) {
+      const int i  = p / (kWmmaN / 2);
+      const int c2 = (p % (kWmmaN / 2)) * 2;
+      const float2 f = make_float2(my_wmma[i * kWmmaN + c2],
+                                     my_wmma[i * kWmmaN + c2 + 1]);
+      const __nv_bfloat162 b = __float22bfloat162_rn(f);
+      __nv_bfloat162* dst = reinterpret_cast<__nv_bfloat162*>(
+          &sh_out[i * F + ct * kWmmaN + c2]);
+      *dst = b;
     }
   }
   __syncthreads();

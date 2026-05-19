@@ -153,10 +153,17 @@ __global__ void fused_ffn_tma_kernel(
     }
     wmma::store_matrix_sync(my_wmma, c, kWmmaN, wmma::mem_row_major);
     __syncwarp();
-    for (int idx = lane; idx < kWmmaM * kWmmaN; idx += 32) {
-      const int i = idx / kWmmaN;
-      const int j = idx % kWmmaN;
-      sh_gate_up[i * (2 * H) + ct * kWmmaN + j] = __float2bfloat16(my_wmma[idx]);
+    // B2 — paired conversion + 4-byte store.
+    constexpr int kPairs = kWmmaM * kWmmaN / 2;
+    for (int p = lane; p < kPairs; p += 32) {
+      const int i  = p / (kWmmaN / 2);
+      const int c2 = (p % (kWmmaN / 2)) * 2;
+      const float2 f = make_float2(my_wmma[i * kWmmaN + c2],
+                                     my_wmma[i * kWmmaN + c2 + 1]);
+      const __nv_bfloat162 b = __float22bfloat162_rn(f);
+      __nv_bfloat162* dst = reinterpret_cast<__nv_bfloat162*>(
+          &sh_gate_up[i * (2 * H) + ct * kWmmaN + c2]);
+      *dst = b;
     }
   }
   __syncthreads();
@@ -204,12 +211,19 @@ __global__ void fused_ffn_tma_kernel(
     }
     wmma::store_matrix_sync(my_wmma, c, kWmmaN, wmma::mem_row_major);
     __syncwarp();
-    for (int idx = lane; idx < kWmmaM * kWmmaN; idx += 32) {
-      const int i = idx / kWmmaN;
-      const int j = idx % kWmmaN;
+    // B2 — paired conversion + 4-byte store.
+    constexpr int kPairs = kWmmaM * kWmmaN / 2;
+    for (int p = lane; p < kPairs; p += 32) {
+      const int i  = p / (kWmmaN / 2);
+      const int c2 = (p % (kWmmaN / 2)) * 2;
       const int gi = row_base + i;
       if (gi >= N) continue;
-      y_out[(int64_t)gi * d + ct * kWmmaN + j] = __float2bfloat16(my_wmma[idx]);
+      const float2 f = make_float2(my_wmma[i * kWmmaN + c2],
+                                     my_wmma[i * kWmmaN + c2 + 1]);
+      const __nv_bfloat162 b = __float22bfloat162_rn(f);
+      __nv_bfloat162* dst = reinterpret_cast<__nv_bfloat162*>(
+          &y_out[(int64_t)gi * d + ct * kWmmaN + c2]);
+      *dst = b;
     }
   }
 #else

@@ -151,16 +151,36 @@ __global__ void silu_mul_bf16_kernel(
     const __nv_bfloat16* __restrict__ up,
     __nv_bfloat16* __restrict__ out,
     int64_t n) {
-  // Same grid-stride loop structure as the FP32 path; no vectorisation
-  // because BF16 has no equivalent of float4 that doesn't add complexity
-  // for negligible bandwidth gain (BF16 is already half the width of FP32).
+  // B4 — vectorise via uint4 (16 bytes = 8 bf16 elements per memory
+  // transaction). Mirrors the fp32 path's float4 strategy. The math
+  // stays in fp32 through __bfloat1622float2 pairs to keep the sigmoid
+  // accurate at the tails of the distribution.
   int64_t idx    = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
 
-  for (int64_t i = idx; i < n; i += stride) {
-    // Upcast each element to FP32 before the silu+multiply, then downcast
-    // before the store. The intrinsics __bfloat162float / __float2bfloat16
-    // expand to a single PTX instruction each — essentially free.
+  const int64_t n_vec = n / 8;
+  const uint4* gate4 = reinterpret_cast<const uint4*>(gate);
+  const uint4* up4   = reinterpret_cast<const uint4*>(up);
+  uint4* out4        = reinterpret_cast<uint4*>(out);
+
+  for (int64_t i = idx; i < n_vec; i += stride) {
+    uint4 g_raw = gate4[i];
+    uint4 u_raw = up4[i];
+    __nv_bfloat162* gb = reinterpret_cast<__nv_bfloat162*>(&g_raw);
+    __nv_bfloat162* ub = reinterpret_cast<__nv_bfloat162*>(&u_raw);
+    __nv_bfloat162 rb[4];
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      float2 gf = __bfloat1622float2(gb[j]);
+      float2 uf = __bfloat1622float2(ub[j]);
+      float2 rf = make_float2(silu(gf.x) * uf.x, silu(gf.y) * uf.y);
+      rb[j] = __float22bfloat162_rn(rf);
+    }
+    out4[i] = *reinterpret_cast<uint4*>(rb);
+  }
+
+  // Tail: any leftover n % 8 elements after the vectorised body.
+  for (int64_t i = n_vec * 8 + idx; i < n; i += stride) {
     float g = __bfloat162float(gate[i]);
     float u = __bfloat162float(up[i]);
     out[i]  = __float2bfloat16(silu(g) * u);

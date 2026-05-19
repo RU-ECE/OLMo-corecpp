@@ -645,6 +645,12 @@ target_link_libraries(test_fused_ce PRIVATE olmo_cpp)
 target_include_directories(test_fused_ce PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(test_fused_ce PRIVATE -O3 -march=native)
 
+# A2 — fused QKV+RoPE forward/backward parity vs the discrete ATen chain.
+add_executable(test_fused_qkv_rope tools/test_fused_qkv_rope.cpp)
+target_link_libraries(test_fused_qkv_rope PRIVATE olmo_cpp)
+target_include_directories(test_fused_qkv_rope PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(test_fused_qkv_rope PRIVATE -O3 -march=native)
+
 # Fused LM-head + Gumbel-max sampler unit test (fast-inference [6]).
 # CPU-only; verifies determinism, distribution match vs softmax, and
 # temperature-sharpening behavior.

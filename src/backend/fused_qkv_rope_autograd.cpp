@@ -19,6 +19,7 @@
  */
 
 #include "olmo_cpp/backend/fused_qkv_rope.hpp"
+#include "olmo_cpp/backend/cublas_direct.hpp"
 
 #include <torch/torch.h>
 #include <torch/csrc/autograd/custom_function.h>
@@ -28,18 +29,23 @@ namespace olmo_cpp {
 
 namespace {
 
-// Inverse RoPE: (x_even, x_odd) -> (x_even*c + x_odd*s, -x_even*s + x_odd*c)
+// Inverse RoPE matching the forward kernel's HALF-rotation convention:
+//   y[i]        = x[i] * c - x[i + half] * s
+//   y[i + half] = x[i] * s + x[i + half] * c
+// Backward (transpose of the 2×2 rotation matrix):
+//   grad_x[i]        =  grad_y[i] * c + grad_y[i + half] * s
+//   grad_x[i + half] = -grad_y[i] * s + grad_y[i + half] * c
+// cos/sin shapes: [S, head_dim/2]. Broadcast across [B, H, S, head_dim/2].
 torch::Tensor inverse_rope(torch::Tensor t, torch::Tensor cos, torch::Tensor sin) {
   const int64_t head_dim = t.size(3);
-  auto tv = t.view({t.size(0), t.size(1), t.size(2), head_dim / 2, 2});
-  auto e = tv.select(-1, 0);
-  auto o = tv.select(-1, 1);
+  const int64_t half = head_dim / 2;
+  auto first  = t.narrow(-1, 0,    half);
+  auto second = t.narrow(-1, half, half);
   auto cb = cos.view({1, 1, cos.size(0), cos.size(1)});
   auto sb = sin.view({1, 1, sin.size(0), sin.size(1)});
-  auto ne =  e * cb + o * sb;
-  auto no = -e * sb + o * cb;
-  auto out = torch::stack({ne, no}, -1);
-  return out.reshape(t.sizes());
+  auto out_first  =  first * cb + second * sb;
+  auto out_second = -first * sb + second * cb;
+  return torch::cat({out_first, out_second}, /*dim=*/-1);
 }
 
 struct FusedQKVRopeFunction
@@ -83,14 +89,30 @@ struct FusedQKVRopeFunction
 
     const int64_t B = x.size(0);
     const int64_t S = x.size(1);
-    auto gq = grad_q.transpose(1, 2).contiguous().view({B, S, n_q  * hd});
-    auto gk = grad_k.transpose(1, 2).contiguous().view({B, S, n_kv * hd});
-    auto gv = grad_v.transpose(1, 2).contiguous().view({B, S, n_kv * hd});
-    auto g_qkv = torch::cat({gq, gk, gv}, /*dim=*/-1);   // [B, S, (n_q+2*n_kv)*hd]
+    const int64_t d = x.size(-1);
+    const int64_t total = (n_q + 2 * n_kv) * hd;
 
-    auto grad_x      = torch::matmul(g_qkv, w_qkv);                       // [B, S, d]
-    auto grad_w_qkv  = torch::matmul(g_qkv.view({B * S, -1}).transpose(0, 1),
-                                      x.view({B * S, -1}));                // [(n_q+2*n_kv)*hd, d]
+    // Pre-allocate g_qkv and copy each grad slice into its halves —
+    // no torch::cat (which would allocate a 4th tensor and copy all
+    // three again). The .transpose(1,2).contiguous() copies are
+    // unavoidable: we need head-major → seq-major + contiguous layout
+    // for the downstream GEMM.
+    auto g_qkv = torch::empty({B, S, total}, x.options());
+    g_qkv.narrow(-1, 0,             n_q  * hd).copy_(
+        grad_q.transpose(1, 2).contiguous().view({B, S, n_q  * hd}));
+    g_qkv.narrow(-1, n_q * hd,      n_kv * hd).copy_(
+        grad_k.transpose(1, 2).contiguous().view({B, S, n_kv * hd}));
+    g_qkv.narrow(-1, (n_q + n_kv) * hd, n_kv * hd).copy_(
+        grad_v.transpose(1, 2).contiguous().view({B, S, n_kv * hd}));
+
+    // cuBLASLt-direct backward GEMMs (A2).
+    //   grad_x      = g_qkv  @ w_qkv         [B*S, total] @ [total, d] → [B*S, d]
+    //   grad_w_qkv  = g_qkv.T @ x_flat       [total, B*S] @ [B*S, d]   → [total, d]
+    auto g_qkv_flat = g_qkv.view({B * S, total});
+    auto x_flat     = x.view({B * S, d});
+    auto grad_x_flat   = fast_matmul(g_qkv_flat, w_qkv, /*transa=*/false, /*transb=*/false);
+    auto grad_w_qkv    = fast_matmul(g_qkv_flat, x_flat, /*transa=*/true,  /*transb=*/false);
+    auto grad_x        = grad_x_flat.view(x.sizes());
 
     return {grad_x, grad_w_qkv, torch::Tensor(), torch::Tensor(),
             torch::Tensor(), torch::Tensor(), torch::Tensor()};

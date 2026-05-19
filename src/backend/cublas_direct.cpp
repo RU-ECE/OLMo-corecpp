@@ -18,6 +18,7 @@
 #include "olmo_cpp/backend/cublas_direct.hpp"
 
 #include <torch/torch.h>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 
@@ -64,17 +65,103 @@ bool supported_lt_dtype(torch::ScalarType t) {
   return t == torch::kFloat16 || t == torch::kBFloat16 || t == torch::kFloat32;
 }
 
+// D3 — descriptor cache. cublasLtMatmulDescCreate + 3 layout creates
+// per call cost a few microseconds; for fixed-shape training loops
+// the same descriptors get re-created every step. Cache them keyed
+// by (dtype, M, N, K, opA, opB). One std::shared_ptr per plan keeps
+// the cuBLASLt resources alive for the program's lifetime.
+struct PlanKey {
+  cudaDataType_t dtype;
+  int64_t M, N, K;
+  cublasOperation_t opA, opB;
+  bool operator==(const PlanKey& o) const {
+    return dtype == o.dtype && M == o.M && N == o.N && K == o.K
+        && opA == o.opA && opB == o.opB;
+  }
+};
+struct PlanKeyHash {
+  size_t operator()(const PlanKey& k) const noexcept {
+    size_t h = std::hash<int>{}(static_cast<int>(k.dtype));
+    auto mix = [&](size_t x) {
+      h ^= x + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+    };
+    mix(std::hash<int64_t>{}(k.M));
+    mix(std::hash<int64_t>{}(k.N));
+    mix(std::hash<int64_t>{}(k.K));
+    mix(std::hash<int>{}(static_cast<int>(k.opA)));
+    mix(std::hash<int>{}(static_cast<int>(k.opB)));
+    return h;
+  }
+};
+struct CachedPlan {
+  cublasLtMatmulDesc_t   desc    = nullptr;
+  cublasLtMatrixLayout_t aLayout = nullptr;
+  cublasLtMatrixLayout_t bLayout = nullptr;
+  cublasLtMatrixLayout_t cLayout = nullptr;
+  ~CachedPlan() {
+    if (desc)    cublasLtMatmulDescDestroy(desc);
+    if (aLayout) cublasLtMatrixLayoutDestroy(aLayout);
+    if (bLayout) cublasLtMatrixLayoutDestroy(bLayout);
+    if (cLayout) cublasLtMatrixLayoutDestroy(cLayout);
+  }
+};
+
+struct PlanCache {
+  std::unordered_map<PlanKey, std::shared_ptr<CachedPlan>, PlanKeyHash> map;
+  std::mutex mu;
+};
+static PlanCache& plan_cache() {
+  static PlanCache c;
+  return c;
+}
+
+// Returns a (cached) plan for the given matmul shape. The plan stores
+// the descriptor + three layouts. ldA/ldB/ldC are the per-layout
+// leading dimensions in cuBLAS column-major view.
+std::shared_ptr<CachedPlan> get_or_create_plan(
+    cudaDataType_t dtype,
+    int64_t M, int64_t N, int64_t K,
+    cublasOperation_t opA, cublasOperation_t opB,
+    int64_t ldA_rows, int64_t ldA_cols, int64_t ldA,
+    int64_t ldB_rows, int64_t ldB_cols, int64_t ldB,
+    int64_t ldC_rows, int64_t ldC_cols, int64_t ldC) {
+  PlanKey key{dtype, M, N, K, opA, opB};
+  auto& cache = plan_cache();
+  std::lock_guard<std::mutex> lock(cache.mu);
+  auto it = cache.map.find(key);
+  if (it != cache.map.end()) return it->second;
+
+  auto plan = std::make_shared<CachedPlan>();
+  cublasLtMatmulDescCreate(&plan->desc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+  cublasLtMatmulDescSetAttribute(plan->desc, CUBLASLT_MATMUL_DESC_TRANSA,
+                                  &opA, sizeof(opA));
+  cublasLtMatmulDescSetAttribute(plan->desc, CUBLASLT_MATMUL_DESC_TRANSB,
+                                  &opB, sizeof(opB));
+  cublasLtMatrixLayoutCreate(&plan->aLayout, dtype, ldA_rows, ldA_cols, ldA);
+  cublasLtMatrixLayoutCreate(&plan->bLayout, dtype, ldB_rows, ldB_cols, ldB);
+  cublasLtMatrixLayoutCreate(&plan->cLayout, dtype, ldC_rows, ldC_cols, ldC);
+  cache.map.emplace(key, plan);
+  return plan;
+}
+
 #endif  // OLMO_HAS_CUBLASLT
 
 }  // namespace
 
 void cublas_direct_reset_cache() {
 #ifdef OLMO_HAS_CUBLASLT
-  auto& c = lt_cache();
-  std::lock_guard<std::mutex> lock(c.mu);
-  if (c.handle) {
-    cublasLtDestroy(c.handle);
-    c.handle = nullptr;
+  {
+    auto& c = lt_cache();
+    std::lock_guard<std::mutex> lock(c.mu);
+    if (c.handle) {
+      cublasLtDestroy(c.handle);
+      c.handle = nullptr;
+    }
+  }
+  {
+    auto& pc = plan_cache();
+    std::lock_guard<std::mutex> lock(pc.mu);
+    pc.map.clear();  // CachedPlan dtors release descriptors
   }
 #endif
 }
@@ -100,35 +187,26 @@ torch::Tensor fast_linear(torch::Tensor x,
 
     auto handle = get_handle();
     auto dtype = to_cuda_dtype(x_c.scalar_type());
-    cublasLtMatmulDesc_t desc;
-    cublasLtMatmulDescCreate(&desc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
     cublasOperation_t opA = CUBLAS_OP_T;  // weight (NxK) used as A^T -> KxN
     cublasOperation_t opN = CUBLAS_OP_N;
-    cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSA,
-                                    &opA, sizeof(opA));
-    cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSB,
-                                    &opN, sizeof(opN));
 
-    cublasLtMatrixLayout_t aLayout, bLayout, cLayout;
-    cublasLtMatrixLayoutCreate(&aLayout, dtype, K, N, K);  // W [N, K] row-major -> seen as col-major KxN
-    cublasLtMatrixLayoutCreate(&bLayout, dtype, K, M, K);  // x2 [M, K] row-major -> seen as col-major KxM
-    cublasLtMatrixLayoutCreate(&cLayout, dtype, N, M, N);  // out2 [M, N] row-major -> col-major NxM
+    // D3 — cached plan keyed by (dtype, M, N, K, opA, opB).
+    auto plan = get_or_create_plan(
+        dtype, M, N, K, opA, opN,
+        K, N, K,
+        K, M, K,
+        N, M, N);
 
     float alpha = 1.0f, beta = 0.0f;
-    cublasLtMatmul(handle, desc,
+    cublasLtMatmul(handle, plan->desc,
                     &alpha,
-                    w_c.data_ptr(), aLayout,
-                    x2.data_ptr(), bLayout,
+                    w_c.data_ptr(), plan->aLayout,
+                    x2.data_ptr(),  plan->bLayout,
                     &beta,
-                    out2.data_ptr(), cLayout,
-                    out2.data_ptr(), cLayout,
+                    out2.data_ptr(), plan->cLayout,
+                    out2.data_ptr(), plan->cLayout,
                     nullptr, nullptr, 0,
                     c10::cuda::getCurrentCUDAStream().stream());
-
-    cublasLtMatmulDescDestroy(desc);
-    cublasLtMatrixLayoutDestroy(aLayout);
-    cublasLtMatrixLayoutDestroy(bLayout);
-    cublasLtMatrixLayoutDestroy(cLayout);
 
     auto out_shape = x_c.sizes().vec();
     out_shape.back() = N;
@@ -179,45 +257,26 @@ torch::Tensor fast_matmul(torch::Tensor a,
     // (leading dim c). Two transposes (the row→col reinterp and the user's
     // transpose flag) collapse to: flip the cublasOperation when the user
     // does NOT want a transpose (because the row→col view already is one).
-    // i.e., user-trans=false → CUBLAS_OP_T; user-trans=true → CUBLAS_OP_N.
-    //
-    // Computing y = op(a) @ op(b) with row-major outputs means we tell
-    // cuBLAS to compute Y^T = op(b)^T @ op(a)^T where Y has shape [N, M]
-    // in col-major (same buffer, just interpreted). The B-arg-becomes-A
-    // swap moves the leading-dim tensor accordingly.
-    cublasLtMatmulDesc_t desc;
-    cublasLtMatmulDescCreate(&desc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
     cublasOperation_t opA_lt = transb ? CUBLAS_OP_N : CUBLAS_OP_T;
     cublasOperation_t opB_lt = transa ? CUBLAS_OP_N : CUBLAS_OP_T;
-    cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSA,
-                                    &opA_lt, sizeof(opA_lt));
-    cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSB,
-                                    &opB_lt, sizeof(opB_lt));
 
-    cublasLtMatrixLayout_t aLayout, bLayout, cLayout;
-    // a buffer is treated as A in the lt call, but represents op(b) row-major.
-    // Its row-major shape: [b_rows, b_cols] where b_rows = b_c.size(0).
-    cublasLtMatrixLayoutCreate(&aLayout, dtype,
-                                b_c.size(1), b_c.size(0), b_c.size(1));
-    cublasLtMatrixLayoutCreate(&bLayout, dtype,
-                                a_c.size(1), a_c.size(0), a_c.size(1));
-    cublasLtMatrixLayoutCreate(&cLayout, dtype, N, M, N);
+    // D3 — cached plan.
+    auto plan = get_or_create_plan(
+        dtype, M, N, K, opA_lt, opB_lt,
+        b_c.size(1), b_c.size(0), b_c.size(1),
+        a_c.size(1), a_c.size(0), a_c.size(1),
+        N, M, N);
 
     float alpha = 1.0f, beta = 0.0f;
-    cublasLtMatmul(handle, desc,
+    cublasLtMatmul(handle, plan->desc,
                     &alpha,
-                    b_c.data_ptr(), aLayout,
-                    a_c.data_ptr(), bLayout,
+                    b_c.data_ptr(), plan->aLayout,
+                    a_c.data_ptr(), plan->bLayout,
                     &beta,
-                    out.data_ptr(), cLayout,
-                    out.data_ptr(), cLayout,
+                    out.data_ptr(), plan->cLayout,
+                    out.data_ptr(), plan->cLayout,
                     nullptr, nullptr, 0,
                     c10::cuda::getCurrentCUDAStream().stream());
-
-    cublasLtMatmulDescDestroy(desc);
-    cublasLtMatrixLayoutDestroy(aLayout);
-    cublasLtMatrixLayoutDestroy(bLayout);
-    cublasLtMatrixLayoutDestroy(cLayout);
     return out;
   }
 #endif

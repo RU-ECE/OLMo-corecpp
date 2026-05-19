@@ -134,7 +134,10 @@ struct TrainConfig {
   int64_t log_interval = 10;         // Steps between loss D2H sync
   /// Capture fwd+bwd as a CUDA graph and replay each step. Eliminates
   /// per-kernel launch overhead. Requires fixed shapes (no curriculum).
-  bool use_cuda_graph = false;       // Capture forward+backward as CUDA graph (requires fixed shapes)
+  /// Default ON (item BB): the runtime gate (device.is_cuda() && !ddp) in
+  /// train.cpp ensures CPU/MPS/multi-rank runs auto-skip; users who want
+  /// to disable on CUDA for ablation can set use_cuda_graph=0 in [optimization].
+  bool use_cuda_graph = true;
 
   // Heartbeat monitoring
   /// Wall-seconds between heartbeat-file writes (calibrated dynamically

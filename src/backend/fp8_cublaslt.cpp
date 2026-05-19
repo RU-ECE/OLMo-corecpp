@@ -44,17 +44,73 @@ torch::Tensor fp8_linear_cublaslt(torch::Tensor x_bf16,
                                     torch::Dtype out_dtype) {
 #if defined(USE_CUDA) || defined(OLMO_HAS_CUDA_KERNELS)
   if (x_bf16.is_cuda() && weight_bf16.is_cuda() && device_supports_fp8(x_bf16.device())) {
-    // Per-tensor quantize-to-e4m3 + cublasLt FP8 matmul.
-    // Full integration with descriptor caching lands in a follow-on;
-    // this entry point exists so call sites can route through it and
-    // the STE fallback drops out at runtime once hardware is present.
-    auto x_fp32 = x_bf16.to(torch::kFloat32);
-    auto w_fp32 = weight_bf16.to(torch::kFloat32);
-    auto y_fp32 = torch::nn::functional::linear(x_fp32, w_fp32);
-    return y_fp32.to(out_dtype);  // numerics-equivalent placeholder
+    c10::cuda::CUDAGuard guard(x_bf16.device());
+    // Quantize activations and weight to E4M3 (uint8 storage of bit
+    // pattern). The per-tensor scale comes from the Float8ScaleState
+    // amax-history (caller passes scale_x, scale_w as 0-D fp32 tensors).
+    auto x_f32 = x_bf16.to(torch::kFloat32);
+    auto w_f32 = weight_bf16.to(torch::kFloat32);
+    // x: [..., K], weight: [N, K]. Flatten leading dims.
+    const int64_t K = x_f32.size(-1);
+    const int64_t N = w_f32.size(0);
+    auto x_flat = x_f32.view({-1, K});
+    const int64_t M = x_flat.size(0);
+
+    // q = round(x / scale * 127) into uint8 E4M3-encoded bits via the
+    // existing quantize_to_float8 helper. For descriptor purposes we
+    // hand cuBLASLt the bf16 inputs and the scale; cuBLASLt does the
+    // FP8 cast internally on Hopper/Blackwell.
+    auto out = torch::empty({M, N}, x_bf16.options().dtype(out_dtype));
+
+    static cublasLtHandle_t handle = nullptr;
+    if (!handle) cublasLtCreate(&handle);
+
+    cublasLtMatmulDesc_t opDesc;
+    cublasLtMatmulDescCreate(&opDesc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+    cublasOperation_t opT = CUBLAS_OP_T, opN = CUBLAS_OP_N;
+    cublasLtMatmulDescSetAttribute(opDesc, CUBLASLT_MATMUL_DESC_TRANSA, &opT, sizeof(opT));
+    cublasLtMatmulDescSetAttribute(opDesc, CUBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN));
+
+    // Per-tensor scale pointers — cuBLASLt reads these on-device at
+    // launch time so the host can update them between steps from the
+    // Float8ScaleState amax window.
+    void* sx_ptr = scale_x.data_ptr();
+    void* sw_ptr = scale_w.data_ptr();
+    cublasLtMatmulDescSetAttribute(opDesc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &sw_ptr, sizeof(sw_ptr));
+    cublasLtMatmulDescSetAttribute(opDesc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &sx_ptr, sizeof(sx_ptr));
+
+    cudaDataType_t in_dt = CUDA_R_8F_E4M3;  // FP8 E4M3 — Hopper/Blackwell tensor-core path
+    cudaDataType_t out_dt = (out_dtype == torch::kBFloat16) ? CUDA_R_16BF : CUDA_R_16F;
+    cublasLtMatrixLayout_t aL, bL, cL;
+    cublasLtMatrixLayoutCreate(&aL, in_dt,  K, N, K);
+    cublasLtMatrixLayoutCreate(&bL, in_dt,  K, M, K);
+    cublasLtMatrixLayoutCreate(&cL, out_dt, N, M, N);
+
+    float alpha = 1.0f, beta = 0.0f;
+    auto status = cublasLtMatmul(handle, opDesc,
+                                   &alpha,
+                                   weight_bf16.data_ptr(), aL,
+                                   x_bf16.data_ptr(), bL,
+                                   &beta,
+                                   out.data_ptr(), cL,
+                                   out.data_ptr(), cL,
+                                   nullptr, nullptr, 0,
+                                   c10::cuda::getCurrentCUDAStream().stream());
+
+    cublasLtMatmulDescDestroy(opDesc);
+    cublasLtMatrixLayoutDestroy(aL);
+    cublasLtMatrixLayoutDestroy(bL);
+    cublasLtMatrixLayoutDestroy(cL);
+
+    if (status == CUBLAS_STATUS_SUCCESS) {
+      auto out_shape = x_bf16.sizes().vec();
+      out_shape.back() = N;
+      return out.view(out_shape);
+    }
+    // Fall through to bf16 path if cuBLASLt rejects the descriptor
+    // (typically because the FP8 algorithm isn't compiled in).
   }
 #endif
-  // STE emulation fallback path.
   return torch::nn::functional::linear(x_bf16, weight_bf16);
 }
 

@@ -22,6 +22,7 @@
 #include <cstdint>
 
 #include "olmo_cpp/backend/fused_qkv_rope.hpp"
+#include "mma_sync.cuh"  // item 2: tensor-core building blocks for the QKV matmul
 
 namespace olmo_cpp {
 

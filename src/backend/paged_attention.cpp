@@ -185,4 +185,89 @@ void paged_kv_write_dyn(
   paged_kv_write_dyn_cpu(k_src, v_src, k_pool, v_pool, page_table, n_tokens);
 }
 
+// ── INT4-KV paged attention (item U) ───────────────────────────────────
+
+torch::Tensor paged_attention_decode_int4_cpu(
+    torch::Tensor q,
+    torch::Tensor k_pool, torch::Tensor k_scales,
+    torch::Tensor v_pool, torch::Tensor v_scales,
+    torch::Tensor page_table,
+    torch::Tensor n_tokens,
+    float sm_scale) {
+  TORCH_CHECK(q.is_cpu(), "int4 cpu path: tensors must be CPU");
+  const int n_tok = n_tokens.to(torch::kInt32).item<int32_t>();
+  // Dequantize K / V pools to fp32 on the fly via the existing nibble
+  // unpack from int4_kv.cpp's logic. For the CPU path we just call
+  // dequantize_kv_int4 once per page reference — slow but correct.
+  // The CUDA kernel does inline dequant for real speed.
+  auto q_c = q.contiguous().to(torch::kFloat32);
+  const int64_t n_q_heads = q_c.size(0);
+  const int64_t head_dim  = q_c.size(1);
+  const int64_t max_pages = k_pool.size(0);
+  const int64_t page_size = k_pool.size(1);
+  const int64_t n_kv_heads = k_pool.size(2);
+  TORCH_CHECK(k_pool.size(3) == head_dim / 2,
+              "int4 pool last dim must be head_dim/2");
+
+  auto pt = page_table.contiguous().to(torch::kInt32);
+  auto pt_a = pt.accessor<int32_t, 1>();
+
+  // Gather K, V into [n_tok, n_kv_heads, head_dim] fp32.
+  auto k = torch::zeros({n_tok, n_kv_heads, head_dim}, torch::kFloat32);
+  auto v = torch::zeros({n_tok, n_kv_heads, head_dim}, torch::kFloat32);
+  for (int t = 0; t < n_tok; ++t) {
+    int blk = t / page_size;
+    int off = t % page_size;
+    int pg  = pt_a[blk];
+    for (int h = 0; h < n_kv_heads; ++h) {
+      float ks = k_scales.index({pg, off, h}).item<float>();
+      float vs = v_scales.index({pg, off, h}).item<float>();
+      auto kbyte = k_pool.index({pg, off, h}).to(torch::kCPU).to(torch::kInt32);
+      auto vbyte = v_pool.index({pg, off, h}).to(torch::kCPU).to(torch::kInt32);
+      auto kbyte_a = kbyte.accessor<int32_t, 1>();
+      auto vbyte_a = vbyte.accessor<int32_t, 1>();
+      for (int j = 0; j < head_dim / 2; ++j) {
+        int lo_k = (kbyte_a[j] & 0xF) - 8;
+        int hi_k = ((kbyte_a[j] >> 4) & 0xF) - 8;
+        int lo_v = (vbyte_a[j] & 0xF) - 8;
+        int hi_v = ((vbyte_a[j] >> 4) & 0xF) - 8;
+        k.index_put_({t, h, 2*j},     static_cast<float>(lo_k) * ks);
+        k.index_put_({t, h, 2*j + 1}, static_cast<float>(hi_k) * ks);
+        v.index_put_({t, h, 2*j},     static_cast<float>(lo_v) * vs);
+        v.index_put_({t, h, 2*j + 1}, static_cast<float>(hi_v) * vs);
+      }
+    }
+  }
+  // GQA expand if needed.
+  if (n_kv_heads != n_q_heads) {
+    const int64_t group = n_q_heads / n_kv_heads;
+    k = k.repeat_interleave(group, /*dim=*/1);
+    v = v.repeat_interleave(group, /*dim=*/1);
+  }
+  auto q_b = q_c.unsqueeze(1);
+  auto k_b = k.transpose(0, 1);
+  auto v_b = v.transpose(0, 1);
+  auto scores = torch::matmul(q_b, k_b.transpose(-1, -2)) * sm_scale;
+  auto attn   = torch::softmax(scores, -1);
+  auto out    = torch::matmul(attn, v_b).squeeze(1);
+  return out.to(q.dtype());
+}
+
+torch::Tensor paged_attention_decode_int4(
+    torch::Tensor q,
+    torch::Tensor k_pool, torch::Tensor k_scales,
+    torch::Tensor v_pool, torch::Tensor v_scales,
+    torch::Tensor page_table,
+    torch::Tensor n_tokens,
+    float sm_scale) {
+#ifdef OLMO_HAS_CUDA_KERNELS
+  if (q.is_cuda()) {
+    return paged_attention_decode_int4_cuda(q, k_pool, k_scales, v_pool, v_scales,
+                                              page_table, n_tokens, sm_scale);
+  }
+#endif
+  return paged_attention_decode_int4_cpu(q, k_pool, k_scales, v_pool, v_scales,
+                                           page_table, n_tokens, sm_scale);
+}
+
 }  // namespace olmo_cpp

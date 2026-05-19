@@ -72,4 +72,17 @@ fused_qkv_rope_cpu(torch::Tensor x,
                    int64_t n_kv_heads,
                    int64_t head_dim);
 
+/// Autograd-aware forward. Calls into fused_qkv_rope (CUDA or CPU) and
+/// records the graph so backward through (x, w_qkv) works. Use from
+/// training call sites; inference (no_grad) can call fused_qkv_rope
+/// directly without paying the autograd graph cost.
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+fused_qkv_rope_autograd(torch::Tensor x,
+                          torch::Tensor w_qkv,
+                          torch::Tensor cos,
+                          torch::Tensor sin,
+                          int64_t n_q_heads,
+                          int64_t n_kv_heads,
+                          int64_t head_dim);
+
 }  // namespace olmo_cpp

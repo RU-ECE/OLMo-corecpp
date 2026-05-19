@@ -403,4 +403,133 @@ torch::Tensor paged_attention_decode_dyn_cuda(
   return out.to(q.dtype());
 }
 
+// ── INT4-KV paged decode kernel (item U) ──────────────────────────────────
+//
+// Same online-softmax pattern as paged_attention_decode_kernel_dyn but each
+// K/V load dequantizes an int4 nibble × per-vector fp16 scale on the fly.
+// Saves 4× HBM read bandwidth on the cache vs bf16.
+__global__ void paged_attention_decode_int4_kernel(
+    const float* __restrict__ q,           // [n_q_heads, head_dim]
+    const uint8_t* __restrict__ k_pool,    // [max_pages, page_size, n_kv_heads, head_dim/2]
+    const __nv_bfloat16* __restrict__ k_scales, // [max_pages, page_size, n_kv_heads]
+    const uint8_t* __restrict__ v_pool,
+    const __nv_bfloat16* __restrict__ v_scales,
+    const int32_t* __restrict__ page_table,
+    const int32_t* __restrict__ n_tokens_ptr,
+    int n_q_heads, int n_kv_heads, int head_dim,
+    int page_size, int max_pages, float sm_scale,
+    float* __restrict__ out) {
+  const int q_head = blockIdx.x;
+  if (q_head >= n_q_heads) return;
+  const int kv_head = (n_kv_heads == n_q_heads)
+                      ? q_head : (q_head * n_kv_heads / n_q_heads);
+
+  extern __shared__ float shmem[];
+  float* sh_q     = shmem;
+  float* sh_accum = shmem + head_dim;
+
+  for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+    sh_q[i] = q[q_head * head_dim + i];
+    sh_accum[i] = 0.0f;
+  }
+  __syncthreads();
+
+  __shared__ int n_tokens_sh;
+  if (threadIdx.x == 0) n_tokens_sh = *n_tokens_ptr;
+  __syncthreads();
+  const int n_tokens = n_tokens_sh;
+
+  float m = -CUDART_INF_F;
+  float l = 0.0f;
+
+  for (int t = 0; t < n_tokens; ++t) {
+    const int blk  = t / page_size;
+    const int off  = t % page_size;
+    const int pg   = page_table[blk];
+    if (pg < 0 || pg >= max_pages) continue;
+
+    const int64_t kv_byte_stride = (((int64_t)pg * page_size + off) * n_kv_heads + kv_head)
+                                    * (head_dim / 2);
+    const int64_t kv_scale_idx   = ((int64_t)pg * page_size + off) * n_kv_heads + kv_head;
+    const uint8_t* k_row = k_pool + kv_byte_stride;
+    const uint8_t* v_row = v_pool + kv_byte_stride;
+    const float k_scale = __bfloat162float(k_scales[kv_scale_idx]);
+    const float v_scale = __bfloat162float(v_scales[kv_scale_idx]);
+
+    // Compute Q·K with inline dequant of K nibbles.
+    float score = 0.0f;
+    for (int j = threadIdx.x; j < head_dim / 2; j += blockDim.x) {
+      const uint8_t byte = k_row[j];
+      const int lo = (int)(byte & 0xF) - 8;
+      const int hi = (int)((byte >> 4) & 0xF) - 8;
+      score += sh_q[2*j]   * (float)lo * k_scale;
+      score += sh_q[2*j+1] * (float)hi * k_scale;
+    }
+    score = block_reduce_sum(score, threadIdx.x, blockDim.x,
+                              shmem + 2 * head_dim);
+    float s = score * sm_scale;
+    float m_new = fmaxf(m, s);
+    float exp_diff = __expf(m - m_new);
+    float w = __expf(s - m_new);
+
+    for (int j = threadIdx.x; j < head_dim / 2; j += blockDim.x) {
+      const uint8_t byte = v_row[j];
+      const int lo = (int)(byte & 0xF) - 8;
+      const int hi = (int)((byte >> 4) & 0xF) - 8;
+      sh_accum[2*j]     = sh_accum[2*j]     * exp_diff + (float)lo * v_scale * w;
+      sh_accum[2*j + 1] = sh_accum[2*j + 1] * exp_diff + (float)hi * v_scale * w;
+    }
+    l = l * exp_diff + w;
+    m = m_new;
+  }
+
+  float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
+  for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+    out[q_head * head_dim + i] = sh_accum[i] * inv_l;
+  }
+}
+
+torch::Tensor paged_attention_decode_int4_cuda(
+    torch::Tensor q,
+    torch::Tensor k_pool, torch::Tensor k_scales,
+    torch::Tensor v_pool, torch::Tensor v_scales,
+    torch::Tensor page_table,
+    torch::Tensor n_tokens,
+    float sm_scale) {
+  TORCH_CHECK(q.is_cuda() && k_pool.is_cuda() && v_pool.is_cuda()
+              && page_table.is_cuda() && n_tokens.is_cuda(),
+              "paged_attention_decode_int4_cuda: tensors must be CUDA");
+
+  c10::cuda::CUDAGuard guard(q.device());
+  auto q_c = q.contiguous().to(torch::kFloat32);
+  auto kp  = k_pool.contiguous();
+  auto vp  = v_pool.contiguous();
+  auto ks  = k_scales.contiguous().to(torch::kBFloat16);
+  auto vs  = v_scales.contiguous().to(torch::kBFloat16);
+  auto pt  = page_table.contiguous().to(torch::kInt32);
+  auto nt  = n_tokens.contiguous().to(torch::kInt32);
+
+  const int n_q_heads  = q_c.size(0);
+  const int head_dim   = q_c.size(1);
+  const int max_pages  = kp.size(0);
+  const int page_size  = kp.size(1);
+  const int n_kv_heads = kp.size(2);
+
+  auto out = torch::empty({n_q_heads, head_dim}, q_c.options());
+  const size_t shmem = (2 * head_dim + kMaxWarps) * sizeof(float);
+
+  paged_attention_decode_int4_kernel<<<n_q_heads, kThreads, shmem>>>(
+      q_c.data_ptr<float>(),
+      kp.data_ptr<uint8_t>(),
+      reinterpret_cast<const __nv_bfloat16*>(ks.data_ptr<at::BFloat16>()),
+      vp.data_ptr<uint8_t>(),
+      reinterpret_cast<const __nv_bfloat16*>(vs.data_ptr<at::BFloat16>()),
+      pt.data_ptr<int32_t>(),
+      nt.data_ptr<int32_t>(),
+      n_q_heads, n_kv_heads, head_dim, page_size, max_pages, sm_scale,
+      out.data_ptr<float>());
+
+  return out.to(q.dtype());
+}
+
 }  // namespace olmo_cpp

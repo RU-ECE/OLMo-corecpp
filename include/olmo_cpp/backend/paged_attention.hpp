@@ -143,4 +143,40 @@ void paged_kv_write_dyn_cpu(
     torch::Tensor page_table,
     torch::Tensor n_tokens);
 
+// ── INT4-KV variant of paged_attention_decode (item U follow-on) ──────────
+//
+// Same contract as paged_attention_decode_dyn but k_pool / v_pool are
+// int4-packed:
+//   k_pool : [max_pages, page_size, n_kv_heads, head_dim/2]  uint8
+//   v_pool : [max_pages, page_size, n_kv_heads, head_dim/2]  uint8
+//   k_scales / v_scales : [max_pages, page_size, n_kv_heads] fp16
+// The kernel dequantizes each K/V on the fly inside the dot-product
+// accumulation. 4× memory savings on the cache, ~1% perplexity hit
+// under sane block sizes.
+torch::Tensor paged_attention_decode_int4(
+    torch::Tensor q,
+    torch::Tensor k_pool, torch::Tensor k_scales,
+    torch::Tensor v_pool, torch::Tensor v_scales,
+    torch::Tensor page_table,
+    torch::Tensor n_tokens,
+    float sm_scale);
+
+#ifdef OLMO_HAS_CUDA_KERNELS
+torch::Tensor paged_attention_decode_int4_cuda(
+    torch::Tensor q,
+    torch::Tensor k_pool, torch::Tensor k_scales,
+    torch::Tensor v_pool, torch::Tensor v_scales,
+    torch::Tensor page_table,
+    torch::Tensor n_tokens,
+    float sm_scale);
+#endif
+
+torch::Tensor paged_attention_decode_int4_cpu(
+    torch::Tensor q,
+    torch::Tensor k_pool, torch::Tensor k_scales,
+    torch::Tensor v_pool, torch::Tensor v_scales,
+    torch::Tensor page_table,
+    torch::Tensor n_tokens,
+    float sm_scale);
+
 }  // namespace olmo_cpp

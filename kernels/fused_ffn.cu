@@ -22,6 +22,7 @@
 #include <cstdint>
 
 #include "olmo_cpp/backend/fused_ffn.hpp"
+#include "mma_sync.cuh"  // item 2: tensor-core mma helpers for gate_up + down matmuls
 
 namespace olmo_cpp {
 

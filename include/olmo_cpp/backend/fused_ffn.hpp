@@ -43,4 +43,9 @@ torch::Tensor fused_ffn_cpu(torch::Tensor x,
                              torch::Tensor w_gate_up,
                              torch::Tensor w_down);
 
+/// Autograd-aware variant for training call sites.
+torch::Tensor fused_ffn_autograd(torch::Tensor x,
+                                   torch::Tensor w_gate_up,
+                                   torch::Tensor w_down);
+
 }  // namespace olmo_cpp

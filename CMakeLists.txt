@@ -243,6 +243,9 @@ set(OLMO_SOURCES
     src/backend/tma_loads.cpp       # W (Blackwell TMA descriptor builder)
     src/backend/fp8_cublaslt.cpp    # S (FP8 cuBLASLt entry point)
     src/generate/tree_speculative.cpp  # 8.1 (tree speculative)
+    src/backend/fused_qkv_rope_autograd.cpp  # G backward (autograd-aware)
+    src/backend/fused_ffn_autograd.cpp       # I backward (autograd-aware)
+    src/backend/subq_backward.cpp            # HH SubQ STE backward
     # Seed and profiling infrastructure
     src/seed.cpp
     src/profiler.cpp

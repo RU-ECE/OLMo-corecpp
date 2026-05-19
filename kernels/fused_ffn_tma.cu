@@ -1,0 +1,254 @@
+/**
+ * kernels/fused_ffn_tma.cu
+ *
+ * TMA (Tensor Memory Accelerator) variant of fused_ffn_wmma — item W
+ * wiring. On sm_90+ (Hopper / Blackwell sm_120), the x input tile is
+ * async-loaded into shared memory via cp.async.bulk.tensor with an
+ * mbarrier-based completion signal; WMMA computes on the loaded tile.
+ * The async load overlaps compute and hides HBM latency.
+ *
+ * Older arches: the host dispatcher detects compute capability < 9 and
+ * falls back to fused_ffn_wmma_cuda; the kernel body's TMA path is
+ * preprocessed out via __CUDA_ARCH__ guards. The kernel symbol is
+ * always defined so the launch site links cleanly across all targets.
+ *
+ * Reference: NVIDIA PTX ISA 8.0 §9.7.8.24 (cp.async.bulk.tensor) and
+ * §9.7.13.16 (mbarrier).
+ */
+
+#include <cuda_runtime.h>
+#include <cuda.h>
+#include <torch/torch.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <cuda_bf16.h>
+#include <mma.h>
+#include <cstdint>
+
+#include "olmo_cpp/backend/fused_ffn.hpp"
+#include "olmo_cpp/backend/tma_loads.hpp"
+
+namespace olmo_cpp {
+
+namespace {
+
+using namespace nvcuda;
+
+constexpr int kWmmaM = 16;
+constexpr int kWmmaN = 16;
+constexpr int kWmmaK = 16;
+constexpr int kWarpSize = 32;
+constexpr int kWarpsPerBlock = 4;
+constexpr int kThreadsPerBlock = kWarpSize * kWarpsPerBlock;
+
+__device__ __forceinline__ float silu_f(float v) {
+  return v / (1.0f + __expf(-v));
+}
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+
+// PTX wrappers around TMA + mbarrier primitives. Inline so we don't
+// pay a function-call cost on the hot path. Only compiled for sm_90+;
+// older arches preprocessor-skip and use the WMMA-only path below.
+__device__ __forceinline__ void mbarrier_init(uint64_t* mbar_smem, unsigned count) {
+  unsigned mbar_ptr = static_cast<unsigned>(__cvta_generic_to_shared(mbar_smem));
+  asm volatile("mbarrier.init.shared.b64 [%0], %1;\n"
+               :: "r"(mbar_ptr), "r"(count));
+}
+
+__device__ __forceinline__ void mbarrier_arrive_expect_tx(uint64_t* mbar_smem,
+                                                            unsigned bytes) {
+  unsigned mbar_ptr = static_cast<unsigned>(__cvta_generic_to_shared(mbar_smem));
+  asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;\n"
+               :: "r"(mbar_ptr), "r"(bytes));
+}
+
+__device__ __forceinline__ void mbarrier_wait(uint64_t* mbar_smem, unsigned phase) {
+  unsigned mbar_ptr = static_cast<unsigned>(__cvta_generic_to_shared(mbar_smem));
+  asm volatile(
+      "{\n"
+      ".reg .pred  p;\n"
+      "L1: mbarrier.try_wait.parity.shared.b64 p, [%0], %1;\n"
+      "@!p bra L1;\n"
+      "}\n"
+      :: "r"(mbar_ptr), "r"(phase));
+}
+
+__device__ __forceinline__ void cp_async_bulk_tensor_2d(
+    __nv_bfloat16* smem_dst,
+    const void* tensor_map,
+    int coord0, int coord1,
+    uint64_t* mbar_smem) {
+  unsigned dst_ptr  = static_cast<unsigned>(__cvta_generic_to_shared(smem_dst));
+  unsigned mbar_ptr = static_cast<unsigned>(__cvta_generic_to_shared(mbar_smem));
+  asm volatile(
+      "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes"
+      " [%0], [%1, {%2, %3}], [%4];\n"
+      :: "r"(dst_ptr),
+         "l"(reinterpret_cast<uint64_t>(tensor_map)),
+         "r"(coord0), "r"(coord1),
+         "r"(mbar_ptr));
+}
+
+#endif  // sm_90+ PTX wrappers
+
+// Kernel body. One block processes a 16-row tile of the (N, d) input.
+// On sm_90+, x is loaded via TMA. On older arches the body is a stub —
+// host dispatch will never reach it because the runtime check routes
+// older devices to fused_ffn_wmma_cuda.
+__global__ void fused_ffn_tma_kernel(
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    const __grid_constant__ CUtensorMap x_desc,
+#else
+    const void* /*x_desc_unused*/,
+#endif
+    const __nv_bfloat16* __restrict__ w_gate_up,
+    const __nv_bfloat16* __restrict__ w_down,
+    __nv_bfloat16* __restrict__ y_out,
+    int N, int d, int H) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  const int row_tile = blockIdx.x;
+  const int row_base = row_tile * kWmmaM;
+  if (row_base >= N) return;
+
+  const int warp_id = threadIdx.x / kWarpSize;
+
+  // Shared-memory carve-up. mbarrier is 8-byte aligned at the tail.
+  extern __shared__ __nv_bfloat16 smem_pool[];
+  __nv_bfloat16* sh_x       = smem_pool;
+  __nv_bfloat16* sh_gate_up = sh_x + 16 * d;
+  __nv_bfloat16* sh_act     = sh_gate_up + 16 * (2 * H);
+  uint64_t* mbar = reinterpret_cast<uint64_t*>(
+      (reinterpret_cast<uintptr_t>(sh_act + 16 * H) + 7) & ~static_cast<uintptr_t>(7));
+
+  // Phase 0 — TMA load of x[row_base:row_base+16, 0:d].
+  if (threadIdx.x == 0) {
+    mbarrier_init(mbar, 1);
+    const unsigned bytes = 16u * static_cast<unsigned>(d) * sizeof(__nv_bfloat16);
+    mbarrier_arrive_expect_tx(mbar, bytes);
+    cp_async_bulk_tensor_2d(sh_x, &x_desc, /*col0=*/0, /*row1=*/row_base, mbar);
+  }
+  __syncthreads();
+  mbarrier_wait(mbar, /*phase=*/0);
+
+  // Phase 1 — WMMA matmul gate_up = sh_x @ w_gate_up.T.
+  const int col_tiles_2H = (2 * H) / kWmmaN;
+  for (int ct = warp_id; ct < col_tiles_2H; ct += kWarpsPerBlock) {
+    wmma::fragment<wmma::accumulator, kWmmaM, kWmmaN, kWmmaK, float> c;
+    wmma::fill_fragment(c, 0.0f);
+    for (int kt = 0; kt < d / kWmmaK; ++kt) {
+      wmma::fragment<wmma::matrix_a, kWmmaM, kWmmaN, kWmmaK,
+                      __nv_bfloat16, wmma::row_major> a;
+      wmma::fragment<wmma::matrix_b, kWmmaM, kWmmaN, kWmmaK,
+                      __nv_bfloat16, wmma::col_major> b;
+      wmma::load_matrix_sync(a, sh_x + kt * kWmmaK, d);
+      wmma::load_matrix_sync(b, w_gate_up + (int64_t)(ct * kWmmaN) * d + kt * kWmmaK, d);
+      wmma::mma_sync(c, a, b, c);
+    }
+    float c_fp32[kWmmaM * kWmmaN];
+    wmma::store_matrix_sync(c_fp32, c, kWmmaN, wmma::mem_row_major);
+    for (int i = 0; i < kWmmaM; ++i) {
+      for (int j = 0; j < kWmmaN; ++j) {
+        sh_gate_up[i * (2 * H) + ct * kWmmaN + j] =
+            __float2bfloat16(c_fp32[i * kWmmaN + j]);
+      }
+    }
+  }
+  __syncthreads();
+
+  // Phase 2 — silu_mul to act.
+  const int total_act = 16 * H;
+  for (int idx = threadIdx.x; idx < total_act; idx += blockDim.x) {
+    int i = idx / H;
+    int h = idx % H;
+    float g = __bfloat162float(sh_gate_up[i * (2 * H) + h]);
+    float u = __bfloat162float(sh_gate_up[i * (2 * H) + h + H]);
+    sh_act[i * H + h] = __float2bfloat16(silu_f(g) * u);
+  }
+  __syncthreads();
+
+  // Phase 3 — down matmul. y_out[row_base:row_base+16, 0:d] = sh_act @ w_down.T.
+  const int col_tiles_d = d / kWmmaN;
+  for (int ct = warp_id; ct < col_tiles_d; ct += kWarpsPerBlock) {
+    wmma::fragment<wmma::accumulator, kWmmaM, kWmmaN, kWmmaK, float> c;
+    wmma::fill_fragment(c, 0.0f);
+    for (int kt = 0; kt < H / kWmmaK; ++kt) {
+      wmma::fragment<wmma::matrix_a, kWmmaM, kWmmaN, kWmmaK,
+                      __nv_bfloat16, wmma::row_major> a;
+      wmma::fragment<wmma::matrix_b, kWmmaM, kWmmaN, kWmmaK,
+                      __nv_bfloat16, wmma::col_major> b;
+      wmma::load_matrix_sync(a, sh_act + kt * kWmmaK, H);
+      wmma::load_matrix_sync(b, w_down + (int64_t)(ct * kWmmaN) * H + kt * kWmmaK, H);
+      wmma::mma_sync(c, a, b, c);
+    }
+    float c_fp32[kWmmaM * kWmmaN];
+    wmma::store_matrix_sync(c_fp32, c, kWmmaN, wmma::mem_row_major);
+    for (int i = 0; i < kWmmaM; ++i) {
+      for (int j = 0; j < kWmmaN; ++j) {
+        const int gi = row_base + i;
+        if (gi >= N) continue;
+        y_out[(int64_t)gi * d + ct * kWmmaN + j] =
+            __float2bfloat16(c_fp32[i * kWmmaN + j]);
+      }
+    }
+  }
+#else
+  // Pre-sm_90 builds: kernel is unreachable at runtime (host routes to
+  // fused_ffn_wmma_cuda), but we keep the symbol so the launch site
+  // links. No-op body keeps device-side preprocessing legal — the TMA
+  // PTX is preprocessed out above.
+  (void)w_gate_up; (void)w_down; (void)y_out;
+  (void)N; (void)d; (void)H;
+#endif
+}
+
+}  // namespace
+
+torch::Tensor fused_ffn_tma_cuda(torch::Tensor x,
+                                   torch::Tensor w_gate_up,
+                                   torch::Tensor w_down) {
+  TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16,
+              "fused_ffn_tma_cuda: bf16 CUDA inputs required");
+
+  // Runtime gate: TMA needs sm_90+. Older devices route through the
+  // WMMA-only fused kernel.
+  cudaDeviceProp props;
+  cudaGetDeviceProperties(&props, x.device().index());
+  if (props.major < 9) {
+    return fused_ffn_wmma_cuda(x, w_gate_up, w_down);
+  }
+
+  c10::cuda::CUDAGuard guard(x.device());
+  auto x_c  = x.contiguous();
+  auto wg   = w_gate_up.contiguous();
+  auto wd   = w_down.contiguous();
+  const int64_t B = x_c.size(0);
+  const int64_t S = x_c.size(1);
+  const int64_t d = x_c.size(2);
+  const int64_t H = wg.size(0) / 2;
+  TORCH_CHECK(d % 16 == 0 && H % 16 == 0,
+              "fused_ffn_tma_cuda: shapes must be multiples of 16");
+  const int N = static_cast<int>(B * S);
+  auto y = torch::empty_like(x_c);
+
+  // Build TMA descriptor for x viewed as [N, d].
+  auto x_flat = x_c.view({N, d});
+  alignas(64) unsigned char x_desc_storage[128];
+  make_tma_descriptor(x_flat, /*tile_rows=*/16, /*tile_cols=*/d, x_desc_storage);
+
+  const size_t shmem =
+        16 * d * sizeof(__nv_bfloat16)              // sh_x
+      + 16 * (2 * H) * sizeof(__nv_bfloat16)         // sh_gate_up
+      + 16 * H * sizeof(__nv_bfloat16)               // sh_act
+      + 16;                                          // mbarrier slack
+
+  const int grid = (N + 16 - 1) / 16;
+  fused_ffn_tma_kernel<<<grid, kThreadsPerBlock, shmem>>>(
+      *reinterpret_cast<const CUtensorMap*>(x_desc_storage),
+      reinterpret_cast<const __nv_bfloat16*>(wg.data_ptr<at::BFloat16>()),
+      reinterpret_cast<const __nv_bfloat16*>(wd.data_ptr<at::BFloat16>()),
+      reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()),
+      N, static_cast<int>(d), static_cast<int>(H));
+  return y;
+}
+
+}  // namespace olmo_cpp

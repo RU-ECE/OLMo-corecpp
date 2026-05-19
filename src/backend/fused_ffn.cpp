@@ -37,8 +37,10 @@ torch::Tensor fused_ffn(torch::Tensor x,
     const int64_t d = x.size(-1);
     const int64_t H = w_gate_up.size(0) / 2;
     if (d % 16 == 0 && H % 16 == 0) {
-      // Tensor-core path — preferred on sm_80+ for aligned shapes.
-      return fused_ffn_wmma_cuda(x, w_gate_up, w_down);
+      // Tensor-core path — TMA variant on sm_90+, plain WMMA otherwise.
+      // fused_ffn_tma_cuda itself runtime-checks and falls back to the
+      // WMMA path on older arches, so we always dispatch here.
+      return fused_ffn_tma_cuda(x, w_gate_up, w_down);
     }
     // Fallback to FMA-loop kernel for non-aligned shapes.
     return fused_ffn_cuda(x, w_gate_up, w_down);

@@ -55,6 +55,13 @@ torch::Tensor fused_ffn_autograd(torch::Tensor x,
 torch::Tensor fused_ffn_wmma_cuda(torch::Tensor x,
                                     torch::Tensor w_gate_up,
                                     torch::Tensor w_down);
+
+/// TMA (Tensor Memory Accelerator) variant. On sm_90+ async-loads
+/// x tiles via cp.async.bulk.tensor + mbarrier; otherwise routes
+/// internally to fused_ffn_wmma_cuda. Same numerics, same outputs.
+torch::Tensor fused_ffn_tma_cuda(torch::Tensor x,
+                                   torch::Tensor w_gate_up,
+                                   torch::Tensor w_down);
 #endif
 
 }  // namespace olmo_cpp

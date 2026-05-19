@@ -17,6 +17,7 @@ add_library(olmo_kernels SHARED
     fused_qkv_rope_wmma.cu     # G + item 2: tensor-core (WMMA) variant
     fused_ffn.cu               # I (fused SwiGLU FFN macro)
     fused_ffn_wmma.cu          # I + item 2: tensor-core (WMMA) variant
+    fused_ffn_tma.cu           # I + item W: TMA async-load variant (sm_90+)
 )
 target_include_directories(olmo_kernels PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/..

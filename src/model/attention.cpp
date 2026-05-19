@@ -24,7 +24,9 @@
  *   ATen's autograd over the SDPA op and the linear layers.
  */
 #include "olmo_cpp/model/attention.hpp"
+#include "olmo_cpp/backend/paged_attention.hpp"
 #include <ATen/ops/scaled_dot_product_attention.h>
+#include <cmath>
 #include <limits>
 
 namespace olmo_cpp {
@@ -187,9 +189,32 @@ torch::Tensor AttentionImpl::forward_paged(
     k = k_rot;
   }
 
-  // Append new K/V into the page pool, then materialize the full cached
-  // K/V as contiguous [B, n_kv_heads, total_len, head_dim] views.
+  // Append new K/V into the page pool. From here we either:
+  //  (1) dispatch the single-query paged kernel (S==1, sliding window off,
+  //      real BlockManager-backed pools), or
+  //  (2) materialize the full cached K/V and run SDPA (prefill, sliding
+  //      window, or shim-backed caches).
   paged->append(layer_idx, k, v);
+
+  const bool kernel_eligible =
+      (S == 1) && (sliding_window_size_ <= 0) && paged->has_page_table();
+  if (kernel_eligible) {
+    // q is [1, n_heads, 1, head_dim]; the kernel wants [n_q_heads, head_dim].
+    // It handles GQA internally (maps q_head -> kv_head) and reads K/V
+    // straight out of the page pool via the page table — no materialize.
+    const float sm_scale = 1.0f / std::sqrt(static_cast<float>(head_dim_));
+    auto q2 = q.select(0, 0).select(1, 0).contiguous();           // [n_heads, head_dim]
+    auto attn_flat = paged_attention_decode(
+        q2,
+        paged->k_pool(layer_idx),
+        paged->v_pool(layer_idx),
+        paged->page_table_tensor(),
+        paged->seq_len(),
+        sm_scale);                                                // [n_heads, head_dim]
+    auto attn_out_one = attn_flat.view({B, S, n_heads_ * head_dim_});
+    return w_out_(attn_out_one);
+  }
+
   auto [full_k, full_v] = paged->materialize(layer_idx);
   k = full_k;
   v = full_v;

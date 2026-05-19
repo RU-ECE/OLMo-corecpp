@@ -66,6 +66,35 @@ class IPagedKVCache {
 
   /// Drop all cached state.
   virtual void clear() = 0;
+
+  // ── Optional kernel-facing accessors ───────────────────────────────────
+  // The paged_attention_decode kernel (kernels/paged_attention.cu) needs
+  // direct access to the page pools and page table. Implementations that
+  // don't physically page (e.g. the concat shim) should leave the default
+  // throws in place; AttentionImpl::forward_paged checks has_page_table()
+  // first and falls back to materialize() + SDPA when the kernel path is
+  // unavailable.
+
+  /// True if k_pool / v_pool / page_table_tensor return real device data.
+  virtual bool has_page_table() const { return false; }
+
+  /// Page size in tokens (page dimension stride in the per-layer pool).
+  virtual int64_t page_size() const { return 0; }
+
+  /// Per-layer K/V page pool: [max_pages, page_size, n_kv_heads, head_dim].
+  virtual torch::Tensor k_pool(int64_t /*layer*/) const {
+    throw std::runtime_error("k_pool() not supported on this IPagedKVCache impl");
+  }
+  virtual torch::Tensor v_pool(int64_t /*layer*/) const {
+    throw std::runtime_error("v_pool() not supported on this IPagedKVCache impl");
+  }
+
+  /// Page table as a 1-D int32 tensor on the cache's device, length =
+  /// number of currently allocated blocks. The kernel walks it as
+  /// logical_block_idx -> physical_page_idx.
+  virtual torch::Tensor page_table_tensor() const {
+    throw std::runtime_error("page_table_tensor() not supported on this IPagedKVCache impl");
+  }
 };
 
 /// Construct a paged KV cache backed by the existing concat KVCache.

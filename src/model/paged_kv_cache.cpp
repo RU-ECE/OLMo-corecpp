@@ -160,6 +160,34 @@ class PagedKVCache : public IPagedKVCache {
     logical_len_ = 0;
   }
 
+  // ── Kernel-facing accessors (consumed by paged_attention_decode) ───────
+  bool has_page_table() const override { return true; }
+  int64_t page_size() const override { return page_size_; }
+
+  torch::Tensor k_pool(int64_t layer) const override {
+    TORCH_CHECK(layer >= 0 && layer < n_layers_,
+                "PagedKVCache::k_pool: layer index out of range");
+    return const_cast<BlockManager&>(mgr_).k_pool(layer);
+  }
+  torch::Tensor v_pool(int64_t layer) const override {
+    TORCH_CHECK(layer >= 0 && layer < n_layers_,
+                "PagedKVCache::v_pool: layer index out of range");
+    return const_cast<BlockManager&>(mgr_).v_pool(layer);
+  }
+
+  torch::Tensor page_table_tensor() const override {
+    const auto& pt = mgr_.page_table();
+    const int64_t n = static_cast<int64_t>(pt.size());
+    if (n == 0) {
+      return torch::empty({0}, torch::TensorOptions().dtype(torch::kInt32).device(device_));
+    }
+    // pt holds int32 values; from_blob over them, clone-and-move to device.
+    auto opts_cpu = torch::TensorOptions().dtype(torch::kInt32);
+    return torch::from_blob(const_cast<int32_t*>(pt.data()), {n}, opts_cpu)
+        .clone()
+        .to(device_);
+  }
+
  private:
   void write_layer_slots_(int64_t layer,
                           torch::Tensor k,

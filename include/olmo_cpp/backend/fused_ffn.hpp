@@ -48,4 +48,13 @@ torch::Tensor fused_ffn_autograd(torch::Tensor x,
                                    torch::Tensor w_gate_up,
                                    torch::Tensor w_down);
 
+#ifdef OLMO_HAS_CUDA_KERNELS
+/// Tensor-core (WMMA) FFN kernel. Preferred path on sm_80+ for bf16
+/// inputs with d / H multiples of 16. Falls back to the FMA-loop
+/// fused_ffn_cuda otherwise.
+torch::Tensor fused_ffn_wmma_cuda(torch::Tensor x,
+                                    torch::Tensor w_gate_up,
+                                    torch::Tensor w_down);
+#endif
+
 }  // namespace olmo_cpp

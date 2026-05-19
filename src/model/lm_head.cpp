@@ -27,6 +27,7 @@
  *   (zero_init_lm_head) so the model starts at a uniform output distribution.
  */
 #include "olmo_cpp/model/lm_head.hpp"
+#include "olmo_cpp/backend/cublas_direct.hpp"
 
 namespace olmo_cpp {
 
@@ -55,8 +56,9 @@ torch::Tensor LMHeadImpl::forward(torch::Tensor x) {
     // holder; deref with *norm_ to get the holder, then operator() to call.
     x = (*norm_)(x);
   }
-  // Linear projection D -> V (no bias, by OLMo convention).
-  return w_out_(x);
+  // L (cuBLASLt direct): the LM head is the biggest GEMM in the model
+  // ([B*S, d_model] × [d_model, vocab]); bypass the ATen dispatcher.
+  return fast_linear(x, w_out_->weight, torch::Tensor());
 }
 
 }  // namespace olmo_cpp

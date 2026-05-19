@@ -33,6 +33,16 @@ torch::Tensor fused_ffn(torch::Tensor x,
                          torch::Tensor w_gate_up,
                          torch::Tensor w_down) {
 #ifdef OLMO_HAS_CUDA_KERNELS
+  if (x.is_cuda() && x.scalar_type() == torch::kBFloat16) {
+    const int64_t d = x.size(-1);
+    const int64_t H = w_gate_up.size(0) / 2;
+    if (d % 16 == 0 && H % 16 == 0) {
+      // Tensor-core path — preferred on sm_80+ for aligned shapes.
+      return fused_ffn_wmma_cuda(x, w_gate_up, w_down);
+    }
+    // Fallback to FMA-loop kernel for non-aligned shapes.
+    return fused_ffn_cuda(x, w_gate_up, w_down);
+  }
   if (x.is_cuda()) {
     return fused_ffn_cuda(x, w_gate_up, w_down);
   }

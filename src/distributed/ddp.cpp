@@ -101,8 +101,116 @@ void DDPContext::broadcast_parameters(std::vector<torch::Tensor>& parameters) {
   }
 }
 
+void DDPContext::register_grad_hooks(std::vector<torch::Tensor>& parameters,
+                                      int64_t bucket_bytes) {
+  if (!backend_) return;
+  if (!hook_state_.buckets.empty()) return;  // already registered
+
+  // Build buckets in REVERSE parameter order (deeper layers first, matching
+  // backward order). Each bucket holds N consecutive params; when the last
+  // param's hook fires for a bucket, the bucket's grads are dispatched as
+  // one allreduce.
+  std::vector<std::pair<size_t, size_t>> bucket_ranges;  // (start, count) in reverse order
+  int64_t cur_bytes = 0;
+  size_t bucket_start = 0;
+  size_t reverse_idx = 0;  // count from the back
+
+  // First pass: figure out which params go into which bucket. We walk
+  // parameters in reverse so reverse_idx == 0 is the deepest layer.
+  std::vector<size_t> param_to_bucket(parameters.size(),
+                                      std::numeric_limits<size_t>::max());
+  size_t bucket_id = 0;
+  for (auto it = parameters.rbegin(); it != parameters.rend(); ++it, ++reverse_idx) {
+    const auto& p = *it;
+    if (!p.defined() || !p.requires_grad()) continue;
+    const int64_t pbytes = p.numel() * p.element_size();
+    if (cur_bytes + pbytes > bucket_bytes && cur_bytes > 0) {
+      bucket_id++;
+      cur_bytes = 0;
+    }
+    const size_t fwd_idx = parameters.size() - 1 - reverse_idx;
+    param_to_bucket[fwd_idx] = bucket_id;
+    cur_bytes += pbytes;
+  }
+  const size_t n_buckets = bucket_id + 1;
+
+  hook_state_.buckets.assign(n_buckets, Bucket{});
+  for (size_t i = 0; i < parameters.size(); ++i) {
+    if (param_to_bucket[i] == std::numeric_limits<size_t>::max()) continue;
+    const size_t bidx = param_to_bucket[i];
+    hook_state_.buckets[bidx].total_count++;
+  }
+
+  // Register one hook per trainable parameter. The hook stores the
+  // gradient passed by autograd into the bucket and increments the
+  // bucket's ready counter. When the bucket fills, the hook dispatches
+  // an allreduce (unless sync_required_ is false — that's the no_sync
+  // case for non-final accumulation steps).
+  for (size_t i = 0; i < parameters.size(); ++i) {
+    if (param_to_bucket[i] == std::numeric_limits<size_t>::max()) continue;
+    const size_t bidx = param_to_bucket[i];
+    auto& p = parameters[i];
+    // Capture bidx + this by value; `this` is the DDPContext.
+    p.register_hook([this, bidx](const at::Tensor& grad) -> at::Tensor {
+      if (!this->sync_required_) return grad;
+      std::lock_guard<std::mutex> lock(this->hook_state_.mu);
+      Bucket& b = this->hook_state_.buckets[bidx];
+      b.grads.push_back(grad);
+      b.ready_count++;
+      if (b.ready_count == b.total_count) {
+        // Bucket complete — dispatch the collective. backend_->allreduce
+        // returns a c10::Work; we store it and wait at finalize time.
+        auto work = this->backend_->allreduce(b.grads);
+        this->hook_state_.pending_works.push_back(std::move(work));
+      }
+      return grad;
+    });
+  }
+}
+
 void DDPContext::allreduce_gradients(const std::vector<torch::Tensor>& parameters) {
   if (!backend_) return;
+
+  // Hook mode: most of the work has already been kicked off during
+  // backward. Wait on all the in-flight bucket Works, reset bucket
+  // state for the next iteration, then divide by world_size.
+  if (has_hooks()) {
+    std::vector<c10::intrusive_ptr<c10d::Work>> works_to_wait;
+    {
+      std::lock_guard<std::mutex> lock(hook_state_.mu);
+      works_to_wait = std::move(hook_state_.pending_works);
+      hook_state_.pending_works.clear();
+      // Reset bucket fill state. The grad tensor references are owned by
+      // the model's parameter .grad attributes, which are still valid;
+      // we just drop our pointers so the next backward starts fresh.
+      for (auto& b : hook_state_.buckets) {
+        b.grads.clear();
+        b.ready_count = 0;
+      }
+    }
+    for (auto& w : works_to_wait) {
+      w->wait();
+    }
+
+    // Divide all gradients by world_size in one fused kernel.
+    std::vector<at::Tensor> grads;
+    grads.reserve(parameters.size());
+    for (const auto& p : parameters) {
+      if (p.defined() && p.requires_grad() && p.grad().defined()) {
+        grads.push_back(p.grad());
+      }
+    }
+    if (grads.empty()) return;
+    const auto inv_ws = 1.0 / static_cast<double>(world_size_);
+#if defined(__cpp_lib_ranges) || (defined(_LIBCPP_VERSION) && _LIBCPP_VERSION >= 14000)
+    at::_foreach_mul_(grads, c10::Scalar(inv_ws));
+#else
+    for (auto& g : grads) g.mul_(inv_ws);
+#endif
+    return;
+  }
+
+  // Legacy path (no hooks registered): bucketed end-of-step allreduce.
 
   // Collect every defined gradient. Walk parameters in REVERSE order so the
   // first bucket flushed contains the deepest-layer gradients — those are

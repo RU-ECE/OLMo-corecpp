@@ -191,6 +191,12 @@ void train_epoch(
   std::vector<torch::Tensor> ddp_params;
   if (ddp && ddp->is_distributed()) {
     for (auto& p : model->parameters()) ddp_params.push_back(p);
+    // T-1: register autograd hooks so per-bucket allreduce overlaps with
+    // backward. allreduce_gradients() at end-of-step becomes a finalize
+    // (wait + divide). For grad_accum > 1 the driver controls hook
+    // dispatch via set_sync_required() — disabled on non-final accum
+    // steps so we only collective the final summed gradient.
+    ddp->register_grad_hooks(ddp_params);
   }
 
   // Epoch tracking
@@ -403,6 +409,12 @@ void train(
   std::vector<torch::Tensor> ddp_params;
   if (ddp && ddp->is_distributed()) {
     for (auto& p : model->parameters()) ddp_params.push_back(p);
+    // T-1: register autograd hooks so per-bucket allreduce overlaps with
+    // backward. allreduce_gradients() at end-of-step becomes a finalize
+    // (wait + divide). For grad_accum > 1 the driver controls hook
+    // dispatch via set_sync_required() — disabled on non-final accum
+    // steps so we only collective the final summed gradient.
+    ddp->register_grad_hooks(ddp_params);
   }
 
   // ---- Callback manager ----
@@ -730,6 +742,12 @@ void train(
   std::vector<torch::Tensor> ddp_params;
   if (ddp && ddp->is_distributed()) {
     for (auto& p : model->parameters()) ddp_params.push_back(p);
+    // T-1: register autograd hooks so per-bucket allreduce overlaps with
+    // backward. allreduce_gradients() at end-of-step becomes a finalize
+    // (wait + divide). For grad_accum > 1 the driver controls hook
+    // dispatch via set_sync_required() — disabled on non-final accum
+    // steps so we only collective the final summed gradient.
+    ddp->register_grad_hooks(ddp_params);
   }
 
   // ---- Callback manager ----

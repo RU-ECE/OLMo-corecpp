@@ -35,7 +35,10 @@
 // ProcessGroupGloo here (CPU/TCP) but could be NCCL on GPU clusters.
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <unordered_map>
+#include <vector>
 
 namespace olmo_cpp {
 
@@ -58,7 +61,38 @@ class DDPContext {
   /// Allreduce gradients across all parameters, then divide by world_size.
   /// Net effect: each rank's `.grad` becomes the arithmetic mean of all
   /// per-rank gradients (sum-allreduce + local divide).
+  ///
+  /// Behavior depends on whether register_grad_hooks() was called:
+  ///   - With hooks: this is a "finalize" — wait on any outstanding
+  ///     bucket Works that the hooks kicked off during backward, flush
+  ///     any final partial bucket, then divide. Real overlap with
+  ///     backward happens through the hooks.
+  ///   - Without hooks: original bucketed end-of-step pass (no overlap
+  ///     with backward; still bucketed for collective pipelining).
   void allreduce_gradients(const std::vector<torch::Tensor>& parameters);
+
+  /// Register post-accumulate-grad hooks on every trainable parameter so
+  /// bucket allreduce fires DURING backward. Buckets are filled in
+  /// reverse parameter order (deeper layers first, matching backward
+  /// order). When all parameters in a bucket have accumulated their
+  /// gradient, the hook dispatches a bucket allreduce; the resulting
+  /// c10d::Work is added to pending_works_ for later wait+divide.
+  ///
+  /// Call once after model construction. With gradient accumulation, the
+  /// driver should set sync_required(false) on all but the last accum
+  /// step so the hooks skip the collective.
+  void register_grad_hooks(std::vector<torch::Tensor>& parameters,
+                           int64_t bucket_bytes = 25 * 1024 * 1024);
+
+  /// Hook-mode sync gate. When false, the registered hooks do nothing
+  /// (so per-accum-step gradient accumulation isn't reduced). Set true
+  /// before the last backward in an accumulation cycle.
+  void set_sync_required(bool on) { sync_required_ = on; }
+  bool sync_required() const { return sync_required_; }
+
+  /// True iff register_grad_hooks() has been called and a hook structure
+  /// is live. Drives the allreduce_gradients() branch.
+  bool has_hooks() const { return !hook_state_.buckets.empty(); }
 
   /// This process's rank in [0, world_size).
   int rank() const { return rank_; }
@@ -74,6 +108,25 @@ class DDPContext {
   c10::intrusive_ptr<c10d::Backend> backend_;  // c10d collective backend (Gloo).
   int rank_;          // This process's rank.
   int world_size_;    // Total number of ranks.
+
+  // ── Backward-hook bucket state (T-1) ────────────────────────────────
+  // A bucket is a fixed-size group of consecutive parameters (in reverse
+  // creation order — deeper layers first). Each parameter's hook sets a
+  // bit in its bucket's `ready` mask; when the mask hits all-ones, the
+  // hook dispatches an allreduce over the bucket's gradient list and
+  // records the c10::Work in pending_works_ for finalize-time wait.
+  struct Bucket {
+    std::vector<at::Tensor> grads;  // populated as hooks fire
+    int64_t total_count = 0;        // expected fill count
+    int64_t ready_count = 0;        // current fill count
+  };
+  struct HookState {
+    std::vector<Bucket> buckets;
+    std::vector<c10::intrusive_ptr<c10d::Work>> pending_works;
+    std::mutex mu;
+  };
+  HookState hook_state_;
+  bool sync_required_ = true;
 };
 
 }  // namespace olmo_cpp

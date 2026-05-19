@@ -37,4 +37,7 @@ void DDPContext::broadcast_parameters(std::vector<torch::Tensor>& /*parameters*/
 
 void DDPContext::allreduce_gradients(const std::vector<torch::Tensor>& /*parameters*/) {}
 
+void DDPContext::register_grad_hooks(std::vector<torch::Tensor>& /*parameters*/,
+                                      int64_t /*bucket_bytes*/) {}
+
 }  // namespace olmo_cpp

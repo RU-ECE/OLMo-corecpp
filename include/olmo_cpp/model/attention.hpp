@@ -34,6 +34,7 @@
 #include "olmo_cpp/config.hpp"
 #include "olmo_cpp/model/kv_cache.hpp"
 #include "olmo_cpp/model/layer_norm.hpp"
+#include "olmo_cpp/model/paged_kv_cache.hpp"
 #include "olmo_cpp/model/rope.hpp"
 #include <torch/torch.h>
 #include <optional>
@@ -61,6 +62,20 @@ class AttentionImpl : public torch::nn::Module {
       const RoPEBuffers* rope_bufs = nullptr,
       std::optional<int64_t> start_pos = std::nullopt,
       LayerKVCache* layer_cache = nullptr);
+
+  /// Paged-KV variant of forward. Mirrors `forward` exactly except that the
+  /// per-layer K/V append/materialize goes through `paged` at `layer_idx`
+  /// instead of a LayerKVCache. Currently still uses ATen SDPA on the
+  /// materialized K/V views — the dedicated paged-attention decode kernel
+  /// (kernels/paged_attention.cu) can be wired in once dtype handling and
+  /// batched-q support are finalised. Decode-only call site; expects
+  /// `paged != nullptr`.
+  torch::Tensor forward_paged(
+      torch::Tensor x,
+      const RoPEBuffers* rope_bufs,
+      int64_t start_pos,
+      IPagedKVCache* paged,
+      int64_t layer_idx);
 
  private:
   /// Q projection: [d_model] -> [n_heads * head_dim].

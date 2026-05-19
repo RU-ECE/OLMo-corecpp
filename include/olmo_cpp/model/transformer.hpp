@@ -42,6 +42,7 @@
 #include "olmo_cpp/model/layer_norm.hpp"
 #include "olmo_cpp/model/lm_head.hpp"
 #include "olmo_cpp/model/mtp_head.hpp"
+#include "olmo_cpp/model/paged_kv_cache.hpp"
 #include "olmo_cpp/nn/multi_res_embedding.hpp"
 #include <torch/torch.h>
 #include <optional>
@@ -79,6 +80,21 @@ class TransformerImpl : public torch::nn::Module {
   torch::Tensor forward_backbone(
       torch::Tensor input_ids,
       KVCache* kv_cache = nullptr);
+
+  /// Paged-KV variant of forward_backbone. Threads an IPagedKVCache through
+  /// the block stack via ReorderedNormTransformerBlock::forward_paged.
+  /// Inference path only — no activation checkpointing.
+  torch::Tensor forward_backbone_paged(
+      torch::Tensor input_ids,
+      IPagedKVCache* paged);
+
+  /// Paged-KV variant of forward. Inference path only: returns logits over the
+  /// vocab. No labels / no MTP loss path here — the legacy `forward` covers
+  /// training. Decode call sites should prefer this once they construct a
+  /// PagedKVCache via `make_paged_kv_cache`.
+  torch::Tensor forward_paged(
+      torch::Tensor input_ids,
+      IPagedKVCache* paged);
 
   /// Apply truncated-normal init to all parameters with model-specific
   /// scaling (separate stds for embeddings vs. blocks vs. LM head).

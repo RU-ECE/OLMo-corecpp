@@ -75,4 +75,19 @@ torch::Tensor ReorderedNormTransformerBlockImpl::forward(
   return out;
 }
 
+torch::Tensor ReorderedNormTransformerBlockImpl::forward_paged(
+    torch::Tensor x,
+    const RoPEBuffers* rope_bufs,
+    int64_t start_pos,
+    IPagedKVCache* paged,
+    int64_t layer_idx) {
+  auto& backend = get_backend();
+  backend.begin_scope();
+  auto attn_out = attention_->forward_paged(x, rope_bufs, start_pos, paged, layer_idx);
+  auto h = attention_norm_->forward_add(attn_out, x);
+  auto out = feed_forward_norm_->forward_add(feed_forward_(h), h);
+  backend.end_scope();
+  return out;
+}
+
 }  // namespace olmo_cpp

@@ -213,6 +213,39 @@ torch::Tensor TransformerImpl::forward_backbone(
   return h;
 }
 
+torch::Tensor TransformerImpl::forward_backbone_paged(
+    torch::Tensor input_ids,
+    IPagedKVCache* paged) {
+  TORCH_CHECK(paged != nullptr, "forward_backbone_paged: paged is null");
+
+  auto h = use_multi_res_
+      ? multi_res_embed_->forward(input_ids)
+      : embeddings_(input_ids);
+  if (embed_scale_ && !use_multi_res_) {
+    h = h * *embed_scale_;
+  }
+  h = (*embedding_norm_)(h);
+
+  const auto new_seq_len = input_ids.size(1);
+  const auto device      = input_ids.device();
+  const int64_t cached_len = paged->seq_len();
+  const int64_t total_len  = cached_len + new_seq_len;
+  const auto& rope_bufs = get_rope_buffers(total_len, device, h.dtype().toScalarType());
+
+  for (int64_t i = 0; i < config_.n_layers; ++i) {
+    auto block = blocks_->ptr<ReorderedNormTransformerBlockImpl>(i);
+    h = block->forward_paged(h, &rope_bufs[i], cached_len, paged, i);
+  }
+  return h;
+}
+
+torch::Tensor TransformerImpl::forward_paged(
+    torch::Tensor input_ids,
+    IPagedKVCache* paged) {
+  auto h = forward_backbone_paged(input_ids, paged);
+  return lm_head_(h);
+}
+
 torch::Tensor TransformerImpl::forward(
     torch::Tensor input_ids,
     c10::optional<torch::Tensor> labels,

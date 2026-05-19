@@ -150,4 +150,85 @@ torch::Tensor AttentionImpl::forward(
   return w_out_(attn_out);
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// Paged-KV variant. Differs from `forward` only in cache I/O — the rest of
+// the path (projections, QK-norm, RoPE, GQA expand, sliding-window mask,
+// SDPA) is identical. Kept as a parallel function so the legacy concat
+// path stays untouched.
+// ──────────────────────────────────────────────────────────────────────────
+torch::Tensor AttentionImpl::forward_paged(
+    torch::Tensor x,
+    const RoPEBuffers* rope_bufs,
+    int64_t start_pos,
+    IPagedKVCache* paged,
+    int64_t layer_idx) {
+  TORCH_CHECK(paged != nullptr, "AttentionImpl::forward_paged: paged is null");
+
+  auto B = x.size(0);
+  auto S = x.size(1);
+
+  auto q = w_q_(x);
+  auto k = w_k_(x);
+  auto v = w_v_(x);
+
+  if (q_norm_ && !use_head_qk_norm_) q = (*q_norm_)(q);
+  if (k_norm_ && !use_head_qk_norm_) k = (*k_norm_)(k);
+
+  q = q.view({B, S, n_heads_, head_dim_}).transpose(1, 2);
+  k = k.view({B, S, n_kv_heads_, head_dim_}).transpose(1, 2);
+  v = v.view({B, S, n_kv_heads_, head_dim_}).transpose(1, 2);
+
+  if (q_norm_ && use_head_qk_norm_) q = (*q_norm_)(q);
+  if (k_norm_ && use_head_qk_norm_) k = (*k_norm_)(k);
+
+  if (rope_bufs) {
+    auto [q_rot, k_rot] = (*rope_)->apply(q, k, *rope_bufs, std::optional<int64_t>(start_pos));
+    q = q_rot;
+    k = k_rot;
+  }
+
+  // Append new K/V into the page pool, then materialize the full cached
+  // K/V as contiguous [B, n_kv_heads, total_len, head_dim] views.
+  paged->append(layer_idx, k, v);
+  auto [full_k, full_v] = paged->materialize(layer_idx);
+  k = full_k;
+  v = full_v;
+
+  if (n_heads_rep_ > 1) {
+    auto kS = k.size(2);
+    k = k.unsqueeze(2).expand({B, n_kv_heads_, n_heads_rep_, kS, head_dim_}).reshape({B, n_heads_, kS, head_dim_});
+    v = v.unsqueeze(2).expand({B, n_kv_heads_, n_heads_rep_, kS, head_dim_}).reshape({B, n_heads_, kS, head_dim_});
+  }
+
+  const int64_t total_S = k.size(2);
+  // Same is_causal heuristic as forward(): use built-in causal when the new
+  // sequence covers the entire cached range (prefill); otherwise rely on the
+  // append order (no explicit mask needed for decode).
+  bool is_causal = (S > 1) && (total_S == S);
+
+  torch::Tensor attn_out;
+  if (sliding_window_size_ > 0 && S > 1) {
+    if (S != cached_mask_S_ || total_S != cached_mask_full_S_) {
+      const auto offset = total_S - S;
+      auto bool_opts = torch::TensorOptions().dtype(torch::kBool).device(x.device());
+      auto ones      = torch::ones({S, total_S}, bool_opts);
+      auto allowed   = torch::tril(ones, offset)
+                         & torch::triu(ones, offset - sliding_window_size_);
+      auto mask_opts = torch::TensorOptions().dtype(x.dtype()).device(x.device());
+      cached_attn_mask_ = torch::where(
+          allowed,
+          torch::zeros({}, mask_opts),
+          torch::full({}, -std::numeric_limits<float>::infinity(), mask_opts));
+      cached_mask_S_      = S;
+      cached_mask_full_S_ = total_S;
+    }
+    attn_out = at::scaled_dot_product_attention(q, k, v, cached_attn_mask_, 0.0, false);
+  } else {
+    attn_out = at::scaled_dot_product_attention(q, k, v, c10::nullopt, 0.0, is_causal);
+  }
+
+  attn_out = attn_out.transpose(1, 2).reshape({B, S, -1});
+  return w_out_(attn_out);
+}
+
 }  // namespace olmo_cpp

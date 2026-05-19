@@ -35,6 +35,7 @@
 #include "olmo_cpp/model/feed_forward.hpp"
 #include "olmo_cpp/model/kv_cache.hpp"
 #include "olmo_cpp/model/layer_norm.hpp"
+#include "olmo_cpp/model/paged_kv_cache.hpp"
 #include "olmo_cpp/model/rope.hpp"
 #include <torch/torch.h>
 #include <optional>
@@ -57,6 +58,15 @@ class ReorderedNormTransformerBlockImpl : public torch::nn::Module {
       const RoPEBuffers* rope_bufs = nullptr,
       std::optional<int64_t> start_pos = std::nullopt,
       LayerKVCache* layer_cache = nullptr);
+
+  /// Paged-KV variant: same reordered-norm residual pattern, but attention's
+  /// per-layer K/V append/materialize goes through `paged` at `layer_idx`.
+  torch::Tensor forward_paged(
+      torch::Tensor x,
+      const RoPEBuffers* rope_bufs,
+      int64_t start_pos,
+      IPagedKVCache* paged,
+      int64_t layer_idx);
 
  private:
   /// Self-attention sublayer.

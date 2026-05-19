@@ -61,6 +61,7 @@
 #include "olmo_cpp/config.hpp"
 #include "olmo_cpp/model/transformer.hpp"
 #include "olmo_cpp/model/kv_cache.hpp"
+#include "olmo_cpp/model/paged_kv_cache.hpp"
 #include "olmo_cpp/backend/cuda_graph.hpp"
 #include "olmo_cpp/data/bpe_tokenizer.hpp"
 #include "olmo_cpp/data/structural_tokenizer.hpp"
@@ -603,6 +604,13 @@ int main(int argc, char** argv) {
   std::string draft_config_path;
   std::string structural_config;
 
+  // fast-inference [1]: paged KV cache (BlockManager-backed) on the
+  // non-speculative decode path. Stable layout precondition for whole-step
+  // CUDA graph capture (item [2]) and continuous batching (item [3]).
+  bool use_paged_kv = false;
+  int64_t paged_page_size = 16;
+  int64_t paged_max_seq   = 2048;
+
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
     if (arg == "--checkpoint" && i + 1 < argc) checkpoint_path = argv[++i];
@@ -628,6 +636,11 @@ int main(int argc, char** argv) {
       draft_checkpoint_path = argv[++i];
     else if (arg == "--draft-config" && i + 1 < argc)
       draft_config_path = argv[++i];
+    else if (arg == "--paged-kv") use_paged_kv = true;
+    else if (arg == "--page-size" && i + 1 < argc)
+      paged_page_size = std::stoll(argv[++i]);
+    else if (arg == "--paged-max-seq" && i + 1 < argc)
+      paged_max_seq = std::stoll(argv[++i]);
   }
 
   if (checkpoint_path.empty() || config_path.empty() || vocab_path.empty() || merges_path.empty()) {
@@ -651,7 +664,11 @@ int main(int argc, char** argv) {
               << "  --persistent-decode        (route greedy/temp sampling through the\n"
               << "                              persistent-decode handle; stub for now)\n"
               << "  --draft-checkpoint <path>  (draft model .pt for two-model speculative)\n"
-              << "  --draft-config <path>      (draft model JSON config)\n";
+              << "  --draft-config <path>      (draft model JSON config)\n"
+              << "  --paged-kv                 (use paged KV cache on non-speculative decode;\n"
+              << "                              required precondition for whole-step CUDA graphs)\n"
+              << "  --page-size <n>            (paged KV page size in tokens; default 16)\n"
+              << "  --paged-max-seq <n>        (paged KV cap on cached seq length; default 2048)\n";
     return 1;
   }
 
@@ -966,6 +983,56 @@ int main(int argc, char** argv) {
                   << "speculative, " << std::setprecision(0) << accept_rate << "% accepted]\n"
                   << std::endl;
         continue;  // skip the generic stats block below
+      } else if (use_kv_cache && use_paged_kv) {
+        // fast-inference [1]: paged KV cache. Replaces the concat KVCache
+        // on the decode path. Memory layout is stable (per-layer page pools
+        // pre-allocated by BlockManager), unblocking whole-step CUDA graph
+        // capture (item [2]) and continuous batching (item [3]).
+        const int64_t n_kv_heads = cfg.get_n_kv_heads();
+        const int64_t head_dim   = cfg.get_head_dim();
+        const int64_t max_pages  = (paged_max_seq + paged_page_size - 1) / paged_page_size;
+        // dtype: match the model's first parameter, which already reflects
+        // any post-load .to(dtype) the user did. Fallback to fp32.
+        auto model_dtype = torch::kFloat32;
+        if (!model->parameters().empty()) {
+          model_dtype = model->parameters()[0].dtype().toScalarType();
+        }
+        auto paged = olmo_cpp::make_paged_kv_cache(
+            model->n_layers(), n_kv_heads, head_dim,
+            paged_page_size, max_pages, device, model_dtype);
+
+        // Prefill.
+        {
+          auto input = torch::from_blob(all_tokens.data(), {1, prompt_len},
+                                        torch::TensorOptions().dtype(torch::kInt64))
+                           .clone()
+                           .to(device);
+          torch::NoGradGuard no_grad;
+          auto logits = model->forward_paged(input, paged.get());
+          auto next_logits = logits.select(1, logits.size(1) - 1).squeeze(0);
+          int64_t next_id = sample_logits(next_logits, temperature, top_k, top_p,
+                                          all_tokens, repetition_penalty, rng);
+          all_tokens.push_back(next_id);
+          std::vector<uint32_t> tok_to_decode = {static_cast<uint32_t>(next_id)};
+          std::cout << decode_tokens(tok_to_decode) << std::flush;
+          tokens_generated++;
+        }
+        // Incremental decode: feed one token at a time.
+        for (int64_t step = prompt_len + 1; step < max_total; ++step) {
+          int64_t last_token = all_tokens.back();
+          if (last_token == static_cast<int64_t>(tokenizer.eos_id())) break;
+          auto input = torch::tensor({last_token}, torch::kInt64).unsqueeze(0).to(device);
+          torch::NoGradGuard no_grad;
+          auto logits = model->forward_paged(input, paged.get());
+          auto next_logits = logits.select(1, logits.size(1) - 1).squeeze(0);
+          int64_t next_id = sample_logits(next_logits, temperature, top_k, top_p,
+                                          all_tokens, repetition_penalty, rng);
+          all_tokens.push_back(next_id);
+          if (next_id == static_cast<int64_t>(tokenizer.eos_id())) break;
+          std::vector<uint32_t> tok_to_decode = {static_cast<uint32_t>(next_id)};
+          std::cout << decode_tokens(tok_to_decode) << std::flush;
+          tokens_generated++;
+        }
       } else if (use_kv_cache) {
         // KV cache path: prefill + incremental decode
         // CUDA graphs capture the decode step (always [1,1] input) for zero launch overhead

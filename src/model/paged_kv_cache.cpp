@@ -97,7 +97,17 @@ class PagedKVCache : public IPagedKVCache {
       : mgr_(n_layers, n_kv_heads, head_dim, page_size, max_pages, device, dtype),
         n_layers_(n_layers),
         page_size_(page_size),
-        device_(device) {}
+        max_pages_(max_pages),
+        device_(device) {
+    // Stable-address mirrors of the host-side cursor + page table. The
+    // capture-friendly kernel (paged_attention_decode_dyn) reads from
+    // these tensors at launch time; storage must outlive any captured
+    // CUDA graph that holds the pointers, so we allocate once and update
+    // in place.
+    auto i32_opts = torch::TensorOptions().dtype(torch::kInt32).device(device_);
+    page_table_t_ = torch::zeros({max_pages}, i32_opts);
+    n_tokens_t_   = torch::zeros({}, i32_opts);
+  }
 
   int64_t seq_len() const override { return logical_len_; }
 
@@ -123,8 +133,12 @@ class PagedKVCache : public IPagedKVCache {
       const int64_t blocks_current = static_cast<int64_t>(mgr_.page_table().size());
       if (blocks_needed > blocks_current) {
         mgr_.allocate(blocks_needed - blocks_current);
+        sync_page_table_tensor_(blocks_current, blocks_needed);
       }
       logical_len_ = step_end;
+      // Mirror the new seq_len into the device-side stable scalar so the
+      // capture-friendly kernel sees the right bound on its next launch.
+      write_n_tokens_(static_cast<int32_t>(logical_len_));
     } else {
       step_end = logical_len_;
       step_start = step_end - S;
@@ -153,11 +167,13 @@ class PagedKVCache : public IPagedKVCache {
     // Pages stay allocated; subsequent appends will overwrite the rolled-back
     // slots. Cheap (just a cursor move) — matches LayerKVCache::truncate.
     logical_len_ = len;
+    write_n_tokens_(static_cast<int32_t>(logical_len_));
   }
 
   void clear() override {
     mgr_.free_all();
     logical_len_ = 0;
+    write_n_tokens_(0);
   }
 
   // ── Kernel-facing accessors (consumed by paged_attention_decode) ───────
@@ -176,19 +192,49 @@ class PagedKVCache : public IPagedKVCache {
   }
 
   torch::Tensor page_table_tensor() const override {
-    const auto& pt = mgr_.page_table();
-    const int64_t n = static_cast<int64_t>(pt.size());
-    if (n == 0) {
-      return torch::empty({0}, torch::TensorOptions().dtype(torch::kInt32).device(device_));
-    }
-    // pt holds int32 values; from_blob over them, clone-and-move to device.
-    auto opts_cpu = torch::TensorOptions().dtype(torch::kInt32);
-    return torch::from_blob(const_cast<int32_t*>(pt.data()), {n}, opts_cpu)
-        .clone()
-        .to(device_);
+    // Variable-length view of the stable buffer. Length = current block
+    // count. Safe for use cases that do not need graph capture.
+    const int64_t n = static_cast<int64_t>(mgr_.page_table().size());
+    return page_table_t_.narrow(0, 0, n);
+  }
+
+  torch::Tensor page_table_tensor_stable() const override { return page_table_t_; }
+  torch::Tensor n_tokens_tensor() const override        { return n_tokens_t_; }
+  int64_t block_count() const override {
+    return static_cast<int64_t>(mgr_.page_table().size());
   }
 
  private:
+  void sync_page_table_tensor_(int64_t old_blocks, int64_t new_blocks) {
+    // Copy any newly-allocated page indices from the host vector into the
+    // stable device tensor. Pages already mirrored stay put.
+    const auto& pt = mgr_.page_table();
+    const int64_t n_new = new_blocks - old_blocks;
+    if (n_new <= 0) return;
+    std::vector<int32_t> tmp(static_cast<size_t>(n_new));
+    for (int64_t i = 0; i < n_new; ++i) {
+      tmp[static_cast<size_t>(i)] = pt[static_cast<size_t>(old_blocks + i)];
+    }
+    auto opts_cpu = torch::TensorOptions().dtype(torch::kInt32);
+    auto src = torch::from_blob(tmp.data(), {n_new}, opts_cpu).clone();
+    page_table_t_.narrow(0, old_blocks, n_new).copy_(src.to(device_));
+  }
+
+  void write_n_tokens_(int32_t v) {
+    // CPU-only fast path: write_ into the underlying storage. On CUDA the
+    // .fill_() is enough (issues an async memset/H2D under the hood); the
+    // value is visible to the next kernel launch on the same stream.
+    if (device_.is_cpu()) {
+      n_tokens_t_.fill_(v);
+    } else {
+      // Stage on host to keep the fill on this stream's allocator; .fill_
+      // with a Python int works on CUDA too without going through a host
+      // intermediate, but we avoid scalar-via-PyObject overhead.
+      auto staging = torch::tensor(v, torch::TensorOptions().dtype(torch::kInt32));
+      n_tokens_t_.copy_(staging.to(device_, /*non_blocking=*/true));
+    }
+  }
+
   void write_layer_slots_(int64_t layer,
                           torch::Tensor k,
                           torch::Tensor v,
@@ -264,8 +310,14 @@ class PagedKVCache : public IPagedKVCache {
   BlockManager mgr_;
   int64_t n_layers_;
   int64_t page_size_;
+  int64_t max_pages_;
   int64_t logical_len_ = 0;
   torch::Device device_;
+  // Stable-address mirrors for graph-capture-friendly launches. Updated
+  // in place — never reallocated — so any captured kernel launch holds a
+  // valid device pointer across replays.
+  torch::Tensor page_table_t_;
+  torch::Tensor n_tokens_t_;
 };
 
 }  // namespace

@@ -88,4 +88,39 @@ torch::Tensor paged_attention_decode(
   return paged_attention_decode_cpu(q, k_pool, v_pool, page_table, n_tokens, sm_scale);
 }
 
+// ── Graph-capture-friendly variant ────────────────────────────────────────
+//
+// CPU reference reads the scalar tensor value once and delegates to the
+// existing static-n_tokens CPU path. The "dyn" suffix is meaningful on the
+// CUDA path, where the kernel reads from a device pointer to keep the
+// captured graph correct as n_tokens advances.
+
+torch::Tensor paged_attention_decode_dyn_cpu(
+    torch::Tensor q,
+    torch::Tensor k_pool,
+    torch::Tensor v_pool,
+    torch::Tensor page_table,
+    torch::Tensor n_tokens,
+    float sm_scale) {
+  TORCH_CHECK(n_tokens.is_cpu(), "paged_attention_decode_dyn_cpu: n_tokens must be CPU");
+  TORCH_CHECK(n_tokens.numel() == 1, "paged_attention_decode_dyn_cpu: n_tokens must be a scalar");
+  const int64_t n = static_cast<int64_t>(n_tokens.to(torch::kInt64).item<int64_t>());
+  return paged_attention_decode_cpu(q, k_pool, v_pool, page_table, n, sm_scale);
+}
+
+torch::Tensor paged_attention_decode_dyn(
+    torch::Tensor q,
+    torch::Tensor k_pool,
+    torch::Tensor v_pool,
+    torch::Tensor page_table,
+    torch::Tensor n_tokens,
+    float sm_scale) {
+#ifdef OLMO_HAS_CUDA_KERNELS
+  if (q.is_cuda()) {
+    return paged_attention_decode_dyn_cuda(q, k_pool, v_pool, page_table, n_tokens, sm_scale);
+  }
+#endif
+  return paged_attention_decode_dyn_cpu(q, k_pool, v_pool, page_table, n_tokens, sm_scale);
+}
+
 }  // namespace olmo_cpp

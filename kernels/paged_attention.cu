@@ -34,7 +34,11 @@ constexpr int kMaxWarps = (kThreads + 31) >> 5;
 // One block per (q_head, batch=1). Each block streams over n_tokens
 // cached positions, gathering K/V from pages via the page table, and
 // online-softmaxes the result. Output one row of [n_q_heads, head_dim].
-__global__ void paged_attention_decode_kernel(
+//
+// The internal kernel body is shared between the static-n_tokens launcher
+// and the graph-capture-friendly launcher; the only difference is whether
+// n_tokens is a kernel arg or read from device memory at kernel entry.
+__device__ __forceinline__ void paged_attention_decode_body(
     const float* __restrict__ q,           // [n_q_heads, head_dim]
     const float* __restrict__ k_pool,      // [max_pages, page_size, n_kv_heads, head_dim]
     const float* __restrict__ v_pool,      // same
@@ -149,6 +153,49 @@ __global__ void paged_attention_decode_kernel(
   }
 }
 
+// Static-n_tokens launcher (legacy API; n_tokens captured at launch time).
+__global__ void paged_attention_decode_kernel(
+    const float* __restrict__ q,
+    const float* __restrict__ k_pool,
+    const float* __restrict__ v_pool,
+    const int32_t* __restrict__ page_table,
+    int64_t n_tokens,
+    int n_q_heads, int n_kv_heads, int head_dim,
+    int page_size, int max_pages, float sm_scale,
+    float* __restrict__ out
+) {
+  paged_attention_decode_body(q, k_pool, v_pool, page_table,
+                              n_tokens, n_q_heads, n_kv_heads, head_dim,
+                              page_size, max_pages, sm_scale, out);
+}
+
+// Graph-capture-friendly launcher: reads n_tokens from device memory at
+// kernel entry. The captured graph's launch parameters reference the
+// device pointer, not the value, so each replay sees whatever the caller
+// wrote into `*n_tokens_ptr` between replays — no re-capture needed as
+// the cache grows.
+__global__ void paged_attention_decode_kernel_dyn(
+    const float* __restrict__ q,
+    const float* __restrict__ k_pool,
+    const float* __restrict__ v_pool,
+    const int32_t* __restrict__ page_table,
+    const int32_t* __restrict__ n_tokens_ptr,
+    int n_q_heads, int n_kv_heads, int head_dim,
+    int page_size, int max_pages, float sm_scale,
+    float* __restrict__ out
+) {
+  // Single read per block; all threads see the same value.
+  __shared__ int n_tokens_shared;
+  if (threadIdx.x == 0) {
+    n_tokens_shared = *n_tokens_ptr;
+  }
+  __syncthreads();
+  paged_attention_decode_body(q, k_pool, v_pool, page_table,
+                              static_cast<int64_t>(n_tokens_shared),
+                              n_q_heads, n_kv_heads, head_dim,
+                              page_size, max_pages, sm_scale, out);
+}
+
 }  // namespace
 
 torch::Tensor paged_attention_decode_cuda(
@@ -187,6 +234,54 @@ torch::Tensor paged_attention_decode_cuda(
       v_c.data_ptr<float>(),
       pt.data_ptr<int32_t>(),
       n_tokens, n_q_heads, n_kv_heads, head_dim,
+      page_size, max_pages, sm_scale,
+      out.data_ptr<float>());
+
+  return out.to(q.dtype());
+}
+
+// Graph-capture-friendly launcher. Mirrors paged_attention_decode_cuda
+// exactly except for the dynamic n_tokens read.
+torch::Tensor paged_attention_decode_dyn_cuda(
+    torch::Tensor q,
+    torch::Tensor k_pool,
+    torch::Tensor v_pool,
+    torch::Tensor page_table,
+    torch::Tensor n_tokens,
+    float sm_scale) {
+  TORCH_CHECK(q.is_cuda() && k_pool.is_cuda() && v_pool.is_cuda() && page_table.is_cuda(),
+              "paged_attention_decode_dyn_cuda: all tensors must be CUDA");
+  TORCH_CHECK(n_tokens.is_cuda(), "n_tokens must live on the same CUDA device as q");
+  TORCH_CHECK(n_tokens.scalar_type() == torch::kInt32, "n_tokens must be int32");
+  TORCH_CHECK(n_tokens.numel() == 1, "n_tokens must be a scalar");
+  TORCH_CHECK(q.dim() == 2, "q must be [n_q_heads, head_dim]");
+  TORCH_CHECK(k_pool.dim() == 4, "k_pool must be [max_pages, page_size, n_kv_heads, head_dim]");
+  TORCH_CHECK(v_pool.dim() == 4, "v_pool must be [max_pages, page_size, n_kv_heads, head_dim]");
+
+  c10::cuda::CUDAGuard guard(q.device());
+
+  auto q_c  = q.contiguous().to(torch::kFloat32);
+  auto k_c  = k_pool.contiguous().to(torch::kFloat32);
+  auto v_c  = v_pool.contiguous().to(torch::kFloat32);
+  auto pt   = page_table.contiguous().to(torch::kInt32);
+  auto nt   = n_tokens.contiguous();
+
+  const int n_q_heads  = static_cast<int>(q_c.size(0));
+  const int head_dim   = static_cast<int>(q_c.size(1));
+  const int max_pages  = static_cast<int>(k_c.size(0));
+  const int page_size  = static_cast<int>(k_c.size(1));
+  const int n_kv_heads = static_cast<int>(k_c.size(2));
+
+  auto out = torch::empty({n_q_heads, head_dim}, q_c.options());
+  const size_t shmem = static_cast<size_t>(2 * head_dim + kMaxWarps) * sizeof(float);
+
+  paged_attention_decode_kernel_dyn<<<n_q_heads, kThreads, shmem>>>(
+      q_c.data_ptr<float>(),
+      k_c.data_ptr<float>(),
+      v_c.data_ptr<float>(),
+      pt.data_ptr<int32_t>(),
+      nt.data_ptr<int32_t>(),
+      n_q_heads, n_kv_heads, head_dim,
       page_size, max_pages, sm_scale,
       out.data_ptr<float>());
 

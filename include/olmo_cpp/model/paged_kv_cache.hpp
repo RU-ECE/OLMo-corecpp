@@ -92,9 +92,33 @@ class IPagedKVCache {
   /// Page table as a 1-D int32 tensor on the cache's device, length =
   /// number of currently allocated blocks. The kernel walks it as
   /// logical_block_idx -> physical_page_idx.
+  ///
+  /// For graph-capture use, prefer page_table_tensor_stable() — that
+  /// variant returns a tensor with fixed storage so the captured launch
+  /// holds a valid pointer across replays even as new pages are added.
   virtual torch::Tensor page_table_tensor() const {
     throw std::runtime_error("page_table_tensor() not supported on this IPagedKVCache impl");
   }
+
+  /// Stable-address page table view sized for the worst case. The first
+  /// `block_count()` entries are valid; the kernel relies on the n_tokens
+  /// scalar to bound its iteration so the unused tail does not matter.
+  /// Required if the caller wants to capture the decode launch in a CUDA
+  /// graph (storage must stay put across replays).
+  virtual torch::Tensor page_table_tensor_stable() const {
+    return page_table_tensor();
+  }
+
+  /// 0-D int32 tensor on the cache's device whose value is the current
+  /// seq_len(). Storage stays put across appends — only the value gets
+  /// written in place. Pair with paged_attention_decode_dyn.
+  virtual torch::Tensor n_tokens_tensor() const {
+    throw std::runtime_error("n_tokens_tensor() not supported on this IPagedKVCache impl");
+  }
+
+  /// Number of pages currently in use (= length of the valid prefix of
+  /// page_table_tensor_stable()).
+  virtual int64_t block_count() const { return 0; }
 };
 
 /// Construct a paged KV cache backed by the existing concat KVCache.

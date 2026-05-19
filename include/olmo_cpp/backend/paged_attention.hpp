@@ -62,4 +62,40 @@ torch::Tensor paged_attention_decode_cpu(
     int64_t n_tokens,
     float sm_scale);
 
+// ── Graph-capture-friendly variant ────────────────────────────────────────
+//
+// Identical contract to paged_attention_decode, but `n_tokens` is a 0-D
+// int32 tensor on the same device. The CUDA kernel reads `*n_tokens_ptr` at
+// launch time, so the captured graph stays correct as the cache grows: the
+// caller updates the scalar tensor between replays, the same launched
+// kernel reads the new value, no recapture needed.
+//
+// Required precondition for whole-step CUDA graph capture of the decode
+// step. CPU reference exists for validation parity.
+torch::Tensor paged_attention_decode_dyn(
+    torch::Tensor q,
+    torch::Tensor k_pool,
+    torch::Tensor v_pool,
+    torch::Tensor page_table,
+    torch::Tensor n_tokens,   // 0-D int32 on the same device
+    float sm_scale);
+
+#ifdef OLMO_HAS_CUDA_KERNELS
+torch::Tensor paged_attention_decode_dyn_cuda(
+    torch::Tensor q,
+    torch::Tensor k_pool,
+    torch::Tensor v_pool,
+    torch::Tensor page_table,
+    torch::Tensor n_tokens,
+    float sm_scale);
+#endif
+
+torch::Tensor paged_attention_decode_dyn_cpu(
+    torch::Tensor q,
+    torch::Tensor k_pool,
+    torch::Tensor v_pool,
+    torch::Tensor page_table,
+    torch::Tensor n_tokens,
+    float sm_scale);
+
 }  // namespace olmo_cpp

@@ -243,6 +243,11 @@ set(OLMO_SOURCES
 option(OLMO_USE_ADVANCED_PARALLEL
        "Build pipeline / FSDP / context / expert parallel (off; stubs only)" OFF)
 
+# zero1 is always compiled: with no backend it falls through to a no-op
+# pass-through partition + allgather, so call sites work in single-rank
+# mode without conditional compilation.
+list(APPEND OLMO_SOURCES src/distributed/zero1.cpp)
+
 if(OLMO_USE_DDP AND GLOO_INCLUDE_DIR)
     list(APPEND OLMO_SOURCES
         src/distributed/ddp.cpp

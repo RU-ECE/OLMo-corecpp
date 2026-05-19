@@ -129,7 +129,14 @@ class PagedKVCache : public IPagedKVCache {
     // Layer 0 is the "leader": it allocates any new pages and advances the
     // cursor. Layers 1..N-1 just write into the slots that layer 0 reserved.
     int64_t step_start, step_end;
-    if (layer == 0) {
+    if (external_advance_) {
+      // Cursor was bumped by the caller (typically right before a CUDA
+      // graph replay). All layers in this step use the same slot range.
+      step_end = logical_len_;
+      step_start = step_end - S;
+      TORCH_CHECK(step_start >= 0,
+                  "PagedKVCache: external_advance=true but cursor not advanced for this step");
+    } else if (layer == 0) {
       step_start = logical_len_;
       step_end = logical_len_ + S;
       const int64_t blocks_needed = (step_end + page_size_ - 1) / page_size_;
@@ -152,6 +159,24 @@ class PagedKVCache : public IPagedKVCache {
     write_layer_slots_(layer, k, v, step_start, step_end);
     return logical_len_;
   }
+
+  // ── Graph-capture-friendly split: cursor advance separate from write ──
+  int64_t advance_cursor(int64_t S) override {
+    if (S <= 0) return logical_len_;
+    const int64_t new_len = logical_len_ + S;
+    const int64_t blocks_needed = (new_len + page_size_ - 1) / page_size_;
+    const int64_t blocks_current = static_cast<int64_t>(mgr_.page_table().size());
+    if (blocks_needed > blocks_current) {
+      mgr_.allocate(blocks_needed - blocks_current);
+      sync_page_table_tensor_(blocks_current, blocks_needed);
+    }
+    logical_len_ = new_len;
+    write_n_tokens_(static_cast<int32_t>(logical_len_));
+    return logical_len_;
+  }
+
+  void set_external_advance(bool on) override { external_advance_ = on; }
+  bool external_advance() const override { return external_advance_; }
 
   std::pair<torch::Tensor, torch::Tensor> materialize(int64_t layer) const override {
     TORCH_CHECK(layer >= 0 && layer < n_layers_,
@@ -334,6 +359,7 @@ class PagedKVCache : public IPagedKVCache {
   int64_t logical_len_ = 0;
   torch::Device device_;
   bool use_dyn_write_ = false;
+  bool external_advance_ = false;
   // Stable-address mirrors for graph-capture-friendly launches. Updated
   // in place — never reallocated — so any captured kernel launch holds a
   // valid device pointer across replays.

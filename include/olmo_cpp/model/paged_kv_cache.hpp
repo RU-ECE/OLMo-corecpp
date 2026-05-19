@@ -119,6 +119,41 @@ class IPagedKVCache {
   /// Number of pages currently in use (= length of the valid prefix of
   /// page_table_tensor_stable()).
   virtual int64_t block_count() const { return 0; }
+
+  // ── Split append for CUDA-graph capture ────────────────────────────────
+  // append() does two things: (a) advance the cursor (host bookkeeping +
+  // allocate pages + bump n_tokens_t_) and (b) launch the K/V write
+  // kernel. In a captured graph, (a) runs once at capture time and is
+  // never re-run; (b) re-runs on every replay. For replays to write to
+  // the correct slot, the kernel must compute its destination from
+  // n_tokens_t_ at launch — and n_tokens_t_ must be advanced externally
+  // between replays.
+  //
+  // To enable that, two pieces of API:
+  //   1. advance_cursor(S): host-only update. Bumps logical_len_,
+  //      allocates pages, writes new n_tokens_t_. No kernel launch.
+  //   2. external_advance mode: when set, append() skips its internal
+  //      cursor advance and just runs the K/V write. The caller is
+  //      responsible for calling advance_cursor before each forward.
+  //
+  // When external_advance is OFF (default), append() is the all-in-one
+  // call described above and behavior is unchanged.
+
+  /// Bump the cursor by S without launching any K/V writes. Allocates
+  /// new pages if needed and refreshes the device-side n_tokens scalar.
+  /// Returns the new seq_len.
+  virtual int64_t advance_cursor(int64_t /*S*/) {
+    throw std::runtime_error("advance_cursor() not supported on this IPagedKVCache impl");
+  }
+
+  /// Toggle whether append() includes the cursor advance. Default false
+  /// (cursor advance is internal to append). Set true before capturing a
+  /// CUDA graph of forward_paged: the caller must invoke advance_cursor
+  /// before each replay.
+  virtual void set_external_advance(bool /*on*/) {
+    throw std::runtime_error("set_external_advance() not supported on this IPagedKVCache impl");
+  }
+  virtual bool external_advance() const { return false; }
 };
 
 /// Construct a paged KV cache backed by the existing concat KVCache.

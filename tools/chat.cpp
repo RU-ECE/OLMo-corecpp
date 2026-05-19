@@ -62,6 +62,11 @@
 #include "olmo_cpp/model/transformer.hpp"
 #include "olmo_cpp/model/kv_cache.hpp"
 #include "olmo_cpp/model/paged_kv_cache.hpp"
+#if defined(OLMO_HAS_CUDA_KERNELS) || defined(USE_CUDA)
+#include <ATen/cuda/CUDAGraph.h>
+#include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAGuard.h>
+#endif
 #include "olmo_cpp/backend/cuda_graph.hpp"
 #include "olmo_cpp/data/bpe_tokenizer.hpp"
 #include "olmo_cpp/data/structural_tokenizer.hpp"
@@ -614,6 +619,12 @@ int main(int argc, char** argv) {
   // chunks of this size and feed each through forward_paged. 0 disables
   // (single full-length prefill).
   int64_t prefill_chunk_size = 0;
+  // fast-inference [1]: capture decode step into a CUDA graph and
+  // replay each subsequent step. Requires --paged-kv and a CUDA device;
+  // automatically uses make_paged_kv_cache_graph_safe so K/V writes go
+  // through the dyn write kernel and replays land in the right slot.
+  bool use_cuda_graph = false;
+  int64_t cuda_graph_warmup_steps = 2;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -647,6 +658,9 @@ int main(int argc, char** argv) {
       paged_max_seq = std::stoll(argv[++i]);
     else if (arg == "--prefill-chunk-size" && i + 1 < argc)
       prefill_chunk_size = std::stoll(argv[++i]);
+    else if (arg == "--cuda-graph") use_cuda_graph = true;
+    else if (arg == "--cuda-graph-warmup" && i + 1 < argc)
+      cuda_graph_warmup_steps = std::stoll(argv[++i]);
   }
 
   if (checkpoint_path.empty() || config_path.empty() || vocab_path.empty() || merges_path.empty()) {
@@ -677,7 +691,11 @@ int main(int argc, char** argv) {
               << "  --paged-max-seq <n>        (paged KV cap on cached seq length; default 2048)\n"
               << "  --prefill-chunk-size <n>   (chunked prefill: split prompt into N-token\n"
               << "                              chunks; 0 = full prefill in one call; only\n"
-              << "                              effective with --paged-kv)\n";
+              << "                              effective with --paged-kv)\n"
+              << "  --cuda-graph               (capture decode step into a CUDA graph and\n"
+              << "                              replay; requires --paged-kv on a CUDA device)\n"
+              << "  --cuda-graph-warmup <n>    (decode steps to run eagerly before capture;\n"
+              << "                              default 2 — lets caching allocator settle)\n";
     return 1;
   }
 
@@ -1006,9 +1024,14 @@ int main(int argc, char** argv) {
         if (!model->parameters().empty()) {
           model_dtype = model->parameters()[0].dtype().toScalarType();
         }
-        auto paged = olmo_cpp::make_paged_kv_cache(
-            model->n_layers(), n_kv_heads, head_dim,
-            paged_page_size, max_pages, device, model_dtype);
+        const bool graph_mode = use_cuda_graph && device.is_cuda();
+        auto paged = graph_mode
+            ? olmo_cpp::make_paged_kv_cache_graph_safe(
+                  model->n_layers(), n_kv_heads, head_dim,
+                  paged_page_size, max_pages, device, model_dtype)
+            : olmo_cpp::make_paged_kv_cache(
+                  model->n_layers(), n_kv_heads, head_dim,
+                  paged_page_size, max_pages, device, model_dtype);
 
         // Prefill — optionally chunked. fast-inference [6].
         //
@@ -1047,12 +1070,116 @@ int main(int argc, char** argv) {
           std::cout << decode_tokens(tok_to_decode) << std::flush;
           tokens_generated++;
         }
-        // Incremental decode: feed one token at a time.
-        for (int64_t step = prompt_len + 1; step < max_total; ++step) {
+        // Incremental decode: feed one token at a time. In CUDA-graph
+        // mode, we run a few eager warmup steps first (so the caching
+        // allocator settles), then capture forward_paged into a graph
+        // and replay it each subsequent step. The captured graph relies
+        // on the dyn paged_attention kernel + dyn K/V write kernel
+        // wired earlier (both read their seq_len from the cache's stable
+        // device-side n_tokens scalar at launch time), and on the
+        // PagedKVCache's external_advance mode — we move the cursor
+        // OUTSIDE the captured region between replays.
+        torch::NoGradGuard no_grad;
+        int64_t step = prompt_len + 1;
+
+        // Eager pre-capture region: run kWarmupSteps (or fewer if EOS /
+        // budget) so any first-touch JIT or allocator setup happens
+        // before capture.
+        const int64_t warmup_budget = graph_mode ? cuda_graph_warmup_steps : 0;
+        int64_t warm_done = 0;
+        while (step < max_total && warm_done < warmup_budget) {
           int64_t last_token = all_tokens.back();
           if (last_token == static_cast<int64_t>(tokenizer.eos_id())) break;
           auto input = torch::tensor({last_token}, torch::kInt64).unsqueeze(0).to(device);
-          torch::NoGradGuard no_grad;
+          auto logits = model->forward_paged(input, paged.get());
+          auto next_logits = logits.select(1, logits.size(1) - 1).squeeze(0);
+          int64_t next_id = sample_logits(next_logits, temperature, top_k, top_p,
+                                          all_tokens, repetition_penalty, rng);
+          all_tokens.push_back(next_id);
+          if (next_id == static_cast<int64_t>(tokenizer.eos_id())) break;
+          std::vector<uint32_t> tok_to_decode = {static_cast<uint32_t>(next_id)};
+          std::cout << decode_tokens(tok_to_decode) << std::flush;
+          tokens_generated++;
+          step++;
+          warm_done++;
+        }
+
+#if defined(OLMO_HAS_CUDA_KERNELS) || defined(USE_CUDA)
+        // Capture path. Only entered when on a CUDA device and the user
+        // asked for --cuda-graph. The captured graph is the entire decode
+        // forward (every layer's projections, QK-norm, RoPE, paged write,
+        // paged attention, FFN, LM head) replayed as one launch.
+        if (graph_mode && step < max_total &&
+            all_tokens.back() != static_cast<int64_t>(tokenizer.eos_id())) {
+          // Stable input buffer the captured launch reads from. We
+          // .fill_() this between replays — same storage address, new
+          // value, kernel sees the update.
+          auto static_input = torch::empty(
+              {1, 1}, torch::TensorOptions().dtype(torch::kInt64).device(device));
+          static_input.fill_(all_tokens.back());
+
+          // Switch the cache to external-advance mode. From here on,
+          // paged->append no longer bumps logical_len_; we do it.
+          paged->set_external_advance(true);
+
+          // Advance once for the to-be-captured step. The captured K/V
+          // write kernel will read this n_tokens and put its data at slot
+          // (n_tokens - 1).
+          paged->advance_cursor(1);
+
+          // Capture on a side stream so we don't trample the default
+          // stream's allocator state.
+          auto cap_stream = c10::cuda::getStreamFromPool();
+          c10::cuda::CUDAStreamGuard guard(cap_stream);
+
+          at::cuda::CUDAGraph graph;
+          torch::Tensor captured_logits;
+          graph.capture_begin();
+          captured_logits = model->forward_paged(static_input, paged.get());
+          graph.capture_end();
+
+          // The capture run IS the first real decode step under graph
+          // mode: it just wrote one token's K/V and produced its logits.
+          {
+            auto next_logits = captured_logits.select(1, 0).squeeze(0);
+            int64_t next_id = sample_logits(next_logits, temperature, top_k, top_p,
+                                            all_tokens, repetition_penalty, rng);
+            all_tokens.push_back(next_id);
+            if (next_id != static_cast<int64_t>(tokenizer.eos_id())) {
+              std::vector<uint32_t> tok_to_decode = {static_cast<uint32_t>(next_id)};
+              std::cout << decode_tokens(tok_to_decode) << std::flush;
+              tokens_generated++;
+              step++;
+            } else {
+              step = max_total;  // exit
+            }
+          }
+
+          // Replay loop. Each iteration: bump cursor, write new token
+          // into the static input, replay graph, sample.
+          while (step < max_total) {
+            int64_t last_token = all_tokens.back();
+            if (last_token == static_cast<int64_t>(tokenizer.eos_id())) break;
+            static_input.fill_(last_token);
+            paged->advance_cursor(1);
+            graph.replay();
+            auto next_logits = captured_logits.select(1, 0).squeeze(0);
+            int64_t next_id = sample_logits(next_logits, temperature, top_k, top_p,
+                                            all_tokens, repetition_penalty, rng);
+            all_tokens.push_back(next_id);
+            if (next_id == static_cast<int64_t>(tokenizer.eos_id())) break;
+            std::vector<uint32_t> tok_to_decode = {static_cast<uint32_t>(next_id)};
+            std::cout << decode_tokens(tok_to_decode) << std::flush;
+            tokens_generated++;
+            step++;
+          }
+        } else
+#endif
+        // Eager fallback: same behavior as before, no graph capture.
+        for (; step < max_total; ++step) {
+          int64_t last_token = all_tokens.back();
+          if (last_token == static_cast<int64_t>(tokenizer.eos_id())) break;
+          auto input = torch::tensor({last_token}, torch::kInt64).unsqueeze(0).to(device);
           auto logits = model->forward_paged(input, paged.get());
           auto next_logits = logits.select(1, logits.size(1) - 1).squeeze(0);
           int64_t next_id = sample_logits(next_logits, temperature, top_k, top_p,

@@ -202,14 +202,20 @@ torch::Tensor AttentionImpl::forward_paged(
     // q is [1, n_heads, 1, head_dim]; the kernel wants [n_q_heads, head_dim].
     // It handles GQA internally (maps q_head -> kv_head) and reads K/V
     // straight out of the page pool via the page table — no materialize.
+    //
+    // Always dispatch through paged_attention_decode_dyn so the kernel
+    // reads n_tokens from the cache's stable scalar at launch time. This
+    // is correct under CUDA-graph capture (graph holds the device pointer;
+    // each replay re-reads the value) AND in eager mode (one extra
+    // device-scalar read per launch, negligible).
     const float sm_scale = 1.0f / std::sqrt(static_cast<float>(head_dim_));
     auto q2 = q.select(0, 0).select(1, 0).contiguous();           // [n_heads, head_dim]
-    auto attn_flat = paged_attention_decode(
+    auto attn_flat = paged_attention_decode_dyn(
         q2,
         paged->k_pool(layer_idx),
         paged->v_pool(layer_idx),
-        paged->page_table_tensor(),
-        paged->seq_len(),
+        paged->page_table_tensor_stable(),
+        paged->n_tokens_tensor(),
         sm_scale);                                                // [n_heads, head_dim]
     auto attn_out_one = attn_flat.view({B, S, n_heads_ * head_dim_});
     return w_out_(attn_out_one);

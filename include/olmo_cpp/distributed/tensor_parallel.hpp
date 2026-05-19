@@ -82,6 +82,31 @@ class TensorParallelContext {
   /// entering a tensor-parallel region.
   torch::Tensor allgather_sequence(const torch::Tensor& x);
 
+  /// Reduce-scatter along the sequence axis (dim 1). Input is [B, S, D]
+  /// with each rank holding partial sums of the same D values across the
+  /// full S sequence. Output is [B, S/world_size, D], summed across
+  /// ranks and scattered. This is the inverse of allgather_sequence and
+  /// the boundary OUT of a TP region into an SP region.
+  torch::Tensor reduce_scatter_sequence(const torch::Tensor& x);
+
+  /// Column-parallel linear at an SP boundary. Input is
+  /// [B, S/world_size, in_features] (sequence-sharded, feature-full);
+  /// allgathers along seq, performs the local matmul, returns
+  /// [B, S, out_features_local].
+  torch::Tensor column_parallel_linear_sp(
+      const torch::Tensor& x,
+      const torch::Tensor& weight,
+      const c10::optional<torch::Tensor>& bias = c10::nullopt);
+
+  /// Row-parallel linear at an SP boundary. Input is
+  /// [B, S, in_features_local] (feature-sharded); matmul yields partial
+  /// [B, S, out_features], reduce-scatter on seq gives the SP-region
+  /// shape [B, S/world_size, out_features].
+  torch::Tensor row_parallel_linear_sp(
+      const torch::Tensor& x,
+      const torch::Tensor& weight,
+      const c10::optional<torch::Tensor>& bias = c10::nullopt);
+
   int rank() const { return rank_; }
   int world_size() const { return world_size_; }
   /// Convenience: skip TP machinery entirely if running on a single rank.

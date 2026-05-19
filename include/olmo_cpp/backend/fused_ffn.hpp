@@ -48,6 +48,15 @@ torch::Tensor fused_ffn_autograd(torch::Tensor x,
                                    torch::Tensor w_gate_up,
                                    torch::Tensor w_down);
 
+/// A1 — training-side forward that also produces gate_up so the
+/// autograd backward can skip the recompute matmul. Routes through
+/// the WMMA or TMA train variants on CUDA; falls back to the standard
+/// fused_ffn path + an extra fast_linear on CPU.
+std::pair<torch::Tensor, torch::Tensor>
+fused_ffn_train(torch::Tensor x,
+                 torch::Tensor w_gate_up,
+                 torch::Tensor w_down);
+
 #ifdef OLMO_HAS_CUDA_KERNELS
 /// Tensor-core (WMMA) FFN kernel. Preferred path on sm_80+ for bf16
 /// inputs with d / H multiples of 16. Falls back to the FMA-loop
@@ -62,6 +71,18 @@ torch::Tensor fused_ffn_wmma_cuda(torch::Tensor x,
 torch::Tensor fused_ffn_tma_cuda(torch::Tensor x,
                                    torch::Tensor w_gate_up,
                                    torch::Tensor w_down);
+
+/// A1 — training entry points that also output the gate_up
+/// intermediate so the backward can skip the recompute matmul.
+std::pair<torch::Tensor, torch::Tensor>
+fused_ffn_wmma_train_cuda(torch::Tensor x,
+                            torch::Tensor w_gate_up,
+                            torch::Tensor w_down);
+
+std::pair<torch::Tensor, torch::Tensor>
+fused_ffn_tma_train_cuda(torch::Tensor x,
+                           torch::Tensor w_gate_up,
+                           torch::Tensor w_down);
 #endif
 
 }  // namespace olmo_cpp

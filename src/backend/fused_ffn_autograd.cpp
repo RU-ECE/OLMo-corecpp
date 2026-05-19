@@ -36,8 +36,13 @@ struct FusedFFNFunction : public torch::autograd::Function<FusedFFNFunction> {
                                  torch::Tensor x,
                                  torch::Tensor w_gate_up,
                                  torch::Tensor w_down) {
-    auto y = fused_ffn(x, w_gate_up, w_down);
-    ctx->save_for_backward({x, w_gate_up, w_down});
+    // A1 — call the training-side fused path that also publishes
+    // gate_up. Saving it lets backward skip the recompute matmul.
+    // gate_up is dropped if the caller never invokes backward; the
+    // training-only kernel write happens regardless when this fwd
+    // function fires, which is exactly the no-grad-disabled case.
+    auto [y, gate_up] = fused_ffn_train(x, w_gate_up, w_down);
+    ctx->save_for_backward({x, w_gate_up, w_down, gate_up});
     return y;
   }
 
@@ -48,23 +53,25 @@ struct FusedFFNFunction : public torch::autograd::Function<FusedFFNFunction> {
     auto x         = saved[0];
     auto w_gate_up = saved[1];
     auto w_down    = saved[2];
+    auto gate_up   = saved[3];   // A1 — saved from forward; no recompute
     auto grad_y    = grad_outputs[0];
 
     const int64_t H = w_gate_up.size(0) / 2;
     const int64_t d = x.size(-1);
-    auto leading = x.sizes().vec();          // [B, S, d]
-    leading.pop_back();                       // [B, S]
+    auto leading = x.sizes().vec();
+    leading.pop_back();
     auto twoH_shape = leading;
     twoH_shape.push_back(2 * H);
 
-    // Recompute gate_up via cuBLASLt-direct linear (no dispatcher) and
-    // derive the elementwise intermediates needed downstream.
-    auto gate_up   = fast_linear(x, w_gate_up, torch::Tensor());  // [B,S,2H]
+    // Derive elementwise intermediates from the saved gate_up. The
+    // gate/up narrows are views (free). sigmoid, silu_gate, act are
+    // each one bandwidth-bound elementwise pass over [B*S*H] — cheap
+    // vs the 103-GFLOP gate_up recompute they replace.
     auto gate      = gate_up.narrow(-1, 0, H);
     auto up        = gate_up.narrow(-1, H, H);
     auto sig       = torch::sigmoid(gate);
     auto silu_gate = gate * sig;
-    auto act       = silu_gate * up;                              // [B,S,H]
+    auto act       = silu_gate * up;
 
     // grad_act = grad_y @ w_down  (cuBLASLt 2-D direct call).
     auto grad_y_flat = grad_y.reshape({-1, d});

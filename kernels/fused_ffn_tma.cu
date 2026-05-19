@@ -104,6 +104,7 @@ __global__ void fused_ffn_tma_kernel(
     const __nv_bfloat16* __restrict__ w_gate_up,
     const __nv_bfloat16* __restrict__ w_down,
     __nv_bfloat16* __restrict__ y_out,
+    __nv_bfloat16* __restrict__ gate_up_out,    // [N, 2H] or nullptr (A1)
     int N, int d, int H) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
   const int row_tile = blockIdx.x;
@@ -155,6 +156,22 @@ __global__ void fused_ffn_tma_kernel(
   }
   __syncthreads();
 
+  // A1 — optionally publish gate_up to HBM for the backward path. The
+  // training entry point allocates this buffer; the inference entry
+  // points pass nullptr.
+  if (gate_up_out != nullptr) {
+    const int total_gu = 16 * 2 * H;
+    for (int idx = threadIdx.x; idx < total_gu; idx += blockDim.x) {
+      const int i = idx / (2 * H);
+      const int j = idx % (2 * H);
+      const int gi = row_base + i;
+      if (gi < N) {
+        gate_up_out[(int64_t)gi * (2 * H) + j] = sh_gate_up[i * (2 * H) + j];
+      }
+    }
+    __syncthreads();
+  }
+
   // Phase 2 — silu_mul to act.
   const int total_act = 16 * H;
   for (int idx = threadIdx.x; idx < total_act; idx += blockDim.x) {
@@ -196,7 +213,7 @@ __global__ void fused_ffn_tma_kernel(
   // fused_ffn_wmma_cuda), but we keep the symbol so the launch site
   // links. No-op body keeps device-side preprocessing legal — the TMA
   // PTX is preprocessed out above.
-  (void)w_gate_up; (void)w_down; (void)y_out;
+  (void)w_gate_up; (void)w_down; (void)y_out; (void)gate_up_out;
   (void)N; (void)d; (void)H;
 #endif
 }
@@ -247,8 +264,59 @@ torch::Tensor fused_ffn_tma_cuda(torch::Tensor x,
       reinterpret_cast<const __nv_bfloat16*>(wg.data_ptr<at::BFloat16>()),
       reinterpret_cast<const __nv_bfloat16*>(wd.data_ptr<at::BFloat16>()),
       reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()),
+      /*gate_up_out=*/nullptr,
       N, static_cast<int>(d), static_cast<int>(H));
   return y;
+}
+
+// A1 — training entry point. Mirrors fused_ffn_wmma_train_cuda but on
+// the TMA-async-load path. Sm_90+ keeps TMA; older archs fall through
+// to the WMMA train variant via the same runtime check.
+std::pair<torch::Tensor, torch::Tensor>
+fused_ffn_tma_train_cuda(torch::Tensor x,
+                           torch::Tensor w_gate_up,
+                           torch::Tensor w_down) {
+  TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16,
+              "fused_ffn_tma_train_cuda: bf16 CUDA inputs required");
+  cudaDeviceProp props;
+  cudaGetDeviceProperties(&props, x.device().index());
+  if (props.major < 9) {
+    return fused_ffn_wmma_train_cuda(x, w_gate_up, w_down);
+  }
+
+  c10::cuda::CUDAGuard guard(x.device());
+  auto x_c  = x.contiguous();
+  auto wg   = w_gate_up.contiguous();
+  auto wd   = w_down.contiguous();
+  const int64_t B = x_c.size(0);
+  const int64_t S = x_c.size(1);
+  const int64_t d = x_c.size(2);
+  const int64_t H = wg.size(0) / 2;
+  TORCH_CHECK(d % 16 == 0 && H % 16 == 0,
+              "fused_ffn_tma_train_cuda: shapes must be multiples of 16");
+  const int N = static_cast<int>(B * S);
+  auto y = torch::empty_like(x_c);
+  auto gate_up = torch::empty({B, S, 2 * H}, x_c.options());
+
+  auto x_flat = x_c.view({N, d});
+  alignas(64) unsigned char x_desc_storage[128];
+  make_tma_descriptor(x_flat, /*tile_rows=*/16, /*tile_cols=*/d, x_desc_storage);
+
+  const size_t shmem =
+        16 * d * sizeof(__nv_bfloat16)
+      + 16 * (2 * H) * sizeof(__nv_bfloat16)
+      + 16 * H * sizeof(__nv_bfloat16)
+      + 16;
+
+  const int grid = (N + 16 - 1) / 16;
+  fused_ffn_tma_kernel<<<grid, kThreadsPerBlock, shmem>>>(
+      *reinterpret_cast<const CUtensorMap*>(x_desc_storage),
+      reinterpret_cast<const __nv_bfloat16*>(wg.data_ptr<at::BFloat16>()),
+      reinterpret_cast<const __nv_bfloat16*>(wd.data_ptr<at::BFloat16>()),
+      reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()),
+      reinterpret_cast<__nv_bfloat16*>(gate_up.data_ptr<at::BFloat16>()),
+      N, static_cast<int>(d), static_cast<int>(H));
+  return {y, gate_up};
 }
 
 }  // namespace olmo_cpp

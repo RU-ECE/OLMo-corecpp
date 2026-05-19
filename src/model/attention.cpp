@@ -36,6 +36,31 @@ namespace olmo_cpp {
 /// Construct Q/K/V/output linears, optional QK-norms, and RoPE module.
 /// The K/V projections are sized for n_kv_heads (GQA-aware), while the
 /// Q and output projections use the full n_heads count.
+// A4 — return the cached packed [w_q ; w_k ; w_v] weight, rebuilding only
+// when any source weight has incremented its version counter (i.e. after
+// the optimizer touched it). torch::cat itself stays in the autograd
+// graph so grad_w_packed splits back into grad_w_q / grad_w_k / grad_w_v
+// correctly. The savings come from skipping the bandwidth-bound concat
+// (≈3.5 MB / layer / forward at 125M) and its dispatcher overhead on
+// every forward within an unchanged-weights window.
+torch::Tensor AttentionImpl::packed_qkv_weight() {
+  const uint32_t v_q = w_q_->weight._version();
+  const uint32_t v_k = w_k_->weight._version();
+  const uint32_t v_v = w_v_->weight._version();
+  if (cached_w_packed_valid_ &&
+      v_q == cached_w_packed_v_q_ &&
+      v_k == cached_w_packed_v_k_ &&
+      v_v == cached_w_packed_v_v_) {
+    return cached_w_packed_;
+  }
+  cached_w_packed_ = torch::cat({w_q_->weight, w_k_->weight, w_v_->weight}, /*dim=*/0);
+  cached_w_packed_v_q_ = v_q;
+  cached_w_packed_v_k_ = v_k;
+  cached_w_packed_v_v_ = v_v;
+  cached_w_packed_valid_ = true;
+  return cached_w_packed_;
+}
+
 AttentionImpl::AttentionImpl(const TransformerConfig& cfg, int64_t /*layer_idx*/)
     : w_q_(register_module("w_q", torch::nn::Linear(torch::nn::LinearOptions(cfg.d_model, cfg.n_heads * cfg.get_head_dim()).bias(false)))),
       w_k_(register_module("w_k", torch::nn::Linear(torch::nn::LinearOptions(cfg.d_model, cfg.get_n_kv_heads() * cfg.get_head_dim()).bias(false)))),
@@ -99,7 +124,7 @@ torch::Tensor AttentionImpl::forward(
   const bool can_use_fused_qkv =
       x.is_cuda() && !use_float8_ && !q_norm_ && !k_norm_ && rope_bufs != nullptr;
   if (can_use_fused_qkv) {
-    auto w_packed = torch::cat({w_q_->weight, w_k_->weight, w_v_->weight}, /*dim=*/0);
+    auto w_packed = packed_qkv_weight();
     // RoPEBuffers stores pos_cos/pos_sin as [seq_len, head_dim] full-dim
     // broadcast; the fused kernel takes [S, head_dim/2] (first half is
     // enough under half-rotation).
@@ -136,7 +161,7 @@ torch::Tensor AttentionImpl::forward(
   // one Linear, just don't use the fused-with-RoPE kernel. Saves 2 of
   // the 3 Linear launches without changing numerics.
   if (!use_float8_) {
-    auto w_packed = torch::cat({w_q_->weight, w_k_->weight, w_v_->weight}, /*dim=*/0);
+    auto w_packed = packed_qkv_weight();
     auto qkv = fast_linear(x, w_packed, torch::Tensor());
     const int64_t q_dim  = n_heads_    * head_dim_;
     const int64_t kv_dim = n_kv_heads_ * head_dim_;
@@ -296,7 +321,7 @@ torch::Tensor AttentionImpl::forward_paged(
   const bool can_use_fused_qkv =
       x.is_cuda() && !use_float8_ && !q_norm_ && !k_norm_ && rope_bufs != nullptr;
   if (can_use_fused_qkv) {
-    auto w_packed = torch::cat({w_q_->weight, w_k_->weight, w_v_->weight}, /*dim=*/0);
+    auto w_packed = packed_qkv_weight();
     auto cos_full = rope_bufs->pos_cos.narrow(0, start_pos, S);
     auto sin_full = rope_bufs->pos_sin.narrow(0, start_pos, S);
     auto cos_half = cos_full.narrow(-1, 0, head_dim_ / 2);

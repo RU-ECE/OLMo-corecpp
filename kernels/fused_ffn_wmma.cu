@@ -55,6 +55,7 @@ __global__ void fused_ffn_wmma_kernel(
     const __nv_bfloat16* __restrict__ w_gate_up, // [2H, d]
     const __nv_bfloat16* __restrict__ w_down,    // [d, H]
     __nv_bfloat16* __restrict__ y,                // [N, d]
+    __nv_bfloat16* __restrict__ gate_up_out,      // [N, 2H] or nullptr (A1)
     int N, int d, int H) {
   const int row_tile = blockIdx.x;
   const int row_base = row_tile * kWmmaM;
@@ -108,6 +109,21 @@ __global__ void fused_ffn_wmma_kernel(
     }
   }
   __syncthreads();
+
+  // A1 — optionally publish gate_up to HBM so the training-side backward
+  // skips the recompute matmul. nullptr means inference (no_grad) and we
+  // skip the write entirely.
+  if (gate_up_out != nullptr) {
+    const int total_gu = 16 * 2 * H;
+    for (int idx = threadIdx.x; idx < total_gu; idx += blockDim.x) {
+      const int i = idx / (2 * H);
+      const int j = idx % (2 * H);
+      const int gi = row_base + i;
+      if (gi < N) {
+        gate_up_out[(int64_t)gi * (2 * H) + j] = sh_gate_up[i * (2 * H) + j];
+      }
+    }
+  }
 
   // silu_mul: act[i, h] = silu(gate_up[i, h]) * gate_up[i, h + H]
   // for i in [0, 16), h in [0, H).
@@ -176,8 +192,45 @@ torch::Tensor fused_ffn_wmma_cuda(torch::Tensor x,
       reinterpret_cast<const __nv_bfloat16*>(wg.data_ptr<at::BFloat16>()),
       reinterpret_cast<const __nv_bfloat16*>(wd.data_ptr<at::BFloat16>()),
       reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()),
+      /*gate_up_out=*/nullptr,
       N, static_cast<int>(d), static_cast<int>(H));
   return y;
+}
+
+// A1 — training entry point. Identical to fused_ffn_wmma_cuda but also
+// materializes gate_up to HBM so the autograd backward can skip
+// recomputing fast_linear(x, w_gate_up). The HBM write cost (≈143 µs
+// for B*S=16384, H=2048 on 5060 Ti) is amortized by the ≈860 µs
+// recompute it eliminates.
+std::pair<torch::Tensor, torch::Tensor>
+fused_ffn_wmma_train_cuda(torch::Tensor x,
+                            torch::Tensor w_gate_up,
+                            torch::Tensor w_down) {
+  TORCH_CHECK(x.is_cuda() && x.scalar_type() == torch::kBFloat16,
+              "fused_ffn_wmma_train_cuda: bf16 CUDA inputs required");
+  c10::cuda::CUDAGuard guard(x.device());
+  auto x_c = x.contiguous();
+  auto wg = w_gate_up.contiguous();
+  auto wd = w_down.contiguous();
+  const int64_t B = x_c.size(0);
+  const int64_t S = x_c.size(1);
+  const int64_t d = x_c.size(2);
+  const int64_t H = wg.size(0) / 2;
+  TORCH_CHECK(d % 16 == 0 && H % 16 == 0, "shapes must be multiples of 16");
+  const int N = static_cast<int>(B * S);
+  auto y = torch::empty_like(x_c);
+  auto gate_up = torch::empty({B, S, 2 * H}, x_c.options());
+
+  const size_t shmem = (16 * (2 * H) + 16 * H) * sizeof(__nv_bfloat16);
+  const int grid = (N + 16 - 1) / 16;
+  fused_ffn_wmma_kernel<<<grid, kThreadsPerBlock, shmem>>>(
+      reinterpret_cast<const __nv_bfloat16*>(x_c.data_ptr<at::BFloat16>()),
+      reinterpret_cast<const __nv_bfloat16*>(wg.data_ptr<at::BFloat16>()),
+      reinterpret_cast<const __nv_bfloat16*>(wd.data_ptr<at::BFloat16>()),
+      reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()),
+      reinterpret_cast<__nv_bfloat16*>(gate_up.data_ptr<at::BFloat16>()),
+      N, static_cast<int>(d), static_cast<int>(H));
+  return {y, gate_up};
 }
 
 }  // namespace olmo_cpp

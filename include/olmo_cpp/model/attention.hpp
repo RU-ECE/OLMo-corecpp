@@ -132,6 +132,21 @@ class AttentionImpl : public torch::nn::Module {
   bool use_float8_ = false;
   std::unique_ptr<Float8ScaleState> fp8_qx_, fp8_kx_, fp8_vx_, fp8_ox_;
   std::unique_ptr<Float8ScaleState> fp8_qw_, fp8_kw_, fp8_vw_, fp8_ow_;
+
+  /// A4 — packed-QKV weight cache. torch::cat({w_q, w_k, w_v}) was
+  /// rebuilt on every forward; for 125M shapes that's ~3.5 MB of bf16
+  /// alloc + copy per layer per forward (~3% of step time). Cache the
+  /// result and invalidate via the underlying weights' version counters.
+  /// Autograd flows through correctly because we rebuild a fresh cat
+  /// node (with up-to-date saved-variable references) whenever any
+  /// source weight's version increments — i.e. after every optimizer
+  /// step. Within a step the same node is reused across forwards.
+  torch::Tensor cached_w_packed_;
+  uint32_t cached_w_packed_v_q_ = 0;
+  uint32_t cached_w_packed_v_k_ = 0;
+  uint32_t cached_w_packed_v_v_ = 0;
+  bool     cached_w_packed_valid_ = false;
+  torch::Tensor packed_qkv_weight();
 };
 
 /// Holder type macro from LibTorch — defines `Attention` as a shared-ptr

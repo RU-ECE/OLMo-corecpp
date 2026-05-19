@@ -653,14 +653,19 @@ void train(
       model->train();
     }
 
-    // Checkpointing
+    // R.2: async checkpoint save. The CheckpointManager already exposes
+    // save_async(); use it so the main training stream doesn't pause to
+    // write parameter tensors to disk. The returned future is dropped
+    // on the next ckpt iteration (block-on-prior-save semantics).
     if (ckpt_mgr && cfg.checkpoint_interval > 0 && (step + 1) % cfg.checkpoint_interval == 0) {
       std::string tag = "step_" + std::to_string(step + 1);
       CheckpointMetadata meta;
       meta.step = step + 1;
       meta.loss = accum_loss;
-      ckpt_mgr->save(tag, *model, *optimizer, meta, rank,
-                      ddp ? ddp->world_size() : 1);
+      static std::future<void> _last_ckpt;
+      if (_last_ckpt.valid()) _last_ckpt.wait();  // ensure previous save finished
+      _last_ckpt = ckpt_mgr->save_async(tag, *model, *optimizer, meta, rank,
+                                         ddp ? ddp->world_size() : 1);
       ckpt_mgr->prune(cfg.keep_checkpoints);
       cb_mgr.on_checkpoint_save(state, cfg.checkpoint_dir + "/" + tag);
     }

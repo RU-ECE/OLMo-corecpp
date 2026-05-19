@@ -55,6 +55,7 @@
 #include "olmo_cpp/optim/muon.hpp"
 #include "olmo_cpp/optim/dion.hpp"
 #include "olmo_cpp/optim/foreach_adamw.hpp"
+#include "olmo_cpp/optim/eight_bit_adamw.hpp"
 #include "olmo_cpp/optim/grad_clip.hpp"
 #include "olmo_cpp/optim/skip_step.hpp"
 #include "olmo_cpp/optim/scheduler.hpp"
@@ -362,6 +363,13 @@ void train(
     optimizer = std::make_unique<DION>(
         model->parameters(), DIONOptions(cfg.lr).weight_decay(cfg.weight_decay));
     optim_display = "DION";
+  } else if (cfg.optimizer == "adamw_8bit") {
+    // 8-bit block-quantized Adam states. ~4x optimizer-memory reduction
+    // vs FP32 Adam; trajectory parity within Adam-noise (bitsandbytes).
+    optimizer = std::make_unique<EightBitAdamW>(
+        model->parameters(),
+        EightBitAdamWOptions().lr(cfg.lr).weight_decay(cfg.weight_decay));
+    optim_display = "EightBitAdamW (block-quantized)";
   } else if (cfg.use_foreach_optimizer) {
     optimizer = std::make_unique<ForeachAdamW>(
         model->parameters(), ForeachAdamWOptions(cfg.lr).weight_decay(cfg.weight_decay));
@@ -721,6 +729,10 @@ void train(
   } else if (cfg.optimizer == "dion") {
     optimizer = std::make_unique<DION>(
         model->parameters(), DIONOptions(cfg.lr).weight_decay(cfg.weight_decay));
+  } else if (cfg.optimizer == "adamw_8bit") {
+    optimizer = std::make_unique<EightBitAdamW>(
+        model->parameters(),
+        EightBitAdamWOptions().lr(cfg.lr).weight_decay(cfg.weight_decay));
   } else if (cfg.use_foreach_optimizer) {
     optimizer = std::make_unique<ForeachAdamW>(
         model->parameters(), ForeachAdamWOptions(cfg.lr).weight_decay(cfg.weight_decay));

@@ -288,32 +288,53 @@ torch::Tensor AttentionImpl::forward_paged(
   auto B = x.size(0);
   auto S = x.size(1);
 
-  auto linear_maybe_fp8 = [&](torch::nn::Linear& lin,
-                              Float8ScaleState* sx, Float8ScaleState* sw,
-                              const torch::Tensor& in) -> torch::Tensor {
-    if (!use_float8_) return lin(in);
-    return float8_linear_emulated(in, lin->weight,
-                                  lin->bias.defined() ? lin->bias : torch::Tensor(),
-                                  *sx, *sw);
-  };
-  auto q = linear_maybe_fp8(w_q_, fp8_qx_.get(), fp8_qw_.get(), x);
-  auto k = linear_maybe_fp8(w_k_, fp8_kx_.get(), fp8_kw_.get(), x);
-  auto v = linear_maybe_fp8(w_v_, fp8_vx_.get(), fp8_vw_.get(), x);
+  torch::Tensor q, k, v;
 
-  if (q_norm_ && !use_head_qk_norm_) q = (*q_norm_)(q);
-  if (k_norm_ && !use_head_qk_norm_) k = (*k_norm_)(k);
+  // Fused QKV + reshape + RoPE in one kernel — the same fast path the
+  // training-side `forward` uses, dropped into the inference (paged) path.
+  // Replaces 3 Linears + 3 reshapes + 1 RoPE with a single launch.
+  const bool can_use_fused_qkv =
+      x.is_cuda() && !use_float8_ && !q_norm_ && !k_norm_ && rope_bufs != nullptr;
+  if (can_use_fused_qkv) {
+    auto w_packed = torch::cat({w_q_->weight, w_k_->weight, w_v_->weight}, /*dim=*/0);
+    auto cos_full = rope_bufs->pos_cos.narrow(0, start_pos, S);
+    auto sin_full = rope_bufs->pos_sin.narrow(0, start_pos, S);
+    auto cos_half = cos_full.narrow(-1, 0, head_dim_ / 2);
+    auto sin_half = sin_full.narrow(-1, 0, head_dim_ / 2);
+    auto out = fused_qkv_rope(x, w_packed, cos_half, sin_half,
+                                n_heads_, n_kv_heads_, head_dim_);
+    q = std::get<0>(out);
+    k = std::get<1>(out);
+    v = std::get<2>(out);
+  } else {
+    auto linear_maybe_fp8 = [&](torch::nn::Linear& lin,
+                                Float8ScaleState* sx, Float8ScaleState* sw,
+                                const torch::Tensor& in) -> torch::Tensor {
+      if (!use_float8_) return fast_linear(in, lin->weight,
+                                            lin->bias.defined() ? lin->bias : torch::Tensor());
+      return float8_linear_emulated(in, lin->weight,
+                                    lin->bias.defined() ? lin->bias : torch::Tensor(),
+                                    *sx, *sw);
+    };
+    q = linear_maybe_fp8(w_q_, fp8_qx_.get(), fp8_qw_.get(), x);
+    k = linear_maybe_fp8(w_k_, fp8_kx_.get(), fp8_kw_.get(), x);
+    v = linear_maybe_fp8(w_v_, fp8_vx_.get(), fp8_vw_.get(), x);
 
-  q = q.view({B, S, n_heads_, head_dim_}).transpose(1, 2);
-  k = k.view({B, S, n_kv_heads_, head_dim_}).transpose(1, 2);
-  v = v.view({B, S, n_kv_heads_, head_dim_}).transpose(1, 2);
+    if (q_norm_ && !use_head_qk_norm_) q = (*q_norm_)(q);
+    if (k_norm_ && !use_head_qk_norm_) k = (*k_norm_)(k);
 
-  if (q_norm_ && use_head_qk_norm_) q = (*q_norm_)(q);
-  if (k_norm_ && use_head_qk_norm_) k = (*k_norm_)(k);
+    q = q.view({B, S, n_heads_, head_dim_}).transpose(1, 2);
+    k = k.view({B, S, n_kv_heads_, head_dim_}).transpose(1, 2);
+    v = v.view({B, S, n_kv_heads_, head_dim_}).transpose(1, 2);
 
-  if (rope_bufs) {
-    auto [q_rot, k_rot] = (*rope_)->apply(q, k, *rope_bufs, std::optional<int64_t>(start_pos));
-    q = q_rot;
-    k = k_rot;
+    if (q_norm_ && use_head_qk_norm_) q = (*q_norm_)(q);
+    if (k_norm_ && use_head_qk_norm_) k = (*k_norm_)(k);
+
+    if (rope_bufs) {
+      auto [q_rot, k_rot] = (*rope_)->apply(q, k, *rope_bufs, std::optional<int64_t>(start_pos));
+      q = q_rot;
+      k = k_rot;
+    }
   }
 
   // Append new K/V into the page pool. From here we either:
@@ -349,7 +370,8 @@ torch::Tensor AttentionImpl::forward_paged(
         ? float8_linear_emulated(attn_out_one, w_out_->weight,
                                  w_out_->bias.defined() ? w_out_->bias : torch::Tensor(),
                                  *fp8_ox_, *fp8_ow_)
-        : w_out_(attn_out_one);
+        : fast_linear(attn_out_one, w_out_->weight,
+                       w_out_->bias.defined() ? w_out_->bias : torch::Tensor());
   }
 
   auto [full_k, full_v] = paged->materialize(layer_idx);

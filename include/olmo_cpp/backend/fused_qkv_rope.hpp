@@ -61,6 +61,19 @@ fused_qkv_rope_cuda(torch::Tensor x,
                     int64_t n_q_heads,
                     int64_t n_kv_heads,
                     int64_t head_dim);
+
+/// Tensor-core (WMMA) variant — preferred on sm_80+ for bf16 inputs when
+/// N=B*S, F=(n_q+2*n_kv)*head_dim, and d are all multiples of 16, and
+/// the shmem footprint (16 * F * 2B) fits in the SM. Falls back to
+/// fused_qkv_rope_cuda otherwise.
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+fused_qkv_rope_wmma_cuda(torch::Tensor x,
+                           torch::Tensor w_qkv,
+                           torch::Tensor cos,
+                           torch::Tensor sin,
+                           int64_t n_q_heads,
+                           int64_t n_kv_heads,
+                           int64_t head_dim);
 #endif
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>

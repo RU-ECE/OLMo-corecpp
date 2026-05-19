@@ -22,6 +22,7 @@
  */
 
 #include "olmo_cpp/backend/fused_ffn.hpp"
+#include "olmo_cpp/backend/cublas_direct.hpp"
 
 #include <torch/torch.h>
 #include <torch/csrc/autograd/custom_function.h>
@@ -35,11 +36,6 @@ struct FusedFFNFunction : public torch::autograd::Function<FusedFFNFunction> {
                                  torch::Tensor x,
                                  torch::Tensor w_gate_up,
                                  torch::Tensor w_down) {
-    // Compute the forward both ways: through ATen so we have the
-    // intermediates for backward, and through the fused kernel for
-    // the actual output. The fused-kernel value is the one returned;
-    // intermediates are recomputed under the hood when needed in
-    // backward (matches activation-checkpointing-style memory cost).
     auto y = fused_ffn(x, w_gate_up, w_down);
     ctx->save_for_backward({x, w_gate_up, w_down});
     return y;
@@ -49,35 +45,57 @@ struct FusedFFNFunction : public torch::autograd::Function<FusedFFNFunction> {
       torch::autograd::AutogradContext* ctx,
       torch::autograd::tensor_list grad_outputs) {
     auto saved = ctx->get_saved_variables();
-    auto x = saved[0];
+    auto x         = saved[0];
     auto w_gate_up = saved[1];
-    auto w_down = saved[2];
-    auto grad_y = grad_outputs[0];
+    auto w_down    = saved[2];
+    auto grad_y    = grad_outputs[0];
 
     const int64_t H = w_gate_up.size(0) / 2;
-    auto gate_up = torch::nn::functional::linear(x, w_gate_up);  // [B,S,2H]
-    auto gate = gate_up.narrow(-1, 0, H);
-    auto up   = gate_up.narrow(-1, H, H);
-    auto sig = torch::sigmoid(gate);
-    auto silu_gate = gate * sig;                                  // silu(gate)
-    auto act = silu_gate * up;                                    // [B,S,H]
+    const int64_t d = x.size(-1);
+    auto leading = x.sizes().vec();          // [B, S, d]
+    leading.pop_back();                       // [B, S]
+    auto twoH_shape = leading;
+    twoH_shape.push_back(2 * H);
 
-    // grad_act = grad_y @ w_down  (y = act @ w_down.T)
-    auto grad_act = torch::matmul(grad_y, w_down);                // [B,S,H]
-    auto grad_w_down = torch::matmul(
-        grad_y.flatten(0, -2).transpose(0, 1),                     // [d, B*S]
-        act.flatten(0, -2));                                       // [B*S, H]
+    // Recompute gate_up via cuBLASLt-direct linear (no dispatcher) and
+    // derive the elementwise intermediates needed downstream.
+    auto gate_up   = fast_linear(x, w_gate_up, torch::Tensor());  // [B,S,2H]
+    auto gate      = gate_up.narrow(-1, 0, H);
+    auto up        = gate_up.narrow(-1, H, H);
+    auto sig       = torch::sigmoid(gate);
+    auto silu_gate = gate * sig;
+    auto act       = silu_gate * up;                              // [B,S,H]
 
-    // d silu(g)/dg = sig + g * sig * (1 - sig)
+    // grad_act = grad_y @ w_down  (cuBLASLt 2-D direct call).
+    auto grad_y_flat = grad_y.reshape({-1, d});
+    auto grad_act_flat = fast_matmul(grad_y_flat, w_down, false, false);
+
+    // grad_w_down = grad_y.T @ act.
+    auto act_flat = act.reshape({-1, H});
+    auto grad_w_down = fast_matmul(grad_y_flat, act_flat, true, false);
+
+    // d silu(g)/dg = sig + g * sig * (1 - sig).
     auto d_silu_gate = sig + gate * sig * (1 - sig);
-    auto grad_gate = grad_act * up * d_silu_gate;
-    auto grad_up   = grad_act * silu_gate;
-    auto grad_gate_up = torch::cat({grad_gate, grad_up}, /*dim=*/-1);  // [B,S,2H]
 
-    auto grad_w_gate_up = torch::matmul(
-        grad_gate_up.flatten(0, -2).transpose(0, 1),
-        x.flatten(0, -2));
-    auto grad_x = torch::matmul(grad_gate_up, w_gate_up);
+    // Allocate grad_gate_up once and write the two halves directly into
+    // it — no torch::cat, which would allocate a third tensor and copy
+    // both halves into it. Mul_out targets a pre-allocated buffer.
+    auto grad_gate_up = torch::empty(twoH_shape, grad_y.options());
+    auto grad_gate_view = grad_gate_up.narrow(-1, 0, H);
+    auto grad_up_view   = grad_gate_up.narrow(-1, H, H);
+    auto grad_act = grad_act_flat.view(act.sizes());
+    torch::mul_out(grad_gate_view, grad_act, up);
+    grad_gate_view.mul_(d_silu_gate);
+    torch::mul_out(grad_up_view, grad_act, silu_gate);
+
+    // grad_w_gate_up = grad_gate_up.T @ x.
+    auto grad_gate_up_flat = grad_gate_up.reshape({-1, 2 * H});
+    auto x_flat = x.reshape({-1, d});
+    auto grad_w_gate_up = fast_matmul(grad_gate_up_flat, x_flat, true, false);
+
+    // grad_x = grad_gate_up @ w_gate_up.
+    auto grad_x_flat = fast_matmul(grad_gate_up_flat, w_gate_up, false, false);
+    auto grad_x = grad_x_flat.view(x.sizes());
 
     return {grad_x, grad_w_gate_up, grad_w_down};
   }

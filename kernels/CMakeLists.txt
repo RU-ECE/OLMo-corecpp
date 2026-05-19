@@ -14,6 +14,7 @@ add_library(olmo_kernels SHARED
     quant_dequant.cu           # FP8 / INT4 AWQ device-resident dequant
     topk_argmax.cu             # K (fused GEMV+argmax, no logits materialize)
     fused_qkv_rope.cu          # G (fused QKV projection + reshape + RoPE)
+    fused_qkv_rope_wmma.cu     # G + item 2: tensor-core (WMMA) variant
     fused_ffn.cu               # I (fused SwiGLU FFN macro)
     fused_ffn_wmma.cu          # I + item 2: tensor-core (WMMA) variant
 )

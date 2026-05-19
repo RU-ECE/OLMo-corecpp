@@ -78,6 +78,27 @@ fused_qkv_rope(torch::Tensor x,
                int64_t head_dim) {
 #ifdef OLMO_HAS_CUDA_KERNELS
   if (x.is_cuda()) {
+    // Prefer the WMMA tensor-core variant on bf16 + aligned shapes +
+    // when the [16, F] tile fits in shared memory. F = (n_q+2*n_kv)*hd.
+    // Limit: 96 KB (sm_80 conservative); Blackwell sm_120 has 228 KB
+    // but we keep the gate conservative so it works across archs.
+    if (x.scalar_type() == torch::kBFloat16 &&
+        w_qkv.scalar_type() == torch::kBFloat16 &&
+        cos.scalar_type()   == torch::kBFloat16 &&
+        sin.scalar_type()   == torch::kBFloat16) {
+      const int64_t B = x.size(0);
+      const int64_t S = x.size(1);
+      const int64_t d = x.size(2);
+      const int64_t N = B * S;
+      const int64_t F = (n_q_heads + 2 * n_kv_heads) * head_dim;
+      const size_t  shmem_bytes = (size_t)16 * F * sizeof(uint16_t);
+      const bool aligned = (N % 16 == 0) && (d % 16 == 0) && (F % 16 == 0);
+      const bool shmem_ok = (shmem_bytes <= 96 * 1024);
+      if (aligned && shmem_ok) {
+        return fused_qkv_rope_wmma_cuda(x, w_qkv, cos, sin,
+                                          n_q_heads, n_kv_heads, head_dim);
+      }
+    }
     return fused_qkv_rope_cuda(x, w_qkv, cos, sin,
                                 n_q_heads, n_kv_heads, head_dim);
   }

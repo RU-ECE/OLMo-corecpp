@@ -148,4 +148,82 @@ torch::Tensor fast_bmm(torch::Tensor a, torch::Tensor b) {
   return torch::matmul(a, b);
 }
 
+torch::Tensor fast_matmul(torch::Tensor a,
+                           torch::Tensor b,
+                           bool transa,
+                           bool transb) {
+#ifdef OLMO_HAS_CUBLASLT
+  if (a.is_cuda() && b.is_cuda() && supported_lt_dtype(a.scalar_type())
+      && a.scalar_type() == b.scalar_type() && a.dim() == 2 && b.dim() == 2) {
+    c10::cuda::CUDAGuard guard(a.device());
+    auto a_c = a.contiguous();
+    auto b_c = b.contiguous();
+    // Effective dims after op:
+    //   op(a): [M, K]   op(b): [K, N]
+    const int64_t M = transa ? a_c.size(1) : a_c.size(0);
+    const int64_t Ka = transa ? a_c.size(0) : a_c.size(1);
+    const int64_t Kb = transb ? b_c.size(1) : b_c.size(0);
+    const int64_t N = transb ? b_c.size(0) : b_c.size(1);
+    TORCH_CHECK(Ka == Kb,
+                "fast_matmul: inner-dim mismatch ", Ka, " vs ", Kb);
+    const int64_t K = Ka;
+
+    auto opts = a_c.options();
+    auto out = torch::empty({M, N}, opts);
+
+    auto handle = get_handle();
+    auto dtype = to_cuda_dtype(a_c.scalar_type());
+
+    // cuBLAS sees column-major matrices. Each row-major torch tensor with
+    // shape [r, c] (stride c) maps to a col-major matrix of shape [c, r]
+    // (leading dim c). Two transposes (the row→col reinterp and the user's
+    // transpose flag) collapse to: flip the cublasOperation when the user
+    // does NOT want a transpose (because the row→col view already is one).
+    // i.e., user-trans=false → CUBLAS_OP_T; user-trans=true → CUBLAS_OP_N.
+    //
+    // Computing y = op(a) @ op(b) with row-major outputs means we tell
+    // cuBLAS to compute Y^T = op(b)^T @ op(a)^T where Y has shape [N, M]
+    // in col-major (same buffer, just interpreted). The B-arg-becomes-A
+    // swap moves the leading-dim tensor accordingly.
+    cublasLtMatmulDesc_t desc;
+    cublasLtMatmulDescCreate(&desc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+    cublasOperation_t opA_lt = transb ? CUBLAS_OP_N : CUBLAS_OP_T;
+    cublasOperation_t opB_lt = transa ? CUBLAS_OP_N : CUBLAS_OP_T;
+    cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSA,
+                                    &opA_lt, sizeof(opA_lt));
+    cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSB,
+                                    &opB_lt, sizeof(opB_lt));
+
+    cublasLtMatrixLayout_t aLayout, bLayout, cLayout;
+    // a buffer is treated as A in the lt call, but represents op(b) row-major.
+    // Its row-major shape: [b_rows, b_cols] where b_rows = b_c.size(0).
+    cublasLtMatrixLayoutCreate(&aLayout, dtype,
+                                b_c.size(1), b_c.size(0), b_c.size(1));
+    cublasLtMatrixLayoutCreate(&bLayout, dtype,
+                                a_c.size(1), a_c.size(0), a_c.size(1));
+    cublasLtMatrixLayoutCreate(&cLayout, dtype, N, M, N);
+
+    float alpha = 1.0f, beta = 0.0f;
+    cublasLtMatmul(handle, desc,
+                    &alpha,
+                    b_c.data_ptr(), aLayout,
+                    a_c.data_ptr(), bLayout,
+                    &beta,
+                    out.data_ptr(), cLayout,
+                    out.data_ptr(), cLayout,
+                    nullptr, nullptr, 0,
+                    c10::cuda::getCurrentCUDAStream().stream());
+
+    cublasLtMatmulDescDestroy(desc);
+    cublasLtMatrixLayoutDestroy(aLayout);
+    cublasLtMatrixLayoutDestroy(bLayout);
+    cublasLtMatrixLayoutDestroy(cLayout);
+    return out;
+  }
+#endif
+  auto av = transa ? a.transpose(0, 1) : a;
+  auto bv = transb ? b.transpose(0, 1) : b;
+  return torch::matmul(av, bv);
+}
+
 }  // namespace olmo_cpp

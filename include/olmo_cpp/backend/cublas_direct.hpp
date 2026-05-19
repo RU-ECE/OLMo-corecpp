@@ -32,6 +32,16 @@ torch::Tensor fast_linear(torch::Tensor x,
 /// for 3-D / 4-D inputs but avoids the dispatcher.
 torch::Tensor fast_bmm(torch::Tensor a, torch::Tensor b);
 
+/// General 2-D matmul: y = op(a) @ op(b), where op(t) is t.T when the
+/// corresponding flag is true. Inputs must already be 2-D (callers
+/// flatten higher-rank tensors). Used by the FFN backward and other
+/// hot paths that need a transpose flag torch::matmul can't express
+/// without an explicit .t().contiguous() copy.
+torch::Tensor fast_matmul(torch::Tensor a,
+                           torch::Tensor b,
+                           bool transa = false,
+                           bool transb = false);
+
 /// Force-reset the cached cuBLAS plans (e.g. after dtype changes).
 void cublas_direct_reset_cache();
 

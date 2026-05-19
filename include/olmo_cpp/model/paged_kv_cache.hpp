@@ -69,16 +69,34 @@ class IPagedKVCache {
 };
 
 /// Construct a paged KV cache backed by the existing concat KVCache.
-/// Used as the fallback until the real paged implementation lands.
-/// Once kernels/paged_attention.cu exists, swap this for `make_paged_kv_cache`.
+/// Used as the fallback for code paths that need IPagedKVCache but cannot
+/// yet take advantage of the paged kernels (e.g. CPU-only build).
 std::unique_ptr<IPagedKVCache> make_concat_kv_cache_shim(
     int64_t n_layers, torch::Device device);
 
-// TODO(fast-inference [1]): once paged attention kernel is in place,
-// add:
-//   std::unique_ptr<IPagedKVCache> make_paged_kv_cache(
-//       int64_t n_layers, int64_t page_size, int64_t max_pages,
-//       torch::Device device);
-// and switch chat.cpp / bench_chat.cpp to use it on supported devices.
+/// Construct a real paged KV cache backed by a BlockManager.
+///
+/// Layout: per-layer K/V pools of shape
+///   [max_pages, page_size, n_kv_heads, head_dim].
+/// Block (page) allocation happens lazily as logical_len_ crosses page
+/// boundaries. The caller is expected to invoke `append` for layers in
+/// ascending order each step (layer 0 first); the implementation advances
+/// the cursor on layer 0 and back-computes destination slots for the rest.
+///
+/// `max_pages * page_size` is the hard cap on cached sequence length.
+///
+/// Currently used as a drop-in storage replacement: `materialize(layer)`
+/// returns contiguous [1, n_kv_heads, logical_len, head_dim] views, so the
+/// existing SDPA-based attention path works unchanged. Decode-side attention
+/// can later dispatch to `paged_attention_decode` (kernels/paged_attention.cu)
+/// using the BlockManager pools + page table directly, without materializing.
+std::unique_ptr<IPagedKVCache> make_paged_kv_cache(
+    int64_t n_layers,
+    int64_t n_kv_heads,
+    int64_t head_dim,
+    int64_t page_size,
+    int64_t max_pages,
+    torch::Device device,
+    torch::Dtype dtype);
 
 }  // namespace olmo_cpp

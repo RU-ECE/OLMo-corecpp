@@ -79,6 +79,15 @@ class AttentionImpl : public torch::nn::Module {
       IPagedKVCache* paged,
       int64_t layer_idx);
 
+  /// Tree-attention forward (item 8.1). Same as forward() but uses
+  /// `attn_mask` as the additive SDPA mask instead of the built-in
+  /// causal / sliding-window logic. No KV cache; verifies the whole
+  /// tree in one shot.
+  torch::Tensor forward_with_mask(
+      torch::Tensor x,
+      const RoPEBuffers* rope_bufs,
+      torch::Tensor attn_mask);
+
  private:
   /// Q projection: [d_model] -> [n_heads * head_dim].
   torch::nn::Linear w_q_;

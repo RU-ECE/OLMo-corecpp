@@ -96,6 +96,13 @@ class TransformerImpl : public torch::nn::Module {
       torch::Tensor input_ids,
       IPagedKVCache* paged);
 
+  /// Tree-attention forward (item 8.1 wiring). input_ids: [1, N] flat tree.
+  /// attn_mask: [N, N] bool tensor where mask[i, j] = true iff j is an
+  /// ancestor of i (DraftTree::flatten output). Returns logits [1, N, V].
+  /// No KV cache: each verify is a fresh forward.
+  torch::Tensor forward_tree(torch::Tensor input_ids,
+                              torch::Tensor attn_mask);
+
   /// Apply truncated-normal init to all parameters with model-specific
   /// scaling (separate stds for embeddings vs. blocks vs. LM head).
   /// gen: optional torch generator for reproducibility.

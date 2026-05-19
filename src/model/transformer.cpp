@@ -246,6 +246,40 @@ torch::Tensor TransformerImpl::forward_paged(
   return lm_head_(h);
 }
 
+torch::Tensor TransformerImpl::forward_tree(torch::Tensor input_ids,
+                                              torch::Tensor attn_mask) {
+  // Item 8.1 wiring. input_ids: [1, N] flat tree; attn_mask: [N, N]
+  // bool ancestor matrix from DraftTree::flatten. Each block uses the
+  // mask in place of the built-in causal mask. No KV cache.
+  TORCH_CHECK(input_ids.dim() == 2 && input_ids.size(0) == 1,
+              "forward_tree: input_ids must be [1, N]");
+  TORCH_CHECK(attn_mask.dim() == 2 && attn_mask.size(0) == attn_mask.size(1)
+              && attn_mask.size(0) == input_ids.size(1),
+              "forward_tree: attn_mask must be [N, N]");
+
+  auto h = use_multi_res_
+      ? multi_res_embed_->forward(input_ids)
+      : embeddings_(input_ids);
+  if (embed_scale_ && !use_multi_res_) h = h * *embed_scale_;
+  h = (*embedding_norm_)(h);
+
+  const int64_t N = input_ids.size(1);
+  auto device = input_ids.device();
+  const auto& rope_bufs = get_rope_buffers(N, device, h.dtype().toScalarType());
+
+  auto mask_opts = torch::TensorOptions().dtype(h.dtype()).device(device);
+  auto add_mask = torch::where(
+      attn_mask,
+      torch::zeros({}, mask_opts),
+      torch::full({}, -std::numeric_limits<float>::infinity(), mask_opts));
+
+  for (int64_t i = 0; i < config_.n_layers; ++i) {
+    auto block = blocks_->ptr<ReorderedNormTransformerBlockImpl>(i);
+    h = block->forward_with_mask(h, &rope_bufs[i], add_mask);
+  }
+  return lm_head_(h);
+}
+
 torch::Tensor TransformerImpl::forward(
     torch::Tensor input_ids,
     c10::optional<torch::Tensor> labels,

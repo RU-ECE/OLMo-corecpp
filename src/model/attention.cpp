@@ -182,6 +182,39 @@ torch::Tensor AttentionImpl::forward(
       : w_out_(attn_out);
 }
 
+// Tree-attention forward (item 8.1). Standard projections + RoPE, then
+// SDPA with the caller-supplied additive 2-D mask. No cache.
+torch::Tensor AttentionImpl::forward_with_mask(
+    torch::Tensor x,
+    const RoPEBuffers* rope_bufs,
+    torch::Tensor attn_mask) {
+  auto B = x.size(0);
+  auto S = x.size(1);
+  auto q = w_q_(x);
+  auto k = w_k_(x);
+  auto v = w_v_(x);
+  if (q_norm_ && !use_head_qk_norm_) q = (*q_norm_)(q);
+  if (k_norm_ && !use_head_qk_norm_) k = (*k_norm_)(k);
+  q = q.view({B, S, n_heads_,   head_dim_}).transpose(1, 2);
+  k = k.view({B, S, n_kv_heads_, head_dim_}).transpose(1, 2);
+  v = v.view({B, S, n_kv_heads_, head_dim_}).transpose(1, 2);
+  if (q_norm_ && use_head_qk_norm_) q = (*q_norm_)(q);
+  if (k_norm_ && use_head_qk_norm_) k = (*k_norm_)(k);
+  if (rope_bufs) {
+    auto [q_rot, k_rot] = (*rope_)->apply(q, k, *rope_bufs, std::optional<int64_t>(0));
+    q = q_rot; k = k_rot;
+  }
+  if (n_heads_rep_ > 1) {
+    k = k.unsqueeze(2).expand({B, n_kv_heads_, n_heads_rep_, S, head_dim_})
+            .reshape({B, n_heads_, S, head_dim_});
+    v = v.unsqueeze(2).expand({B, n_kv_heads_, n_heads_rep_, S, head_dim_})
+            .reshape({B, n_heads_, S, head_dim_});
+  }
+  auto attn_out = at::scaled_dot_product_attention(q, k, v, attn_mask, 0.0, false);
+  attn_out = attn_out.transpose(1, 2).reshape({B, S, -1});
+  return w_out_(attn_out);
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // Paged-KV variant. Differs from `forward` only in cache I/O — the rest of
 // the path (projections, QK-norm, RoPE, GQA expand, sliding-window mask,

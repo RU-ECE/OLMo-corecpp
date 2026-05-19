@@ -77,6 +77,7 @@
 #include "olmo_cpp/backend/lm_head_gemv.hpp"
 #include "olmo_cpp/backend/persistent_decode.hpp"
 #include "olmo_cpp/generate/draft_model_speculative.hpp"
+#include "olmo_cpp/generate/tree_speculative.hpp"
 #include <torch/torch.h>
 #include <iostream>
 #include <string>
@@ -572,6 +573,93 @@ int64_t speculative_decode_step(
   return accepted;
 }
 
+/// Tree-shaped speculative decoding step (Medusa/EAGLE-style).
+///
+/// Drafts a width-`fanout` tree of depth `depth` from the MTP heads
+/// of the target model, runs ONE tree-attention verify forward, and
+/// walks the longest matching root-to-leaf path. Each MTP head k
+/// supplies top-`fanout` candidates for depth k+1 of the tree.
+///
+/// Why tree over linear chain: the linear-chain spec accepts the
+/// longest prefix of ONE drafted sequence. The tree carries multiple
+/// alternatives per depth, so the verify can match any of them — the
+/// expected-accepted-length is strictly ≥ the linear case at the
+/// same MTP depth. Cost is one additional forward_backbone on the
+/// accepted prefix (since forward_tree is stateless and doesn't
+/// update the KV cache).
+///
+/// Returns the count of new tokens appended to `all_tokens`.
+int64_t tree_decode_step(
+    olmo_cpp::Transformer& model,
+    std::vector<int64_t>& all_tokens,
+    olmo_cpp::KVCache& kv_cache,
+    torch::Device device,
+    olmo_cpp::BPETokenizer& tokenizer,
+    int64_t fanout,
+    int64_t depth,
+    int64_t& total_drafted,
+    int64_t& total_accepted) {
+  torch::NoGradGuard no_grad;
+  int64_t eos_id = static_cast<int64_t>(tokenizer.eos_id());
+
+  // Step 1: Incremental backbone forward (1 token) to obtain the seed
+  // hidden state. Mirrors the speculative path's invariant of caching
+  // up through last_token before drafting.
+  int64_t last_token = all_tokens.back();
+  auto input = torch::tensor({last_token}, torch::kInt64).unsqueeze(0).to(device);
+  auto hidden = model->forward_backbone(input, &kv_cache);
+#ifdef __APPLE__
+  if (device.is_mps()) torch::mps::synchronize();
+#endif
+  auto last_hidden = hidden.select(1, 0);   // [1, d_model]
+
+  // Step 2: Tree-speculative orchestrator. Builds the tree, runs the
+  // stateless forward_tree verify, walks the accepted path. Always
+  // returns at least one token (the root's argmax prediction).
+  auto accepted = olmo_cpp::tree_speculative_step(
+      model, last_hidden, last_token, fanout, depth, device);
+  if (accepted.empty()) return 0;
+
+  // Stats: every non-root node in the tree is a draft candidate.
+  // For fanout f, depth d the tree has (1 + f + f² + ... + fᵈ) nodes;
+  // drafts = nodes − 1.
+  int64_t drafts_this_step = 0;
+  {
+    int64_t pow_term = 1;
+    for (int64_t d = 1; d <= depth; ++d) {
+      pow_term *= fanout;
+      drafts_this_step += pow_term;
+    }
+  }
+  total_drafted   += drafts_this_step;
+  total_accepted  += static_cast<int64_t>(accepted.size());
+
+  // Step 3: forward_tree is stateless — re-run the accepted prefix
+  // through forward_backbone to materialize KV cache entries for
+  // the new tokens. We could fuse this with the tree verify if the
+  // verify path also wrote into the cache, but tree masks complicate
+  // cache-write logic and the recompute on a short accepted prefix
+  // is cheap relative to the verify forward.
+  auto accept_input = torch::tensor(
+      at::IntArrayRef(accepted.data(), accepted.size()),
+      torch::kInt64).unsqueeze(0).to(device);
+  model->forward_backbone(accept_input, &kv_cache);
+#ifdef __APPLE__
+  if (device.is_mps()) torch::mps::synchronize();
+#endif
+
+  // Step 4: commit + stream the accepted tokens.
+  std::vector<uint32_t> accepted_u32;
+  accepted_u32.reserve(accepted.size());
+  for (auto t : accepted) {
+    all_tokens.push_back(t);
+    accepted_u32.push_back(static_cast<uint32_t>(t));
+    if (t == eos_id) break;
+  }
+  std::cout << tokenizer.decode(accepted_u32) << std::flush;
+  return static_cast<int64_t>(accepted_u32.size());
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -588,6 +676,13 @@ int main(int argc, char** argv) {
   bool legacy_decode = false;
   bool use_kv_cache = true;
   bool use_speculative = true;
+  // Tree-shaped speculative decoding (Medusa/EAGLE-style). When set,
+  // overrides the linear-chain spec path: drafts a fanout-`tree_fanout`
+  // × depth-`tree_depth` tree from the MTP heads and verifies it in
+  // ONE forward via forward_tree. Requires the model to have MTP heads.
+  bool use_tree_decode = false;
+  int64_t tree_fanout = 2;
+  int64_t tree_depth  = 0;   // 0 = use model->num_mtp_heads()
   // fast-inference [6]: fused LM-head + Gumbel-max sampler. Bypasses
   // sample_logits entirely. Requires top_k=0, top_p=1.0, rep_penalty=1.0
   // (the kernel doesn't support those filters yet). Off by default
@@ -642,6 +737,9 @@ int main(int argc, char** argv) {
     else if (arg == "--legacy-decode") legacy_decode = true;
     else if (arg == "--no-kv-cache") use_kv_cache = false;
     else if (arg == "--no-speculative") use_speculative = false;
+    else if (arg == "--tree-decode") use_tree_decode = true;
+    else if (arg == "--tree-fanout" && i + 1 < argc) tree_fanout = std::stoll(argv[++i]);
+    else if (arg == "--tree-depth" && i + 1 < argc) tree_depth = std::stoll(argv[++i]);
     else if (arg == "--fused-sampler") use_fused_sampler = true;
     else if (arg == "--fused-seed" && i + 1 < argc)
       fused_seed = std::stoull(argv[++i]);
@@ -676,6 +774,10 @@ int main(int argc, char** argv) {
               << "  --legacy-decode            (for checkpoints trained with old tokenizer)\n"
               << "  --no-kv-cache              (slower, avoids MPS memory issues)\n"
               << "  --no-speculative           (disable MTP speculative decoding)\n"
+              << "  --tree-decode              (tree-shaped speculative via forward_tree;\n"
+              << "                              requires MTP heads; overrides linear spec)\n"
+              << "  --tree-fanout <n>          (children per node in the draft tree; default 2)\n"
+              << "  --tree-depth <n>           (tree depth; default = num MTP heads)\n"
               << "  --fused-sampler            (use fused LM-head + Gumbel-max sampler;\n"
               << "                              forces top_k=0, top_p=1.0, rep_penalty=1.0;\n"
               << "                              Philox RNG, not std::mt19937)\n"
@@ -942,7 +1044,9 @@ int main(int argc, char** argv) {
 
       if (do_speculative) {
         // === MTP Speculative Decoding with KV Cache ===
-        // Prefill: run full prompt through backbone to warm KV cache
+        // Either linear-chain (speculative_decode_step) or tree-shaped
+        // (tree_decode_step). Tree variant gated on --tree-decode.
+        const bool tree_mode = use_tree_decode && has_mtp;
         olmo_cpp::KVCache spec_kv(model->n_layers());
         {
           auto prefill_input = torch::tensor(
@@ -956,6 +1060,9 @@ int main(int argc, char** argv) {
         }
 
         int64_t total_drafted = 0, total_accepted = 0;
+        // Effective tree depth: caller's override or num_mtp_heads.
+        const int64_t effective_tree_depth =
+            tree_depth > 0 ? tree_depth : model->num_mtp_heads();
 
         // (fast-inference [10b]) Dynamic draft length: tune k from running
         // acceptance rate. Start at 1 (most conservative — k=1 still gets
@@ -979,11 +1086,19 @@ int main(int argc, char** argv) {
           if (!all_tokens.empty() && all_tokens.back() == static_cast<int64_t>(tokenizer.eos_id()))
             break;
 
-          int64_t accepted = speculative_decode_step(
-              model, all_tokens, spec_kv, device, temperature, top_k, top_p,
-              repetition_penalty, rng, tokenizer, total_drafted, total_accepted,
-              /*max_drafts=*/dyn_k,
-              /*use_custom_lm_head_gemv=*/use_custom_lm_head_gemv);
+          int64_t accepted;
+          if (tree_mode) {
+            accepted = tree_decode_step(
+                model, all_tokens, spec_kv, device, tokenizer,
+                tree_fanout, effective_tree_depth,
+                total_drafted, total_accepted);
+          } else {
+            accepted = speculative_decode_step(
+                model, all_tokens, spec_kv, device, temperature, top_k, top_p,
+                repetition_penalty, rng, tokenizer, total_drafted, total_accepted,
+                /*max_drafts=*/dyn_k,
+                /*use_custom_lm_head_gemv=*/use_custom_lm_head_gemv);
+          }
           tokens_generated += accepted;
 
           if (++steps_since_adjust >= kAdjustEvery) {
@@ -1007,7 +1122,8 @@ int main(int argc, char** argv) {
 
         std::cout << "\n[" << tokens_generated << " tokens, "
                   << std::fixed << std::setprecision(1) << tok_per_s << " tok/s, "
-                  << "speculative, " << std::setprecision(0) << accept_rate << "% accepted]\n"
+                  << (tree_mode ? "tree-spec" : "speculative")
+                  << ", " << std::setprecision(0) << accept_rate << "% accepted]\n"
                   << std::endl;
         continue;  // skip the generic stats block below
       } else if (use_kv_cache && use_paged_kv) {

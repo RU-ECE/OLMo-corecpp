@@ -57,19 +57,22 @@ std::pair<torch::Tensor, torch::Tensor> DraftTree::flatten(torch::Device device)
 // drafting at depth d does not condition on which ancestor was chosen
 // at d-1). Even with that, fanout > 1 raises the chance the verify
 // step accepts a longer prefix than a linear-chain draft would.
+//
+// `seed_token` is the root: the last committed token of the caller's
+// prefix. forward_tree sees [seed_token, drafts...] so the model's
+// position-0 prediction is conditioned on the same context the
+// caller's next-token prediction would be.
 static DraftTree build_mtp_tree(
+    int64_t seed_token,
     const std::vector<torch::Tensor>& mtp_logits,
     int64_t fanout,
     int64_t max_depth) {
   DraftTree t;
-  // Root: a sentinel that represents the seed (its parent is -1, no
-  // token of its own). We index into mtp_logits[d-1] for tokens at
-  // depth d.
-  t.nodes.push_back({/*token=*/-1, /*parent=*/-1, /*depth=*/0});
+  t.nodes.push_back({/*token=*/static_cast<int32_t>(seed_token),
+                      /*parent=*/-1, /*depth=*/0});
 
   const int64_t depth = std::min<int64_t>(max_depth,
                                             static_cast<int64_t>(mtp_logits.size()));
-  // Top-`fanout` tokens of each MTP head, computed once.
   std::vector<std::vector<int64_t>> topk_per_head;
   topk_per_head.reserve(static_cast<size_t>(depth));
   for (int64_t d = 0; d < depth; ++d) {
@@ -79,9 +82,7 @@ static DraftTree build_mtp_tree(
     topk_per_head.emplace_back(idx_a, idx_a + fanout);
   }
 
-  // For each depth d, every node at depth d-1 spawns `fanout` children
-  // sharing the same top-K of head d-1.
-  std::vector<int32_t> last_depth_indices = {0};   // root only
+  std::vector<int32_t> last_depth_indices = {0};
   for (int64_t d = 1; d <= depth; ++d) {
     const auto& topk = topk_per_head[static_cast<size_t>(d - 1)];
     std::vector<int32_t> new_indices;
@@ -102,46 +103,40 @@ static DraftTree build_mtp_tree(
 std::vector<int64_t> tree_speculative_step(
     Transformer& target_model,
     torch::Tensor seed_hidden,
+    int64_t seed_token,
     int64_t fanout,
     int64_t max_depth,
-    KVCache& target_kv,
-    BPETokenizer& /*tokenizer*/,
     torch::Device device) {
   if (max_depth <= 0 || fanout <= 0) return {};
+
   // 1. Draft a width-`fanout` tree from MTP heads on seed_hidden.
   auto mtp_logits = target_model->forward_mtp_draft(seed_hidden);
   if (mtp_logits.empty()) return {};
-  DraftTree tree = build_mtp_tree(mtp_logits, fanout, max_depth);
+  DraftTree tree = build_mtp_tree(seed_token, mtp_logits, fanout, max_depth);
   if (tree.nodes.size() <= 1) return {};
 
-  // 2. Flatten: ids (sentinel root token replaced with the seed token
-  // that the caller's last forward already committed; we recover it
-  // from the largest-prob entry of the SEED forward's last-position
-  // logits — but that token is the prior step's output and is not
-  // available here. Use 0 (BOS-ish) as a placeholder for the sentinel;
-  // its prediction is unused because the root has no children outside
-  // the tree.
+  // 2. Flatten: ids are the in-order node tokens, mask[i,j] = j is
+  // an ancestor of i (or i itself).
   auto [ids_flat, mask] = tree.flatten(device);
-  // Replace the sentinel root token (-1) with 0 so embedding lookup is
-  // safe; the sentinel's logits are discarded after the verify pass.
-  ids_flat = ids_flat.clamp_min(0);
 
-  // 3. Verify in ONE forward pass with the tree mask.
-  auto verify_ids = ids_flat.unsqueeze(0);             // [1, N]
-  auto logits = target_model->forward_tree(verify_ids, mask);  // [1, N, V]
+  // 3. Verify in ONE forward pass with the tree mask. Stateless —
+  // forward_tree builds RoPE buffers for length N internally and does
+  // NOT touch any KV cache. The caller re-runs forward_backbone on
+  // the accepted prefix to materialize cache entries.
+  auto verify_ids = ids_flat.unsqueeze(0);                       // [1, N]
+  auto logits = target_model->forward_tree(verify_ids, mask);    // [1, N, V]
 
-  // 4. Walk the tree. Start at the root. Repeatedly pick a child whose
-  // token == argmax(parent's predicted logits). Stop when no child
-  // matches or we hit a leaf.
+  // 4. Walk the tree. Start at the root (the seed_token). The root's
+  // predicted logits give the model's expected next token; if a child
+  // of the root carries that token, accept it and descend. Repeat.
   auto logits_cpu = logits.select(0, 0).to(torch::kCPU).to(torch::kFloat32);
-  auto argmax = std::get<1>(logits_cpu.max(/*dim=*/-1)).contiguous();  // [N]
+  auto argmax = std::get<1>(logits_cpu.max(/*dim=*/-1)).contiguous();   // [N]
   auto am_ptr = argmax.data_ptr<int64_t>();
 
   std::vector<int64_t> accepted;
   int32_t cursor = 0;  // root
   while (true) {
     const int64_t pred = am_ptr[cursor];
-    // Find a child of `cursor` whose token == pred.
     int32_t hit = -1;
     for (size_t i = 1; i < tree.nodes.size(); ++i) {
       if (tree.nodes[i].parent == cursor && tree.nodes[i].token == pred) {
@@ -150,21 +145,15 @@ std::vector<int64_t> tree_speculative_step(
       }
     }
     if (hit < 0) {
-      // No matching child — accept the parent's prediction as the
-      // single new committed token and stop.
+      // No matching child — commit the parent's prediction as the
+      // single new token and stop. Guarantees ≥ 1 token of progress.
       accepted.push_back(pred);
       break;
     }
     accepted.push_back(pred);
     cursor = hit;
   }
-
-  // 5. Push the accepted tokens through the target KV cache so the
-  // next step sees them. forward_tree did NOT touch the KV cache (the
-  // verify forward is stateless); for the accepted prefix we owe a
-  // standard forward to materialize cache entries. The caller (chat)
-  // is expected to handle that re-forward step on the accepted path.
-  (void)target_kv;
+  (void)device;
   return accepted;
 }
 

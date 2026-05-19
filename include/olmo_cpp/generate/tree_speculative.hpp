@@ -27,7 +27,6 @@
  */
 
 #include "olmo_cpp/model/transformer.hpp"
-#include "olmo_cpp/data/bpe_tokenizer.hpp"
 
 #include <torch/torch.h>
 #include <vector>
@@ -48,17 +47,24 @@ struct DraftTree {
   std::pair<torch::Tensor, torch::Tensor> flatten(torch::Device device) const;
 };
 
-/// Tree-spec step: drafts a width-fanout-`fanout` tree of depth
-/// `max_depth` using the MTP heads, runs ONE verify forward on the
-/// target, accepts the longest matching path. Returns the path's
-/// tokens.
+/// Tree-spec step: drafts a width-`fanout` tree of depth `max_depth`
+/// using the MTP heads (top-K candidates per head), runs ONE verify
+/// forward on the target via forward_tree, and accepts the longest
+/// matching path from the root.
+///
+/// `seed_token` is the last committed token of the prefix — it serves
+/// as the tree's root so the verify forward sees the same context the
+/// next-token prediction is conditioned on. forward_tree is stateless;
+/// the caller is responsible for re-running the accepted prefix
+/// through forward_backbone (or equivalent) to update its KV cache.
+///
+/// Returns the path's accepted tokens (length ≥ 1 on success).
 std::vector<int64_t> tree_speculative_step(
     Transformer& target_model,
     torch::Tensor seed_hidden,
+    int64_t seed_token,
     int64_t fanout,
     int64_t max_depth,
-    KVCache& target_kv,
-    BPETokenizer& tokenizer,
     torch::Device device);
 
 }  // namespace olmo_cpp

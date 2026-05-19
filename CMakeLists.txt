@@ -245,6 +245,8 @@ set(OLMO_SOURCES
     src/generate/tree_speculative.cpp  # 8.1 (tree speculative)
     src/backend/fused_qkv_rope_autograd.cpp  # G backward (autograd-aware)
     src/backend/fused_ffn_autograd.cpp       # I backward (autograd-aware)
+    src/backend/fused_lm_head_ce.cpp         # A3 — fused LM-head + CE dispatcher
+    src/backend/fused_lm_head_ce_autograd.cpp  # A3 backward (recompute + grad routing)
     src/backend/subq_backward.cpp            # HH SubQ STE backward
     # Seed and profiling infrastructure
     src/seed.cpp
@@ -636,6 +638,12 @@ target_compile_options(test_scheduler PRIVATE -O3 -march=native)
 if(JSON_INCLUDE_DIR)
   target_compile_definitions(test_scheduler PRIVATE HAS_NLOHMANN_JSON=1)
 endif()
+
+# A3 — fused LM-head + softmax-CE parity vs torch::nn::functional::cross_entropy.
+add_executable(test_fused_ce tools/test_fused_ce.cpp)
+target_link_libraries(test_fused_ce PRIVATE olmo_cpp)
+target_include_directories(test_fused_ce PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(test_fused_ce PRIVATE -O3 -march=native)
 
 # Fused LM-head + Gumbel-max sampler unit test (fast-inference [6]).
 # CPU-only; verifies determinism, distribution match vs softmax, and

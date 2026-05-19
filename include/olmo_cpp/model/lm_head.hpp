@@ -45,6 +45,15 @@ class LMHeadImpl : public torch::nn::Module {
 
   torch::nn::Linear w_out() const { return w_out_; }
 
+  // A3 — accessors that let callers do the LM head's pieces separately
+  // so the fused LM-head + CE kernel can take pre-norm'd input + the
+  // raw weight, skipping logits materialization entirely.
+  torch::Tensor apply_norm(torch::Tensor x) {
+    return norm_ ? (*norm_)(x) : x;
+  }
+  torch::Tensor weight() const { return w_out_->weight; }
+  bool has_norm() const { return norm_.has_value(); }
+
  private:
   std::optional<RMSNorm> norm_;
   torch::nn::Linear w_out_;

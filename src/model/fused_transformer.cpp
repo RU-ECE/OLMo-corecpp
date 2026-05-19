@@ -27,6 +27,7 @@
  */
 #include "olmo_cpp/model/fused_transformer.hpp"
 #include "olmo_cpp/train/activation_checkpoint.hpp"
+#include "olmo_cpp/backend/fused_lm_head_ce.hpp"
 #include <torch/nn/init.h>
 
 namespace {
@@ -188,22 +189,26 @@ torch::Tensor FusedTransformerImpl::forward(
     KVCache* kv_cache) {
 
   auto h = forward_backbone(input_ids, kv_cache);
-  auto logits = lm_head_(h);
 
   if (labels.has_value()) {
-    auto main_loss = torch::nn::functional::cross_entropy(
-        logits.view({-1, config_.vocab_size}),
-        labels->view(-1),
-        torch::nn::functional::CrossEntropyFuncOptions().ignore_index(ignore_index).reduction(torch::kMean));
+    // A3 — fused LM-head + softmax-CE. See transformer.cpp for the full
+    // rationale; we never materialize the [N, V] logits tensor.
+    const int64_t d = h.size(-1);
+    auto w_lm = lm_head_->weight();
+    auto h_norm_main = lm_head_->apply_norm(h);
+    auto main_loss = fused_lm_head_ce_autograd(
+        h_norm_main.reshape({-1, d}),
+        w_lm,
+        labels->reshape(-1),
+        ignore_index);
 
     if (config_.num_mtp_heads > 0) {
-      auto mtp_loss_sum = torch::zeros({}, logits.options());
+      auto mtp_loss_sum = torch::zeros({}, main_loss.options());
       int64_t valid_heads = 0;
+      const int64_t seq_len = labels->size(1);
 
       for (int64_t k = 0; k < config_.num_mtp_heads; ++k) {
         int64_t shift = k + 1;
-        int64_t seq_len = labels->size(1);
-
         if (shift >= seq_len) continue;
 
         auto h_trimmed = h.narrow(1, 0, seq_len - shift);
@@ -211,12 +216,12 @@ torch::Tensor FusedTransformerImpl::forward(
 
         auto head = mtp_heads_->ptr<MTPHeadImpl>(k);
         auto mtp_h = head->forward(h_trimmed);
-        auto mtp_logits = lm_head_(mtp_h);
-
-        auto mtp_loss = torch::nn::functional::cross_entropy(
-            mtp_logits.reshape({-1, config_.vocab_size}),
+        auto mtp_h_normed = lm_head_->apply_norm(mtp_h);
+        auto mtp_loss = fused_lm_head_ce_autograd(
+            mtp_h_normed.reshape({-1, d}),
+            w_lm,
             labels_shifted.reshape(-1),
-            torch::nn::functional::CrossEntropyFuncOptions().ignore_index(ignore_index).reduction(torch::kMean));
+            ignore_index);
 
         mtp_loss_sum = mtp_loss_sum + mtp_loss;
         ++valid_heads;
@@ -229,7 +234,8 @@ torch::Tensor FusedTransformerImpl::forward(
 
     return main_loss;
   }
-  return logits;
+  // Inference path: produce logits as before.
+  return lm_head_(h);
 }
 
 std::vector<torch::Tensor> FusedTransformerImpl::forward_mtp_draft(torch::Tensor hidden_state) {

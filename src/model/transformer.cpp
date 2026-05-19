@@ -52,6 +52,7 @@
  */
 #include "olmo_cpp/model/transformer.hpp"
 #include "olmo_cpp/train/activation_checkpoint.hpp"
+#include "olmo_cpp/backend/fused_lm_head_ce.hpp"
 #include <torch/nn/init.h>
 
 namespace {
@@ -298,47 +299,39 @@ torch::Tensor TransformerImpl::forward(
   const int64_t d = h.size(2);
   const int64_t K = config_.num_mtp_heads;
 
-  // B (optimization roadmap): stack the main head input (h itself) and each
-  // MTP head's transform output along a new leading dim, then run the LM head
-  // ONCE on the combined tensor. cuBLAS sees a single [(K+1)*B*S, d] × [d, V]
-  // GEMM instead of K+1 separate calls — bigger M-dim tiles better and the
-  // dispatcher overhead is paid once.
-  //
-  // Each MTP head is given the FULL h (length seq_len_full) rather than a
-  // narrowed view; we discard the leading positions of its logits before
-  // computing CE. The wasted compute is (k+1)/seq_len ≈ 0.1% per head at
-  // seq_len ≈ 1024 — far below the gain from a single fused GEMM.
-  std::vector<torch::Tensor> heads_inputs;
-  heads_inputs.reserve(static_cast<size_t>(K + 1));
-  heads_inputs.push_back(h);                                  // main head: identity
-  for (int64_t k = 0; k < K; ++k) {
-    auto head = mtp_heads_->ptr<MTPHeadImpl>(k);
-    heads_inputs.push_back(head->forward(h));                 // [B, S, d]
-  }
-  auto stacked = torch::stack(heads_inputs, /*dim=*/0);       // [K+1, B, S, d]
-  auto stacked_flat = stacked.view({(K + 1) * B * seq_len_full, d});
-  auto all_logits_flat = lm_head_(stacked_flat);              // ONE GEMM
-  auto all_logits = all_logits_flat.view({K + 1, B, seq_len_full, config_.vocab_size});
+  // A3 — fused LM-head + softmax-CE. The old path stacked all (K+1)
+  // heads' inputs, ran the LM head ONCE to materialize a (K+1)*B*S × V
+  // logits tensor, then computed cross_entropy per head. That tensor
+  // is ~3.3 GB at V=50k/B*S=16k and forces an extra read in CE; the
+  // fused kernel never writes it. We give up the "ONE GEMM" combine
+  // (each head now does its own GEMM internally inside the fused
+  // kernel) but each remaining GEMM has only the row count it actually
+  // needs, and the bandwidth saving dwarfs the small launch overhead.
+  auto w_lm = lm_head_->weight();
 
-  auto main_logits = all_logits.select(0, 0);                 // [B, S, V]
-  auto main_loss = torch::nn::functional::cross_entropy(
-      main_logits.reshape({-1, config_.vocab_size}),
-      labels->reshape(-1),
-      torch::nn::functional::CrossEntropyFuncOptions().ignore_index(ignore_index).reduction(torch::kMean));
+  // ── Main head ────────────────────────────────────────────────────
+  auto h_norm_main = lm_head_->apply_norm(h);
+  auto main_h_flat = h_norm_main.reshape({-1, d});
+  auto main_labels_flat = labels->reshape(-1);
+  auto main_loss = fused_lm_head_ce_autograd(
+      main_h_flat, w_lm, main_labels_flat, ignore_index);
 
+  // ── MTP heads ────────────────────────────────────────────────────
   if (K > 0) {
-    auto mtp_loss_sum = torch::zeros({}, main_logits.options());
+    auto mtp_loss_sum = torch::zeros({}, main_loss.options());
     int64_t valid_heads = 0;
     for (int64_t k = 0; k < K; ++k) {
       const int64_t shift = k + 1;
       if (shift >= seq_len_full) continue;
-      // Slice this head's logits to the valid prediction range [0, S-shift).
-      auto mtp_logits = all_logits.select(0, k + 1).narrow(1, 0, seq_len_full - shift);
+      auto head = mtp_heads_->ptr<MTPHeadImpl>(k);
+      auto mtp_h = head->forward(h).narrow(1, 0, seq_len_full - shift);   // [B, S-shift, d]
       auto labels_shifted = labels->narrow(1, shift, seq_len_full - shift);
-      auto mtp_loss = torch::nn::functional::cross_entropy(
-          mtp_logits.reshape({-1, config_.vocab_size}),
+      auto mtp_h_normed = lm_head_->apply_norm(mtp_h);
+      auto mtp_loss = fused_lm_head_ce_autograd(
+          mtp_h_normed.reshape({-1, d}),
+          w_lm,
           labels_shifted.reshape(-1),
-          torch::nn::functional::CrossEntropyFuncOptions().ignore_index(ignore_index).reduction(torch::kMean));
+          ignore_index);
       mtp_loss_sum = mtp_loss_sum + mtp_loss;
       ++valid_heads;
     }

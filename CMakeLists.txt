@@ -230,6 +230,7 @@ set(OLMO_SOURCES
     src/model/shared_block_pool.cpp  # fast-inference [I-7] (ref-counted shared pool)
     src/serve/scheduler.cpp  # fast-inference [I-2] (multi-request scheduler)
     src/train/async_loss_reader.cpp  # AA (non-blocking loss readout)
+    src/backend/topk_argmax.cpp  # K (fused GEMV+argmax dispatcher)
     # Seed and profiling infrastructure
     src/seed.cpp
     src/profiler.cpp

@@ -32,6 +32,8 @@
 #include <torch/csrc/autograd/custom_function.h>
 #include <ATen/core/dispatch/Dispatcher.h>
 
+#include "olmo_cpp/backend/rms_norm_backward.hpp"
+
 namespace olmo_cpp {
 
 namespace {
@@ -78,6 +80,17 @@ struct RmsNormFn : public Function<RmsNormFn> {
     const bool has_weight = ctx->saved_data["has_weight"].toBool();
     auto grad_y = grads[0];
 
+    // B3 — fused CUDA backward when possible, ATen fallback otherwise.
+    if (x.is_cuda() &&
+        (x.scalar_type() == torch::kBFloat16 || x.scalar_type() == torch::kFloat32)) {
+      c10::optional<torch::Tensor> w_opt;
+      if (has_weight && w_saved.defined()) w_opt = w_saved;
+      auto [grad_x, grad_w] =
+          rms_norm_backward_cuda(grad_y, x, w_opt, eps);
+      return {grad_x, grad_w, torch::Tensor()};
+    }
+
+    // CPU / unsupported-dtype path: ATen recompute.
     auto x_fp32 = x.to(torch::kFloat32);
     auto rms = (x_fp32 * x_fp32).mean(-1, /*keepdim=*/true).add(eps).rsqrt();
     auto x_hat = x_fp32 * rms;
@@ -92,7 +105,6 @@ struct RmsNormFn : public Function<RmsNormFn> {
 
     torch::Tensor grad_w;
     if (has_weight && w_saved.defined()) {
-      // Sum over all but the last dim.
       auto gw32 = (grad_y.to(torch::kFloat32) * x_hat);
       const int64_t lead = gw32.dim() - 1;
       std::vector<int64_t> reduce_dims;

@@ -19,6 +19,7 @@ add_library(olmo_kernels SHARED
     fused_ffn_wmma.cu          # I + item 2: tensor-core (WMMA) variant
     fused_ffn_tma.cu           # I + item W: TMA async-load variant (sm_90+)
     fused_lm_head_ce.cu        # A3 — fused LM-head + softmax-CE
+    rms_norm_backward.cu       # B3 — fused RMSNorm backward
 )
 target_include_directories(olmo_kernels PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/..

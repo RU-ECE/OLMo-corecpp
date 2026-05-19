@@ -228,6 +228,7 @@ set(OLMO_SOURCES
     src/model/paged_kv_cache.cpp  # fast-inference [1] partial (concat shim)
     src/model/block_manager.cpp  # fast-inference [9] (page allocator)
     src/model/shared_block_pool.cpp  # fast-inference [I-7] (ref-counted shared pool)
+    src/serve/scheduler.cpp  # fast-inference [I-2] (multi-request scheduler)
     # Seed and profiling infrastructure
     src/seed.cpp
     src/profiler.cpp
@@ -598,6 +599,17 @@ add_executable(test_prefix_cache tools/test_prefix_cache.cpp)
 target_link_libraries(test_prefix_cache PRIVATE olmo_cpp)
 target_include_directories(test_prefix_cache PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(test_prefix_cache PRIVATE -O3 -march=native)
+
+# Scheduler integration test (fast-inference [I-2]).
+# Loads the 125M model + tokenizer; admits 2 requests with a shared
+# prefix; verifies prefix-page sharing and per-request completion.
+add_executable(test_scheduler tools/test_scheduler.cpp)
+target_link_libraries(test_scheduler PRIVATE olmo_cpp)
+target_include_directories(test_scheduler PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${JSON_INCLUDE_DIR})
+target_compile_options(test_scheduler PRIVATE -O3 -march=native)
+if(JSON_INCLUDE_DIR)
+  target_compile_definitions(test_scheduler PRIVATE HAS_NLOHMANN_JSON=1)
+endif()
 
 # Fused LM-head + Gumbel-max sampler unit test (fast-inference [6]).
 # CPU-only; verifies determinism, distribution match vs softmax, and

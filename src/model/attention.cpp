@@ -351,20 +351,30 @@ torch::Tensor AttentionImpl::forward_paged(
     // It handles GQA internally (maps q_head -> kv_head) and reads K/V
     // straight out of the page pool via the page table — no materialize.
     //
-    // Always dispatch through paged_attention_decode_dyn so the kernel
-    // reads n_tokens from the cache's stable scalar at launch time. This
-    // is correct under CUDA-graph capture (graph holds the device pointer;
-    // each replay re-reads the value) AND in eager mode (one extra
-    // device-scalar read per launch, negligible).
+    // For an INT4-backed cache (4× memory drop) the kernel
+    // dequantizes inline in the dot product; otherwise the bf16 _dyn
+    // kernel reads the raw pool tensor. Both are graph-capture-safe via
+    // the stable n_tokens scalar.
     const float sm_scale = 1.0f / std::sqrt(static_cast<float>(head_dim_));
     auto q2 = q.select(0, 0).select(1, 0).contiguous();           // [n_heads, head_dim]
-    auto attn_flat = paged_attention_decode_dyn(
-        q2,
-        paged->k_pool(layer_idx),
-        paged->v_pool(layer_idx),
-        paged->page_table_tensor_stable(),
-        paged->n_tokens_tensor(),
-        sm_scale);                                                // [n_heads, head_dim]
+    torch::Tensor attn_flat;
+    if (paged->is_int4()) {
+      attn_flat = paged_attention_decode_int4(
+          q2,
+          paged->k_pool(layer_idx),    paged->k_scales(layer_idx),
+          paged->v_pool(layer_idx),    paged->v_scales(layer_idx),
+          paged->page_table_tensor_stable(),
+          paged->n_tokens_tensor(),
+          sm_scale);
+    } else {
+      attn_flat = paged_attention_decode_dyn(
+          q2,
+          paged->k_pool(layer_idx),
+          paged->v_pool(layer_idx),
+          paged->page_table_tensor_stable(),
+          paged->n_tokens_tensor(),
+          sm_scale);
+    }
     auto attn_out_one = attn_flat.view({B, S, n_heads_ * head_dim_});
     return use_float8_
         ? float8_linear_emulated(attn_out_one, w_out_->weight,

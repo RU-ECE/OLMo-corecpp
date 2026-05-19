@@ -120,6 +120,21 @@ class IPagedKVCache {
   /// page_table_tensor_stable()).
   virtual int64_t block_count() const { return 0; }
 
+  // ── INT4 KV variant (item U follow-on) ─────────────────────────────────
+  // When is_int4() returns true, k_pool / v_pool hold uint8 nibble-packed
+  // codes with shape [max_pages, page_size, n_kv_heads, head_dim/2] and the
+  // matching per-vector fp16 scales are accessible via k_scales / v_scales.
+  // The decode kernel that consumes them is paged_attention_decode_int4
+  // (kernels/paged_attention.cu). Default impl: not int4; the scale
+  // accessors throw.
+  virtual bool is_int4() const { return false; }
+  virtual torch::Tensor k_scales(int64_t /*layer*/) const {
+    throw std::runtime_error("k_scales() only valid on int4-backed caches");
+  }
+  virtual torch::Tensor v_scales(int64_t /*layer*/) const {
+    throw std::runtime_error("v_scales() only valid on int4-backed caches");
+  }
+
   // ── Split append for CUDA-graph capture ────────────────────────────────
   // append() does two things: (a) advance the cursor (host bookkeeping +
   // allocate pages + bump n_tokens_t_) and (b) launch the K/V write
@@ -203,5 +218,24 @@ std::unique_ptr<IPagedKVCache> make_paged_kv_cache_graph_safe(
     int64_t max_pages,
     torch::Device device,
     torch::Dtype dtype);
+
+/// INT4-quantized paged KV cache (item U). K/V are stored as uint8
+/// nibble-packed codes with per-vector fp16 scales — 4× memory
+/// reduction vs bf16 at the cost of ~1% perplexity on long context.
+/// Quantization happens at append() time (per-vector dynamic max-abs).
+/// Decode-side attention dispatches through paged_attention_decode_int4
+/// when the cache reports is_int4() == true. Prefill / SDPA-fallback
+/// paths get dequantized bf16 K/V from materialize().
+///
+/// `compute_dtype` is the dtype the dequantized K/V are produced in
+/// (bf16 for OLMo). `page_size`, `max_pages` follow the bf16 cache.
+std::unique_ptr<IPagedKVCache> make_paged_kv_cache_int4(
+    int64_t n_layers,
+    int64_t n_kv_heads,
+    int64_t head_dim,
+    int64_t page_size,
+    int64_t max_pages,
+    torch::Device device,
+    torch::Dtype compute_dtype);
 
 }  // namespace olmo_cpp

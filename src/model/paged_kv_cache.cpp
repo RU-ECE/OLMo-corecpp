@@ -395,4 +395,313 @@ std::unique_ptr<IPagedKVCache> make_paged_kv_cache_graph_safe(
       /*use_dyn_write=*/true);
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// Int4PagedKVCache — INT4-quantized variant. K/V stored as uint8 nibble
+// pairs plus per-vector fp16 scales. 4× memory drop on the cache. Decode
+// kernel: paged_attention_decode_int4 (dequantizes inline in the dot
+// product). Materialize dequantizes the in-use slots back to compute_dtype.
+// ──────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+class Int4PagedKVCache : public IPagedKVCache {
+ public:
+  Int4PagedKVCache(int64_t n_layers,
+                    int64_t n_kv_heads,
+                    int64_t head_dim,
+                    int64_t page_size,
+                    int64_t max_pages,
+                    torch::Device device,
+                    torch::Dtype compute_dtype)
+      : n_layers_(n_layers),
+        n_kv_heads_(n_kv_heads),
+        head_dim_(head_dim),
+        head_dim_half_(head_dim / 2),
+        page_size_(page_size),
+        max_pages_(max_pages),
+        device_(device),
+        compute_dtype_(compute_dtype) {
+    TORCH_CHECK(head_dim % 2 == 0, "Int4PagedKVCache: head_dim must be even");
+
+    auto u8_opts = torch::TensorOptions().dtype(torch::kUInt8).device(device_);
+    auto fp16_opts = torch::TensorOptions().dtype(torch::kFloat16).device(device_);
+    auto i32_opts = torch::TensorOptions().dtype(torch::kInt32).device(device_);
+
+    k_pools_.reserve(n_layers_);
+    v_pools_.reserve(n_layers_);
+    k_scales_.reserve(n_layers_);
+    v_scales_.reserve(n_layers_);
+    for (int64_t l = 0; l < n_layers_; ++l) {
+      k_pools_.push_back(torch::zeros(
+          {max_pages_, page_size_, n_kv_heads_, head_dim_half_}, u8_opts));
+      v_pools_.push_back(torch::zeros(
+          {max_pages_, page_size_, n_kv_heads_, head_dim_half_}, u8_opts));
+      k_scales_.push_back(torch::zeros(
+          {max_pages_, page_size_, n_kv_heads_}, fp16_opts));
+      v_scales_.push_back(torch::zeros(
+          {max_pages_, page_size_, n_kv_heads_}, fp16_opts));
+    }
+
+    page_table_t_ = torch::zeros({max_pages_}, i32_opts);
+    n_tokens_t_   = torch::zeros({}, i32_opts);
+
+    free_list_.reserve(static_cast<size_t>(max_pages_));
+    for (int64_t i = max_pages_ - 1; i >= 0; --i) {
+      free_list_.push_back(static_cast<int32_t>(i));
+    }
+  }
+
+  int64_t seq_len() const override { return logical_len_; }
+
+  int64_t append(int64_t layer, torch::Tensor k, torch::Tensor v) override {
+    TORCH_CHECK(layer >= 0 && layer < n_layers_,
+                "Int4PagedKVCache: layer index out of range");
+    TORCH_CHECK(k.dim() == 4 && v.dim() == 4,
+                "Int4PagedKVCache: k/v must be 4D [B, n_kv_heads, S, head_dim]");
+    TORCH_CHECK(k.size(0) == 1 && v.size(0) == 1,
+                "Int4PagedKVCache: batch>1 not supported");
+    const int64_t S = k.size(2);
+    if (S == 0) return logical_len_;
+
+    int64_t step_start, step_end;
+    if (layer == 0) {
+      step_start = logical_len_;
+      step_end = logical_len_ + S;
+      const int64_t blocks_needed = (step_end + page_size_ - 1) / page_size_;
+      const int64_t blocks_current = static_cast<int64_t>(page_table_.size());
+      if (blocks_needed > blocks_current) {
+        allocate_(blocks_needed - blocks_current);
+        sync_page_table_(blocks_current, blocks_needed);
+      }
+      logical_len_ = step_end;
+      write_n_tokens_(static_cast<int32_t>(logical_len_));
+    } else {
+      step_end = logical_len_;
+      step_start = step_end - S;
+      TORCH_CHECK(step_start >= 0,
+                  "Int4PagedKVCache: append called for layer>0 before layer 0");
+    }
+    quantize_and_write_(layer, k, v, step_start, step_end);
+    return logical_len_;
+  }
+
+  std::pair<torch::Tensor, torch::Tensor> materialize(int64_t layer) const override {
+    if (logical_len_ == 0) return {torch::Tensor(), torch::Tensor()};
+    return dequantize_layer_(layer, logical_len_);
+  }
+
+  int64_t snapshot() const override { return logical_len_; }
+  void rollback(int64_t len) override {
+    TORCH_CHECK(len >= 0 && len <= logical_len_,
+                "Int4PagedKVCache: rollback length out of range");
+    logical_len_ = len;
+    write_n_tokens_(static_cast<int32_t>(logical_len_));
+  }
+  void clear() override {
+    free_list_.clear();
+    for (int64_t i = max_pages_ - 1; i >= 0; --i) {
+      free_list_.push_back(static_cast<int32_t>(i));
+    }
+    page_table_.clear();
+    logical_len_ = 0;
+    write_n_tokens_(0);
+  }
+
+  // INT4-specific accessors.
+  bool is_int4() const override { return true; }
+  bool has_page_table() const override { return true; }
+  int64_t page_size() const override { return page_size_; }
+  torch::Tensor k_pool(int64_t layer) const override {
+    return k_pools_[static_cast<size_t>(layer)];
+  }
+  torch::Tensor v_pool(int64_t layer) const override {
+    return v_pools_[static_cast<size_t>(layer)];
+  }
+  torch::Tensor k_scales(int64_t layer) const override {
+    return k_scales_[static_cast<size_t>(layer)];
+  }
+  torch::Tensor v_scales(int64_t layer) const override {
+    return v_scales_[static_cast<size_t>(layer)];
+  }
+  torch::Tensor page_table_tensor() const override {
+    const int64_t n = static_cast<int64_t>(page_table_.size());
+    return page_table_t_.narrow(0, 0, n);
+  }
+  torch::Tensor page_table_tensor_stable() const override { return page_table_t_; }
+  torch::Tensor n_tokens_tensor() const override { return n_tokens_t_; }
+  int64_t block_count() const override {
+    return static_cast<int64_t>(page_table_.size());
+  }
+
+ private:
+  void allocate_(int64_t n) {
+    TORCH_CHECK(static_cast<int64_t>(free_list_.size()) >= n,
+                "Int4PagedKVCache: out of free pages");
+    for (int64_t i = 0; i < n; ++i) {
+      page_table_.push_back(free_list_.back());
+      free_list_.pop_back();
+    }
+  }
+
+  void sync_page_table_(int64_t old_blocks, int64_t new_blocks) {
+    const int64_t n_new = new_blocks - old_blocks;
+    if (n_new <= 0) return;
+    std::vector<int32_t> tmp(static_cast<size_t>(n_new));
+    for (int64_t i = 0; i < n_new; ++i) {
+      tmp[static_cast<size_t>(i)] = page_table_[static_cast<size_t>(old_blocks + i)];
+    }
+    auto src = torch::from_blob(tmp.data(), {n_new},
+                                 torch::TensorOptions().dtype(torch::kInt32)).clone();
+    page_table_t_.narrow(0, old_blocks, n_new).copy_(src.to(device_));
+  }
+
+  void write_n_tokens_(int32_t v) const {
+    if (device_.is_cpu()) {
+      n_tokens_t_.fill_(v);
+    } else {
+      auto staging = torch::tensor(v, torch::TensorOptions().dtype(torch::kInt32));
+      n_tokens_t_.copy_(staging.to(device_, /*non_blocking=*/true));
+    }
+  }
+
+  // Quantize one (k, v) batch and write into the page pools at [start, end).
+  // Per-vector dynamic max-abs scaling, 2 nibbles per byte along head_dim.
+  void quantize_and_write_(int64_t layer,
+                            torch::Tensor k,
+                            torch::Tensor v,
+                            int64_t start,
+                            int64_t end) {
+    const int64_t S = end - start;
+    if (S == 0) return;
+
+    // Reorder to [S, n_kv_heads, head_dim] in fp32 for stable quantization.
+    auto k_src = k.select(0, 0).permute({1, 0, 2}).contiguous().to(torch::kFloat32);
+    auto v_src = v.select(0, 0).permute({1, 0, 2}).contiguous().to(torch::kFloat32);
+
+    auto [k_packed, k_scale] = quantize_(k_src);
+    auto [v_packed, v_scale] = quantize_(v_src);
+
+    // Scatter (page, slot) → pool. Build host index vectors of length S.
+    std::vector<int64_t> pg_idx(static_cast<size_t>(S));
+    std::vector<int64_t> slot_idx(static_cast<size_t>(S));
+    for (int64_t i = 0; i < S; ++i) {
+      const int64_t g = start + i;
+      pg_idx[static_cast<size_t>(i)] =
+          static_cast<int64_t>(page_table_[static_cast<size_t>(g / page_size_)]);
+      slot_idx[static_cast<size_t>(i)] = g % page_size_;
+    }
+    auto opts_i64 = torch::TensorOptions().dtype(torch::kInt64);
+    auto pg_t   = torch::from_blob(pg_idx.data(),   {S}, opts_i64).clone().to(device_);
+    auto slot_t = torch::from_blob(slot_idx.data(), {S}, opts_i64).clone().to(device_);
+
+    k_pools_[static_cast<size_t>(layer)].index_put_({pg_t, slot_t}, k_packed);
+    v_pools_[static_cast<size_t>(layer)].index_put_({pg_t, slot_t}, v_packed);
+    k_scales_[static_cast<size_t>(layer)].index_put_({pg_t, slot_t}, k_scale);
+    v_scales_[static_cast<size_t>(layer)].index_put_({pg_t, slot_t}, v_scale);
+  }
+
+  // Returns {packed [S, n_kv_heads, head_dim/2] uint8,
+  //          scales [S, n_kv_heads]              fp16}.
+  std::pair<torch::Tensor, torch::Tensor> quantize_(torch::Tensor t_fp32) const {
+    // t_fp32: [S, n_kv_heads, head_dim].
+    auto max_abs = std::get<0>(t_fp32.abs().max(/*dim=*/-1, /*keepdim=*/true));   // [S, n_kv_heads, 1]
+    auto scales = (max_abs / 7.0f).clamp_min(1e-8f);
+    auto q = (t_fp32 / scales).round().clamp(-8.0f, 7.0f);
+    auto q_shifted = (q + 8.0f).to(torch::kUInt8);                                 // [S, n_kv_heads, head_dim]
+    auto q_pair = q_shifted.reshape({q_shifted.size(0), q_shifted.size(1),
+                                       head_dim_half_, 2});
+    auto lo = q_pair.select(-1, 0);
+    auto hi = q_pair.select(-1, 1);
+    auto packed = (lo | (hi.bitwise_left_shift(4))).contiguous();                  // [S, n_kv_heads, head_dim/2]
+    auto scales_out = scales.squeeze(-1).to(torch::kFloat16).contiguous();          // [S, n_kv_heads]
+    return {packed, scales_out};
+  }
+
+  // Dequantize the in-use slots of one layer back to compute_dtype.
+  std::pair<torch::Tensor, torch::Tensor> dequantize_layer_(int64_t layer,
+                                                             int64_t total_len) const {
+    const int64_t n_blocks = (total_len + page_size_ - 1) / page_size_;
+    std::vector<int64_t> pt_int64(static_cast<size_t>(n_blocks));
+    for (int64_t i = 0; i < n_blocks; ++i) {
+      pt_int64[static_cast<size_t>(i)] =
+          static_cast<int64_t>(page_table_[static_cast<size_t>(i)]);
+    }
+    auto pt_t = torch::from_blob(pt_int64.data(), {n_blocks},
+                                   torch::TensorOptions().dtype(torch::kInt64))
+                     .clone().to(device_);
+
+    const auto& k_pool = k_pools_[static_cast<size_t>(layer)];
+    const auto& v_pool = v_pools_[static_cast<size_t>(layer)];
+    const auto& k_scale = k_scales_[static_cast<size_t>(layer)];
+    const auto& v_scale = v_scales_[static_cast<size_t>(layer)];
+
+    auto k_blocks = k_pool.index_select(0, pt_t);   // [n_blocks, page, H, D/2] uint8
+    auto v_blocks = v_pool.index_select(0, pt_t);
+    auto k_sc_b   = k_scale.index_select(0, pt_t);  // [n_blocks, page, H] fp16
+    auto v_sc_b   = v_scale.index_select(0, pt_t);
+
+    auto k_flat = k_blocks.reshape({n_blocks * page_size_, n_kv_heads_, head_dim_half_})
+                          .narrow(0, 0, total_len);
+    auto v_flat = v_blocks.reshape({n_blocks * page_size_, n_kv_heads_, head_dim_half_})
+                          .narrow(0, 0, total_len);
+    auto k_sc_f = k_sc_b.reshape({n_blocks * page_size_, n_kv_heads_})
+                        .narrow(0, 0, total_len);
+    auto v_sc_f = v_sc_b.reshape({n_blocks * page_size_, n_kv_heads_})
+                        .narrow(0, 0, total_len);
+
+    auto k_dq = dequantize_(k_flat, k_sc_f);   // [total_len, H, D] compute_dtype
+    auto v_dq = dequantize_(v_flat, v_sc_f);
+
+    auto k_out = k_dq.permute({1, 0, 2}).unsqueeze(0).contiguous();   // [1, H, T, D]
+    auto v_out = v_dq.permute({1, 0, 2}).unsqueeze(0).contiguous();
+    return {k_out, v_out};
+  }
+
+  torch::Tensor dequantize_(torch::Tensor packed, torch::Tensor scales) const {
+    // packed: [T, H, D/2] uint8. scales: [T, H] fp16.
+    auto p32 = packed.to(torch::kInt32);
+    auto lo  = (p32.bitwise_and(0xF) - 8).to(torch::kFloat32);              // [T, H, D/2]
+    auto hi  = ((p32.bitwise_right_shift(4)).bitwise_and(0xF) - 8).to(torch::kFloat32);
+    auto stacked = torch::stack({lo, hi}, /*dim=*/-1);                       // [T, H, D/2, 2]
+    auto dq = stacked.reshape({packed.size(0), packed.size(1), head_dim_});  // [T, H, D]
+    auto sc = scales.to(torch::kFloat32).unsqueeze(-1);                      // [T, H, 1]
+    auto out = dq * sc;
+    return out.to(compute_dtype_);
+  }
+
+  int64_t n_layers_;
+  int64_t n_kv_heads_;
+  int64_t head_dim_;
+  int64_t head_dim_half_;
+  int64_t page_size_;
+  int64_t max_pages_;
+  int64_t logical_len_ = 0;
+  torch::Device device_;
+  torch::Dtype compute_dtype_;
+
+  std::vector<int32_t> free_list_;
+  std::vector<int32_t> page_table_;
+  std::vector<torch::Tensor> k_pools_;
+  std::vector<torch::Tensor> v_pools_;
+  std::vector<torch::Tensor> k_scales_;
+  std::vector<torch::Tensor> v_scales_;
+
+  mutable torch::Tensor page_table_t_;
+  mutable torch::Tensor n_tokens_t_;
+};
+
+}  // namespace
+
+std::unique_ptr<IPagedKVCache> make_paged_kv_cache_int4(
+    int64_t n_layers,
+    int64_t n_kv_heads,
+    int64_t head_dim,
+    int64_t page_size,
+    int64_t max_pages,
+    torch::Device device,
+    torch::Dtype compute_dtype) {
+  return std::make_unique<Int4PagedKVCache>(
+      n_layers, n_kv_heads, head_dim, page_size, max_pages, device, compute_dtype);
+}
+
 }  // namespace olmo_cpp

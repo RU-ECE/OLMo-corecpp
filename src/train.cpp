@@ -51,6 +51,7 @@
 #include <c10/cuda/CUDACachingAllocator.h>
 #endif
 #include "olmo_cpp/distributed/ddp.hpp"
+#include "olmo_cpp/distributed/zero1.hpp"
 #include "olmo_cpp/optim/lion.hpp"
 #include "olmo_cpp/optim/muon.hpp"
 #include "olmo_cpp/optim/dion.hpp"
@@ -348,35 +349,48 @@ void train(
   }
   int rank = ddp ? ddp->rank() : 0;
 
+  // ---- ZeRO-1: partition optimizer state across DP ranks ----
+  // Each rank only constructs its optimizer over its share of the
+  // parameters (1/world_size). After every step() we allgather the
+  // updated weights so every replica sees identical params again.
+  // Single-rank / DDP-off: sharder is null, opt_params == all_params.
+  std::unique_ptr<OptimizerStateSharder> zero1;
+  if (cfg.use_zero1 && ddp && ddp->is_distributed()) {
+    zero1 = std::make_unique<OptimizerStateSharder>(
+        ddp->backend(), ddp->rank(), ddp->world_size());
+  }
+  auto all_params = model->parameters();
+  auto opt_params = zero1 ? zero1->partition(all_params) : all_params;
+
   // ---- Create optimizer ----
   std::unique_ptr<torch::optim::Optimizer> optimizer;
   std::string optim_display;
   if (cfg.optimizer == "lion") {
     optimizer = std::make_unique<Lion>(
-        model->parameters(), LionOptions(cfg.lr).weight_decay(cfg.weight_decay));
+        opt_params, LionOptions(cfg.lr).weight_decay(cfg.weight_decay));
     optim_display = "Lion";
   } else if (cfg.optimizer == "muon") {
     optimizer = std::make_unique<Muon>(
-        model->parameters(), MuonOptions(cfg.lr).async_ns(cfg.async_muon));
+        opt_params, MuonOptions(cfg.lr).async_ns(cfg.async_muon));
     optim_display = cfg.async_muon ? "Muon (async NS)" : "Muon";
   } else if (cfg.optimizer == "dion") {
     optimizer = std::make_unique<DION>(
-        model->parameters(), DIONOptions(cfg.lr).weight_decay(cfg.weight_decay));
+        opt_params, DIONOptions(cfg.lr).weight_decay(cfg.weight_decay));
     optim_display = "DION";
   } else if (cfg.optimizer == "adamw_8bit") {
     // 8-bit block-quantized Adam states. ~4x optimizer-memory reduction
     // vs FP32 Adam; trajectory parity within Adam-noise (bitsandbytes).
     optimizer = std::make_unique<EightBitAdamW>(
-        model->parameters(),
+        opt_params,
         EightBitAdamWOptions().lr(cfg.lr).weight_decay(cfg.weight_decay));
     optim_display = "EightBitAdamW (block-quantized)";
   } else if (cfg.use_foreach_optimizer) {
     optimizer = std::make_unique<ForeachAdamW>(
-        model->parameters(), ForeachAdamWOptions(cfg.lr).weight_decay(cfg.weight_decay));
+        opt_params, ForeachAdamWOptions(cfg.lr).weight_decay(cfg.weight_decay));
     optim_display = "ForeachAdamW";
   } else {
     optimizer = std::make_unique<torch::optim::AdamW>(
-        model->parameters(),
+        opt_params,
         torch::optim::AdamWOptions(cfg.lr).weight_decay(cfg.weight_decay));
     optim_display = "AdamW (standard)";
   }
@@ -614,6 +628,8 @@ void train(
       clip_grad_norm_gpu(model_params, cfg.max_grad_norm);
       optimizer->step();
     }
+    // ZeRO-1: broadcast each updated parameter from its owning rank.
+    if (zero1) zero1->allgather_params(all_params);
 
     cb_mgr.on_after_optimizer_step(state);
 
@@ -719,26 +735,35 @@ void train(
   }
   int rank = ddp ? ddp->rank() : 0;
 
+  // ZeRO-1 (FusedTransformer overload).
+  std::unique_ptr<OptimizerStateSharder> zero1;
+  if (cfg.use_zero1 && ddp && ddp->is_distributed()) {
+    zero1 = std::make_unique<OptimizerStateSharder>(
+        ddp->backend(), ddp->rank(), ddp->world_size());
+  }
+  auto all_params = model->parameters();
+  auto opt_params = zero1 ? zero1->partition(all_params) : all_params;
+
   std::unique_ptr<torch::optim::Optimizer> optimizer;
   if (cfg.optimizer == "lion") {
     optimizer = std::make_unique<Lion>(
-        model->parameters(), LionOptions(cfg.lr).weight_decay(cfg.weight_decay));
+        opt_params, LionOptions(cfg.lr).weight_decay(cfg.weight_decay));
   } else if (cfg.optimizer == "muon") {
     optimizer = std::make_unique<Muon>(
-        model->parameters(), MuonOptions(cfg.lr));
+        opt_params, MuonOptions(cfg.lr));
   } else if (cfg.optimizer == "dion") {
     optimizer = std::make_unique<DION>(
-        model->parameters(), DIONOptions(cfg.lr).weight_decay(cfg.weight_decay));
+        opt_params, DIONOptions(cfg.lr).weight_decay(cfg.weight_decay));
   } else if (cfg.optimizer == "adamw_8bit") {
     optimizer = std::make_unique<EightBitAdamW>(
-        model->parameters(),
+        opt_params,
         EightBitAdamWOptions().lr(cfg.lr).weight_decay(cfg.weight_decay));
   } else if (cfg.use_foreach_optimizer) {
     optimizer = std::make_unique<ForeachAdamW>(
-        model->parameters(), ForeachAdamWOptions(cfg.lr).weight_decay(cfg.weight_decay));
+        opt_params, ForeachAdamWOptions(cfg.lr).weight_decay(cfg.weight_decay));
   } else {
     optimizer = std::make_unique<torch::optim::AdamW>(
-        model->parameters(),
+        opt_params,
         torch::optim::AdamWOptions(cfg.lr).weight_decay(cfg.weight_decay));
   }
 
@@ -1052,6 +1077,7 @@ void train(
 
     clip_grad_norm_gpu(model_params, cfg.max_grad_norm);
     optimizer->step();
+    if (zero1) zero1->allgather_params(all_params);
     cb_mgr.on_after_optimizer_step(state);
 
     total_tokens += tokens_per_step;

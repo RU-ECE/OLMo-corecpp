@@ -100,6 +100,9 @@ class DDPContext {
   int world_size() const { return world_size_; }
   /// True iff a real backend was initialised (distributed env was present).
   bool is_distributed() const { return backend_ != nullptr; }
+  /// Access the c10d backend for higher-level orchestration (ZeRO-1,
+  /// expert-parallel, etc.). Returns null when DDP is inactive.
+  c10::intrusive_ptr<c10d::Backend> backend() const { return backend_; }
 
  private:
   // Private ctor; instances are produced by init_from_env().

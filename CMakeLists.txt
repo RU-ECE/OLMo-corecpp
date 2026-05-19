@@ -593,6 +593,15 @@ target_link_libraries(test_paged_kv PRIVATE olmo_cpp)
 target_include_directories(test_paged_kv PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(test_paged_kv PRIVATE -O3 -march=native)
 
+# INT4 post-training weight-only quantizer (item T).
+add_executable(quantize_int4 tools/quantize_int4.cpp)
+target_link_libraries(quantize_int4 PRIVATE olmo_cpp)
+target_include_directories(quantize_int4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${JSON_INCLUDE_DIR})
+target_compile_options(quantize_int4 PRIVATE -O3 -march=native)
+if(JSON_INCLUDE_DIR)
+  target_compile_definitions(quantize_int4 PRIVATE HAS_NLOHMANN_JSON=1)
+endif()
+
 # SharedBlockPool unit test (fast-inference [I-7]).
 # CPU-only; verifies alloc/dec_ref, content-hash lookup, hash chaining,
 # and cross-request prefix sharing all hold.

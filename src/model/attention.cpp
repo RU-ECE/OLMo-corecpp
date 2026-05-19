@@ -25,6 +25,8 @@
  */
 #include "olmo_cpp/model/attention.hpp"
 #include "olmo_cpp/backend/paged_attention.hpp"
+#include "olmo_cpp/backend/cublas_direct.hpp"
+#include "olmo_cpp/backend/fused_qkv_rope.hpp"
 #include <ATen/ops/scaled_dot_product_attention.h>
 #include <cmath>
 #include <limits>
@@ -89,20 +91,73 @@ torch::Tensor AttentionImpl::forward(
   auto B = x.size(0);
   auto S = x.size(1);
 
-  // FP8 emulation gate: when active, route each linear through the
-  // straight-through quantize/dequantize path. Forward sees fp8-rounded
-  // activations + weights; gradient passes through unchanged (STE).
-  auto linear_maybe_fp8 = [&](torch::nn::Linear& lin,
-                              Float8ScaleState* sx, Float8ScaleState* sw,
-                              const torch::Tensor& in) -> torch::Tensor {
-    if (!use_float8_) return lin(in);
-    return float8_linear_emulated(in, lin->weight,
-                                  lin->bias.defined() ? lin->bias : torch::Tensor(),
-                                  *sx, *sw);
-  };
-  auto q = linear_maybe_fp8(w_q_, fp8_qx_.get(), fp8_qw_.get(), x);
-  auto k = linear_maybe_fp8(w_k_, fp8_kx_.get(), fp8_kw_.get(), x);
-  auto v = linear_maybe_fp8(w_v_, fp8_vx_.get(), fp8_vw_.get(), x);
+  // Hottest path: CUDA + no FP8 STE + no QK-norm + RoPE active.
+  // Call the fully fused QKV+RoPE kernel (item G). One launch produces
+  // q/k/v already in head-major layout with RoPE applied. Replaces
+  // 3 Linears + 3 reshapes + 1 RoPE = 7 ATen calls.
+  torch::Tensor q, k, v;
+  const bool can_use_fused_qkv =
+      x.is_cuda() && !use_float8_ && !q_norm_ && !k_norm_ && rope_bufs != nullptr;
+  if (can_use_fused_qkv) {
+    auto w_packed = torch::cat({w_q_->weight, w_k_->weight, w_v_->weight}, /*dim=*/0);
+    // RoPEBuffers stores pos_cos/pos_sin as [seq_len, head_dim] full-dim
+    // broadcast; the fused kernel takes [S, head_dim/2] (first half is
+    // enough under half-rotation).
+    const int64_t s_offset = start_pos.value_or(0);
+    auto cos_full = rope_bufs->pos_cos.narrow(0, s_offset, S);
+    auto sin_full = rope_bufs->pos_sin.narrow(0, s_offset, S);
+    auto cos_half = cos_full.narrow(-1, 0, head_dim_ / 2);
+    auto sin_half = sin_full.narrow(-1, 0, head_dim_ / 2);
+    auto out = fused_qkv_rope_autograd(x, w_packed, cos_half, sin_half,
+                                         n_heads_, n_kv_heads_, head_dim_);
+    q = std::get<0>(out);  // [B, n_q,  S, head_dim] with RoPE
+    k = std::get<1>(out);
+    v = std::get<2>(out);
+    // GQA expand + cache append + SDPA all happen below. Skip RoPE
+    // (already applied) and the projection lines that follow.
+    if (layer_cache) {
+      auto [full_k, full_v] = layer_cache->update(k, v);
+      k = full_k;
+      v = full_v;
+    }
+    if (n_heads_rep_ > 1) {
+      auto kS = k.size(2);
+      k = k.unsqueeze(2).expand({B, n_kv_heads_, n_heads_rep_, kS, head_dim_}).reshape({B, n_heads_, kS, head_dim_});
+      v = v.unsqueeze(2).expand({B, n_kv_heads_, n_heads_rep_, kS, head_dim_}).reshape({B, n_heads_, kS, head_dim_});
+    }
+    bool is_causal_fused = (S > 1) && (layer_cache == nullptr || layer_cache->seq_len() == S);
+    auto attn_out = at::scaled_dot_product_attention(q, k, v, c10::nullopt, 0.0, is_causal_fused);
+    attn_out = attn_out.transpose(1, 2).reshape({B, S, -1});
+    return fast_linear(attn_out, w_out_->weight,
+                       w_out_->bias.defined() ? w_out_->bias : torch::Tensor());
+  }
+
+  // Packed-QKV path (CPU or QK-norm active): still concat weights and do
+  // one Linear, just don't use the fused-with-RoPE kernel. Saves 2 of
+  // the 3 Linear launches without changing numerics.
+  if (!use_float8_) {
+    auto w_packed = torch::cat({w_q_->weight, w_k_->weight, w_v_->weight}, /*dim=*/0);
+    auto qkv = fast_linear(x, w_packed, torch::Tensor());
+    const int64_t q_dim  = n_heads_    * head_dim_;
+    const int64_t kv_dim = n_kv_heads_ * head_dim_;
+    q = qkv.narrow(-1, 0,                  q_dim);
+    k = qkv.narrow(-1, q_dim,              kv_dim);
+    v = qkv.narrow(-1, q_dim + kv_dim,     kv_dim);
+  } else {
+    // FP8 STE path: each Linear runs through float8_linear_emulated with
+    // its own scale tracker; can't pack-and-share because each has its
+    // own per-tensor scale.
+    auto linear_fp8 = [&](torch::nn::Linear& lin,
+                          Float8ScaleState* sx, Float8ScaleState* sw,
+                          const torch::Tensor& in) -> torch::Tensor {
+      return float8_linear_emulated(in, lin->weight,
+                                    lin->bias.defined() ? lin->bias : torch::Tensor(),
+                                    *sx, *sw);
+    };
+    q = linear_fp8(w_q_, fp8_qx_.get(), fp8_qw_.get(), x);
+    k = linear_fp8(w_k_, fp8_kx_.get(), fp8_kw_.get(), x);
+    v = linear_fp8(w_v_, fp8_vx_.get(), fp8_vw_.get(), x);
+  }
 
   // QK-norm before reshape
   if (q_norm_ && !use_head_qk_norm_) q = (*q_norm_)(q);
@@ -179,7 +234,8 @@ torch::Tensor AttentionImpl::forward(
       ? float8_linear_emulated(attn_out, w_out_->weight,
                                w_out_->bias.defined() ? w_out_->bias : torch::Tensor(),
                                *fp8_ox_, *fp8_ow_)
-      : w_out_(attn_out);
+      : fast_linear(attn_out, w_out_->weight,
+                    w_out_->bias.defined() ? w_out_->bias : torch::Tensor());
 }
 
 // Tree-attention forward (item 8.1). Standard projections + RoPE, then

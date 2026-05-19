@@ -28,31 +28,13 @@ namespace olmo_cpp {
 
 namespace {
 
-// Pair-form RoPE: even/odd elements are rotated by (cos, sin) for that
-// position. cos/sin tables hold head_dim/2 entries each (one per pair).
-__device__ __forceinline__ void apply_rope_pair_bf16(
-    int j_pair, int head_dim,
-    const __nv_bfloat16* cos, const __nv_bfloat16* sin,
-    float& v_even, float& v_odd) {
-  const float c = __bfloat162float(cos[j_pair]);
-  const float s = __bfloat162float(sin[j_pair]);
-  const float ne = v_even * c - v_odd * s;
-  const float no = v_even * s + v_odd * c;
-  v_even = ne;
-  v_odd  = no;
-}
-
-__device__ __forceinline__ void apply_rope_pair_f32(
-    int j_pair, int head_dim,
-    const float* cos, const float* sin,
-    float& v_even, float& v_odd) {
-  const float c = cos[j_pair];
-  const float s = sin[j_pair];
-  const float ne = v_even * c - v_odd * s;
-  const float no = v_even * s + v_odd * c;
-  v_even = ne;
-  v_odd  = no;
-}
+// Half-rotation RoPE matching the model's RotaryEmbedding convention:
+//   y = x * cos + rotate_half(x) * sin
+//   rotate_half(x) = [-x[D/2:], x[:D/2]]
+// cos/sin tables here are [S, head_dim/2] (the first half; second half
+// is identical by construction). For position i in [0, head_dim/2):
+//   new_first[i]  = first[i]  * cos[i] - second[i] * sin[i]
+//   new_second[i] = first[i]  * sin[i] + second[i] * cos[i]
 
 template <typename T_in, typename T_cos>
 __global__ void fused_qkv_rope_kernel(
@@ -114,17 +96,21 @@ __global__ void fused_qkv_rope_kernel(
   }
   __syncthreads();
 
-  // Inline RoPE on the head's smem_out for Q/K heads.
+  // Half-rotation RoPE on the head's smem_out for Q/K heads. Each thread
+  // i in [0, head_dim/2) operates on (smem_out[i], smem_out[i + head_dim/2]).
   if (needs_rope && i < half) {
-    float v_even = smem_out[2 * i];
-    float v_odd  = smem_out[2 * i + 1];
+    float c, s;
     if constexpr (std::is_same<T_cos, __nv_bfloat16>::value) {
-      apply_rope_pair_bf16(i, head_dim, cos_s, sin_s, v_even, v_odd);
+      c = __bfloat162float(cos_s[i]);
+      s = __bfloat162float(sin_s[i]);
     } else {
-      apply_rope_pair_f32(i, head_dim, cos_s, sin_s, v_even, v_odd);
+      c = cos_s[i];
+      s = sin_s[i];
     }
-    smem_out[2 * i]     = v_even;
-    smem_out[2 * i + 1] = v_odd;
+    const float a = smem_out[i];
+    const float b = smem_out[i + half];
+    smem_out[i]        = a * c - b * s;
+    smem_out[i + half] = a * s + b * c;
   }
   __syncthreads();
 

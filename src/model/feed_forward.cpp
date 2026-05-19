@@ -34,6 +34,8 @@
  */
 #include "olmo_cpp/model/feed_forward.hpp"
 #include "olmo_cpp/backend/backend.hpp"
+#include "olmo_cpp/backend/fused_ffn.hpp"
+#include "olmo_cpp/backend/cublas_direct.hpp"
 
 namespace olmo_cpp {
 
@@ -71,16 +73,26 @@ FeedForwardImpl::FeedForwardImpl(int64_t d_model, int64_t hidden_size, bool bias
 /// Output    : [B, S, D] (same leading shape) — the FFN contribution.
 /// Math: y = w2( silu(gate) * up ).
 torch::Tensor FeedForwardImpl::forward(torch::Tensor x) {
-  // FP8 routing helper. Identical math to torch::nn::functional::linear
-  // when use_float8_ is false; when true, applies STE FP8 emulation
-  // through float8_linear_emulated.
+  // Hot path: when fused_gate_up is on, no FP8 STE, and the inputs are CUDA,
+  // call the fused FFN macro kernel (item I). One launch instead of three.
+  // CPU and FP8-active paths fall through to the explicit-op variants below.
+  if (fused_ && !use_float8_ && x.is_cuda()) {
+    return fused_ffn_autograd(x, w_gate_up_->weight, w2_->weight);
+  }
+
+  // FP8 STE / non-fused fallback: route each Linear through float8_linear_emulated
+  // (when FP8 is on) or fast_linear (item L: direct cuBLASLt bypass of the
+  // ATen dispatcher on the hot path).
   auto lin = [&](torch::nn::Linear& m,
                  Float8ScaleState* sx, Float8ScaleState* sw,
                  const torch::Tensor& in) -> torch::Tensor {
-    if (!use_float8_) return m(in);
-    return float8_linear_emulated(in, m->weight,
-                                  m->bias.defined() ? m->bias : torch::Tensor(),
-                                  *sx, *sw);
+    if (use_float8_) {
+      return float8_linear_emulated(in, m->weight,
+                                    m->bias.defined() ? m->bias : torch::Tensor(),
+                                    *sx, *sw);
+    }
+    return fast_linear(in, m->weight,
+                       m->bias.defined() ? m->bias : torch::Tensor());
   };
 
   if (fused_) {

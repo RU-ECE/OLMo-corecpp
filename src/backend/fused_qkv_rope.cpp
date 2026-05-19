@@ -16,23 +16,23 @@ namespace olmo_cpp {
 
 namespace {
 
-// Apply RoPE in the "interleaved" pairs form: x_even, x_odd ->
-//   x_even' = x_even * cos - x_odd * sin
-//   x_odd'  = x_even * sin + x_odd * cos
-// cos/sin have shape [S, head_dim/2], broadcast over (B, n_heads).
+// Half-rotation RoPE matching the model's RotaryEmbedding (LLaMA / OLMo
+// convention): rotate_half = [-second_half; first_half]. cos/sin tables
+// have shape [S, head_dim/2] (the first half; full-dim form repeats).
+//   new_first  = first  * cos - second * sin
+//   new_second = first  * sin + second * cos
 torch::Tensor apply_rope_ref(torch::Tensor t,    // [B, n_heads, S, head_dim]
                               torch::Tensor cos, // [S, head_dim/2]
                               torch::Tensor sin) {
   const int64_t head_dim = t.size(3);
-  auto t_view = t.view({t.size(0), t.size(1), t.size(2), head_dim / 2, 2});
-  auto x_even = t_view.select(-1, 0);  // [B, H, S, head_dim/2]
-  auto x_odd  = t_view.select(-1, 1);
+  const int64_t half = head_dim / 2;
+  auto first  = t.narrow(-1, 0,    half);   // [B, H, S, D/2]
+  auto second = t.narrow(-1, half, half);
   auto cos_b = cos.view({1, 1, cos.size(0), cos.size(1)});
   auto sin_b = sin.view({1, 1, sin.size(0), sin.size(1)});
-  auto y_even = x_even * cos_b - x_odd * sin_b;
-  auto y_odd  = x_even * sin_b + x_odd * cos_b;
-  auto out = torch::stack({y_even, y_odd}, /*dim=*/-1);
-  return out.reshape(t.sizes());
+  auto y_first  = first * cos_b - second * sin_b;
+  auto y_second = first * sin_b + second * cos_b;
+  return torch::cat({y_first, y_second}, /*dim=*/-1);
 }
 
 }  // namespace

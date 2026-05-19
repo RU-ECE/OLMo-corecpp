@@ -60,9 +60,15 @@ __global__ void fused_qkv_rope_wmma_kernel(
   if (row_base >= N) return;
 
   const int warp_id = threadIdx.x / kWarpSize;
+  const int lane    = threadIdx.x & 31;
 
-  // Per-block shared memory: the full [16, F] output tile in bf16.
+  // Per-block shared memory layout:
+  //   [0, 16 * F * sizeof(bf16))                         output tile (bf16)
+  //   [trailing, + warps * 16 * 16 * sizeof(float))      per-warp wmma scratch
   extern __shared__ __nv_bfloat16 smem[];
+  __nv_bfloat16* sh_out  = smem;
+  float* sh_wmma = reinterpret_cast<float*>(sh_out + 16 * F);
+  float* my_wmma = sh_wmma + warp_id * (kWmmaM * kWmmaN);
 
   // Phase 1 — WMMA matmul. Compute 16 rows × F cols of x @ w_qkv.T.
   // x is row-major [N, d]; w_qkv is row-major [F, d]. To form x @ w_qkv.T
@@ -81,13 +87,15 @@ __global__ void fused_qkv_rope_wmma_kernel(
       wmma::load_matrix_sync(b, w_qkv + (int64_t)(ct * kWmmaN) * d + kt * kWmmaK, d);
       wmma::mma_sync(c, a, b, c);
     }
-    // Narrow fp32 accumulator to bf16 and write into shared memory.
-    float c_fp32[kWmmaM * kWmmaN];
-    wmma::store_matrix_sync(c_fp32, c, kWmmaN, wmma::mem_row_major);
-    for (int i = 0; i < kWmmaM; ++i) {
-      for (int j = 0; j < kWmmaN; ++j) {
-        smem[i * F + ct * kWmmaN + j] = __float2bfloat16(c_fp32[i * kWmmaN + j]);
-      }
+    // Collective store of the 16×16 tile into the warp's scratch slot.
+    // All threads in the warp pass the same pointer (per WMMA contract).
+    wmma::store_matrix_sync(my_wmma, c, kWmmaN, wmma::mem_row_major);
+    __syncwarp();
+    // Cooperative narrow + scatter into the bf16 output tile.
+    for (int idx = lane; idx < kWmmaM * kWmmaN; idx += 32) {
+      const int i = idx / kWmmaN;
+      const int j = idx % kWmmaN;
+      sh_out[i * F + ct * kWmmaN + j] = __float2bfloat16(my_wmma[idx]);
     }
   }
   __syncthreads();
@@ -110,8 +118,8 @@ __global__ void fused_qkv_rope_wmma_kernel(
     const int s_pos = global_row % S;
 
     const int head_col_offset = hi * hd;  // Q/K live in [0, (n_q+n_kv)*hd)
-    const float a_val = __bfloat162float(smem[r * F + head_col_offset + di]);
-    const float b_val = __bfloat162float(smem[r * F + head_col_offset + di + hd_half]);
+    const float a_val = __bfloat162float(sh_out[r * F + head_col_offset + di]);
+    const float b_val = __bfloat162float(sh_out[r * F + head_col_offset + di + hd_half]);
     const float cv    = __bfloat162float(cos[(int64_t)s_pos * hd_half + di]);
     const float sv    = __bfloat162float(sin[(int64_t)s_pos * hd_half + di]);
     const float new_a = a_val * cv - b_val * sv;
@@ -138,7 +146,7 @@ __global__ void fused_qkv_rope_wmma_kernel(
     if (global_row >= N) continue;
     const int b = global_row / S;
     const int s_pos = global_row % S;
-    const float v_val = __bfloat162float(smem[r * F + v_col_base + hi * hd + di]);
+    const float v_val = __bfloat162float(sh_out[r * F + v_col_base + hi * hd + di]);
     const int64_t base = (((int64_t)b * n_kv + hi) * S + s_pos) * hd;
     v_out[base + di] = __float2bfloat16(v_val);
   }
@@ -186,7 +194,9 @@ fused_qkv_rope_wmma_cuda(torch::Tensor x,
   auto v = torch::empty({B, n_kv, S, hd}, opts);
 
   const int grid  = N / kWmmaM;
-  const size_t shmem = (size_t)kWmmaM * F * sizeof(__nv_bfloat16);
+  const size_t shmem = (size_t)kWmmaM * F * sizeof(__nv_bfloat16)
+                     + (size_t)kWarpsPerBlock * kWmmaM * kWmmaN * sizeof(float);
+  // ^ trailing term: per-warp scratch for wmma::store_matrix_sync.
 
   fused_qkv_rope_wmma_kernel<<<grid, kThreadsPerBlock, shmem>>>(
       reinterpret_cast<const __nv_bfloat16*>(x_c.data_ptr<at::BFloat16>()),

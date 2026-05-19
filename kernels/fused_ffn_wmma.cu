@@ -72,6 +72,13 @@ __global__ void fused_ffn_wmma_kernel(
   extern __shared__ __nv_bfloat16 smem[];
   __nv_bfloat16* sh_gate_up = smem;                       // [16, 2H]
   __nv_bfloat16* sh_act     = smem + 16 * (2 * H);        // [16, H]
+  // Per-warp fp32 scratch for wmma::store_matrix_sync. WMMA requires
+  // every thread in the warp to pass the SAME pointer (shared or
+  // global memory); per-thread stack arrays are UB. Each of the
+  // kWarpsPerBlock warps gets its own [16, 16] scratch slot here.
+  float* sh_wmma = reinterpret_cast<float*>(sh_act + 16 * H);
+  float* my_wmma = sh_wmma + warp_id * (kWmmaM * kWmmaN);
+  const int lane = threadIdx.x & 31;
 
   // Compute gate_up = x_tile @ w_gate_up.T.
   // gate_up tile [16, 2H]. Each warp handles 2H / (warps * 16) column tiles.
@@ -79,33 +86,24 @@ __global__ void fused_ffn_wmma_kernel(
   for (int ct = warp_id; ct < col_tiles_2H; ct += kWarpsPerBlock) {
     wmma::fragment<wmma::accumulator, kWmmaM, kWmmaN, kWmmaK, float> c;
     wmma::fill_fragment(c, 0.0f);
-    // Iterate over K-tiles along d.
     for (int kt = 0; kt < d / kWmmaK; ++kt) {
       wmma::fragment<wmma::matrix_a, kWmmaM, kWmmaN, kWmmaK,
                       __nv_bfloat16, wmma::row_major> a;
       wmma::fragment<wmma::matrix_b, kWmmaM, kWmmaN, kWmmaK,
                       __nv_bfloat16, wmma::col_major> b;
-      // x[row_base : row_base+16, kt*16 : (kt+1)*16]
       wmma::load_matrix_sync(a, x + (int64_t)row_base * d + kt * kWmmaK, d);
-      // w_gate_up[(ct*16) : (ct+1)*16, kt*16 : (kt+1)*16]
       wmma::load_matrix_sync(b, w_gate_up + (int64_t)(ct * kWmmaN) * d + kt * kWmmaK, d);
       wmma::mma_sync(c, a, b, c);
     }
-    // Store the [16, 16] tile into sh_gate_up at column offset ct*16.
-    __nv_bfloat16 c_bf16[kWmmaM * kWmmaN];
-    wmma::fragment<wmma::accumulator, kWmmaM, kWmmaN, kWmmaK, float> c_out = c;
-    // Convert to bf16 via a per-element pass. WMMA stores in fp32; we
-    // narrow on the fly.
-    float c_fp32[kWmmaM * kWmmaN];
-    wmma::store_matrix_sync(c_fp32, c_out, kWmmaN, wmma::mem_row_major);
-    for (int e = 0; e < kWmmaM * kWmmaN; ++e) {
-      c_bf16[e] = __float2bfloat16(c_fp32[e]);
-    }
-    // Write to shared memory.
-    for (int i = 0; i < kWmmaM; ++i) {
-      for (int j = 0; j < kWmmaN; ++j) {
-        sh_gate_up[i * (2 * H) + ct * kWmmaN + j] = c_bf16[i * kWmmaN + j];
-      }
+    // Collective store of the [16, 16] fp32 tile into the warp's
+    // shared-memory scratch slot. All 32 threads pass `my_wmma`.
+    wmma::store_matrix_sync(my_wmma, c, kWmmaN, wmma::mem_row_major);
+    __syncwarp();
+    // Each warp's threads cooperatively narrow + scatter into sh_gate_up.
+    for (int idx = lane; idx < kWmmaM * kWmmaN; idx += 32) {
+      const int i = idx / kWmmaN;
+      const int j = idx % kWmmaN;
+      sh_gate_up[i * (2 * H) + ct * kWmmaN + j] = __float2bfloat16(my_wmma[idx]);
     }
   }
   __syncthreads();
@@ -151,15 +149,14 @@ __global__ void fused_ffn_wmma_kernel(
       wmma::load_matrix_sync(b, w_down + (int64_t)(ct * kWmmaN) * H + kt * kWmmaK, H);
       wmma::mma_sync(c, a, b, c);
     }
-    float c_fp32[kWmmaM * kWmmaN];
-    wmma::store_matrix_sync(c_fp32, c, kWmmaN, wmma::mem_row_major);
-    for (int i = 0; i < kWmmaM; ++i) {
-      for (int j = 0; j < kWmmaN; ++j) {
-        const int gi = row_base + i;
-        if (gi >= N) continue;
-        y[(int64_t)gi * d + ct * kWmmaN + j] =
-            __float2bfloat16(c_fp32[i * kWmmaN + j]);
-      }
+    wmma::store_matrix_sync(my_wmma, c, kWmmaN, wmma::mem_row_major);
+    __syncwarp();
+    for (int idx = lane; idx < kWmmaM * kWmmaN; idx += 32) {
+      const int i = idx / kWmmaN;
+      const int j = idx % kWmmaN;
+      const int gi = row_base + i;
+      if (gi >= N) continue;
+      y[(int64_t)gi * d + ct * kWmmaN + j] = __float2bfloat16(my_wmma[idx]);
     }
   }
 }
@@ -185,7 +182,9 @@ torch::Tensor fused_ffn_wmma_cuda(torch::Tensor x,
   const int N = static_cast<int>(B * S);
   auto y = torch::empty_like(x_c);
 
-  const size_t shmem = (16 * (2 * H) + 16 * H) * sizeof(__nv_bfloat16);
+  const size_t shmem = (16 * (2 * H) + 16 * H) * sizeof(__nv_bfloat16)
+                     + (size_t)kWarpsPerBlock * kWmmaM * kWmmaN * sizeof(float);
+  // ^ trailing term: per-warp scratch for wmma::store_matrix_sync.
   const int grid = (N + 16 - 1) / 16;
   fused_ffn_wmma_kernel<<<grid, kThreadsPerBlock, shmem>>>(
       reinterpret_cast<const __nv_bfloat16*>(x_c.data_ptr<at::BFloat16>()),
@@ -221,7 +220,9 @@ fused_ffn_wmma_train_cuda(torch::Tensor x,
   auto y = torch::empty_like(x_c);
   auto gate_up = torch::empty({B, S, 2 * H}, x_c.options());
 
-  const size_t shmem = (16 * (2 * H) + 16 * H) * sizeof(__nv_bfloat16);
+  const size_t shmem = (16 * (2 * H) + 16 * H) * sizeof(__nv_bfloat16)
+                     + (size_t)kWarpsPerBlock * kWmmaM * kWmmaN * sizeof(float);
+  // ^ trailing term: per-warp scratch for wmma::store_matrix_sync.
   const int grid = (N + 16 - 1) / 16;
   fused_ffn_wmma_kernel<<<grid, kThreadsPerBlock, shmem>>>(
       reinterpret_cast<const __nv_bfloat16*>(x_c.data_ptr<at::BFloat16>()),

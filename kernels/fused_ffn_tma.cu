@@ -112,14 +112,20 @@ __global__ void fused_ffn_tma_kernel(
   if (row_base >= N) return;
 
   const int warp_id = threadIdx.x / kWarpSize;
+  const int lane    = threadIdx.x & 31;
 
   // Shared-memory carve-up. mbarrier is 8-byte aligned at the tail.
   extern __shared__ __nv_bfloat16 smem_pool[];
   __nv_bfloat16* sh_x       = smem_pool;
   __nv_bfloat16* sh_gate_up = sh_x + 16 * d;
   __nv_bfloat16* sh_act     = sh_gate_up + 16 * (2 * H);
+  // Per-warp fp32 scratch for wmma::store_matrix_sync. Placed before
+  // the mbarrier so we keep mbar aligned at the end.
+  float* sh_wmma = reinterpret_cast<float*>(sh_act + 16 * H);
+  float* my_wmma = sh_wmma + warp_id * (kWmmaM * kWmmaN);
   uint64_t* mbar = reinterpret_cast<uint64_t*>(
-      (reinterpret_cast<uintptr_t>(sh_act + 16 * H) + 7) & ~static_cast<uintptr_t>(7));
+      (reinterpret_cast<uintptr_t>(sh_wmma + kWarpsPerBlock * kWmmaM * kWmmaN) + 7)
+      & ~static_cast<uintptr_t>(7));
 
   // Phase 0 — TMA load of x[row_base:row_base+16, 0:d].
   if (threadIdx.x == 0) {
@@ -145,13 +151,12 @@ __global__ void fused_ffn_tma_kernel(
       wmma::load_matrix_sync(b, w_gate_up + (int64_t)(ct * kWmmaN) * d + kt * kWmmaK, d);
       wmma::mma_sync(c, a, b, c);
     }
-    float c_fp32[kWmmaM * kWmmaN];
-    wmma::store_matrix_sync(c_fp32, c, kWmmaN, wmma::mem_row_major);
-    for (int i = 0; i < kWmmaM; ++i) {
-      for (int j = 0; j < kWmmaN; ++j) {
-        sh_gate_up[i * (2 * H) + ct * kWmmaN + j] =
-            __float2bfloat16(c_fp32[i * kWmmaN + j]);
-      }
+    wmma::store_matrix_sync(my_wmma, c, kWmmaN, wmma::mem_row_major);
+    __syncwarp();
+    for (int idx = lane; idx < kWmmaM * kWmmaN; idx += 32) {
+      const int i = idx / kWmmaN;
+      const int j = idx % kWmmaN;
+      sh_gate_up[i * (2 * H) + ct * kWmmaN + j] = __float2bfloat16(my_wmma[idx]);
     }
   }
   __syncthreads();
@@ -197,15 +202,14 @@ __global__ void fused_ffn_tma_kernel(
       wmma::load_matrix_sync(b, w_down + (int64_t)(ct * kWmmaN) * H + kt * kWmmaK, H);
       wmma::mma_sync(c, a, b, c);
     }
-    float c_fp32[kWmmaM * kWmmaN];
-    wmma::store_matrix_sync(c_fp32, c, kWmmaN, wmma::mem_row_major);
-    for (int i = 0; i < kWmmaM; ++i) {
-      for (int j = 0; j < kWmmaN; ++j) {
-        const int gi = row_base + i;
-        if (gi >= N) continue;
-        y_out[(int64_t)gi * d + ct * kWmmaN + j] =
-            __float2bfloat16(c_fp32[i * kWmmaN + j]);
-      }
+    wmma::store_matrix_sync(my_wmma, c, kWmmaN, wmma::mem_row_major);
+    __syncwarp();
+    for (int idx = lane; idx < kWmmaM * kWmmaN; idx += 32) {
+      const int i = idx / kWmmaN;
+      const int j = idx % kWmmaN;
+      const int gi = row_base + i;
+      if (gi >= N) continue;
+      y_out[(int64_t)gi * d + ct * kWmmaN + j] = __float2bfloat16(my_wmma[idx]);
     }
   }
 #else
@@ -256,6 +260,7 @@ torch::Tensor fused_ffn_tma_cuda(torch::Tensor x,
         16 * d * sizeof(__nv_bfloat16)              // sh_x
       + 16 * (2 * H) * sizeof(__nv_bfloat16)         // sh_gate_up
       + 16 * H * sizeof(__nv_bfloat16)               // sh_act
+      + kWarpsPerBlock * kWmmaM * kWmmaN * sizeof(float)  // per-warp WMMA scratch
       + 16;                                          // mbarrier slack
 
   const int grid = (N + 16 - 1) / 16;

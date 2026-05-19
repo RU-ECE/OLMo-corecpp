@@ -34,6 +34,7 @@
 #include <torch/torch.h>
 // c10d::Backend exposes send/recv that we use for activation/gradient passing.
 #include <torch/csrc/distributed/c10d/Backend.hpp>
+#include <functional>
 #include <vector>
 #include <memory>
 #include <optional>
@@ -60,11 +61,60 @@ class PipelineParallelContext {
   /// Send tensor to next stage (rank+1). Used for forward activations.
   void send_to_next_stage(const torch::Tensor& t);
   /// Receive tensor from previous stage (rank-1). Forward activations.
+  /// Allocates the result tensor of `activation_shape()` * options.
   torch::Tensor recv_from_prev_stage(const torch::TensorOptions& opts);
   /// Send gradient to previous stage (rank-1). Backward path.
   void send_grad_to_prev_stage(const torch::Tensor& grad);
   /// Receive gradient from next stage (rank+1). Backward path.
   torch::Tensor recv_grad_from_next_stage(const torch::TensorOptions& opts);
+
+  /// Configure the expected per-microbatch activation tensor shape +
+  /// dtype + device. Set before running the 1F1B schedule.
+  void set_activation_meta(const std::vector<int64_t>& shape,
+                           torch::Dtype dtype,
+                           torch::Device device) {
+    act_shape_ = shape;
+    act_dtype_ = dtype;
+    act_device_ = device;
+    act_meta_set_ = true;
+  }
+  bool act_meta_set() const { return act_meta_set_; }
+  const std::vector<int64_t>& activation_shape() const { return act_shape_; }
+  torch::Dtype activation_dtype() const { return act_dtype_; }
+  torch::Device activation_device() const { return act_device_; }
+
+  /// Stage forward callback: given the input activation (from prev stage
+  /// or microbatch input on stage 0) and the microbatch index, produce
+  /// the output activation to send to next stage (or loss on last stage).
+  using StageForwardFn = std::function<torch::Tensor(const torch::Tensor&, int)>;
+
+  /// Stage backward callback: given the upstream gradient (from next
+  /// stage or seed grad on last stage) and the microbatch index, produce
+  /// the gradient to send to the previous stage.
+  using StageBackwardFn = std::function<torch::Tensor(const torch::Tensor&, int)>;
+
+  /// Run the 1F1B (one-forward-one-backward) schedule for `num_microbatches`
+  /// microbatches.
+  ///
+  ///   - On stage 0: caller supplies microbatch inputs via `inputs`.
+  ///     Other stages pass an empty vector.
+  ///   - On the last stage: `targets` provides the loss targets per
+  ///     microbatch; other stages pass empty.
+  ///   - `fwd` and `bwd` are stage-local callbacks. `fwd` does the
+  ///     forward pass on this stage's layer range; `bwd` does the
+  ///     backward pass. Both receive the microbatch index so callers
+  ///     can drive autograd graph stash/replay if needed.
+  ///
+  /// Schedule (per stage, with S=num_stages, rank=r):
+  ///   warmup     : (S - 1 - r) forwards
+  ///   steady     : pairs of (forward, backward) for the remaining microbatches
+  ///   cooldown   : (S - 1 - r) trailing backwards
+  ///
+  /// Requires set_activation_meta() called beforehand.
+  void run_1f1b(int num_microbatches,
+                const std::vector<torch::Tensor>& inputs,
+                const std::vector<torch::Tensor>& targets,
+                StageForwardFn fwd, StageBackwardFn bwd);
 
   int rank() const { return rank_; }
   int world_size() const { return world_size_; }
@@ -84,6 +134,11 @@ class PipelineParallelContext {
   int world_size_;
   int64_t start_layer_;  // Inclusive global layer index.
   int64_t end_layer_;    // Exclusive global layer index.
+
+  std::vector<int64_t> act_shape_;
+  torch::Dtype act_dtype_ = torch::kFloat32;
+  torch::Device act_device_ = torch::kCPU;
+  bool act_meta_set_ = false;
 };
 
 }  // namespace olmo_cpp

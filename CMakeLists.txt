@@ -245,6 +245,19 @@ target_include_directories(olmo_cpp PUBLIC
     ${JSON_INCLUDE_DIR}
 )
 target_link_libraries(olmo_cpp PUBLIC ${TORCH_LIBRARIES} ZLIB::ZLIB)
+# pip cu128 wheels ship CUDA 12.8 libs; system CUDAToolkit may be older (missing symbols).
+if(OLMO_PIP_CUDA_LIBDIRS)
+  foreach(_pip_cuda_libdir IN LISTS OLMO_PIP_CUDA_LIBDIRS)
+    target_link_directories(olmo_cpp PUBLIC "${_pip_cuda_libdir}")
+    target_link_options(olmo_cpp PUBLIC "LINKER:-rpath,${_pip_cuda_libdir}")
+  endforeach()
+endif()
+if(OLMO_PIP_CUDART_LIBRARY)
+  target_link_libraries(olmo_cpp PUBLIC "${OLMO_PIP_CUDART_LIBRARY}")
+endif()
+if(OLMO_PIP_CUPTI_LIBRARY)
+  target_link_libraries(olmo_cpp PUBLIC "${OLMO_PIP_CUPTI_LIBRARY}")
+endif()
 target_compile_options(olmo_cpp PRIVATE -O3 -march=native)
 
 # CUDA kernels (auto-enabled when CUDA compiler is found)

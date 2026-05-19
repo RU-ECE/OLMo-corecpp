@@ -14,6 +14,7 @@ add_library(olmo_kernels SHARED
     quant_dequant.cu           # FP8 / INT4 AWQ device-resident dequant
     topk_argmax.cu             # K (fused GEMV+argmax, no logits materialize)
     fused_qkv_rope.cu          # G (fused QKV projection + reshape + RoPE)
+    fused_ffn.cu               # I (fused SwiGLU FFN macro)
 )
 target_include_directories(olmo_kernels PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/..

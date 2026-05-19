@@ -232,6 +232,7 @@ set(OLMO_SOURCES
     src/train/async_loss_reader.cpp  # AA (non-blocking loss readout)
     src/backend/topk_argmax.cpp  # K (fused GEMV+argmax dispatcher)
     src/backend/fused_qkv_rope.cpp  # G (fused QKV + reshape + RoPE dispatcher)
+    src/backend/fused_ffn.cpp       # I (fused SwiGLU FFN dispatcher)
     # Seed and profiling infrastructure
     src/seed.cpp
     src/profiler.cpp

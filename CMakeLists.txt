@@ -229,6 +229,7 @@ set(OLMO_SOURCES
     src/model/block_manager.cpp  # fast-inference [9] (page allocator)
     src/model/shared_block_pool.cpp  # fast-inference [I-7] (ref-counted shared pool)
     src/serve/scheduler.cpp  # fast-inference [I-2] (multi-request scheduler)
+    src/train/async_loss_reader.cpp  # AA (non-blocking loss readout)
     # Seed and profiling infrastructure
     src/seed.cpp
     src/profiler.cpp

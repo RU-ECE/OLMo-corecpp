@@ -21,6 +21,7 @@
  *   - olmo_cpp/distributed/ddp.hpp      : gradient allreduce.
  *   - olmo_cpp/optim/{adamw,muon,lion,dion,sgp,skip_step}.hpp : every optimizer the loop can pick.
  *   - olmo_cpp/train/grad_scaler.hpp    : FP16 dynamic loss scaling.
+ *   - olmo_cpp/train/async_loss_reader.hpp : non-blocking loss readout (AA).
  *   - olmo_cpp/train/activation_checkpoint.hpp : per-block recompute.
  *   - olmo_cpp/train/checkpoint.hpp     : sharded checkpoint manager.
  *   - olmo_cpp/eval/evaluator.hpp       : periodic validation loss.
@@ -39,6 +40,7 @@
 // Full-featured training loop with callbacks, multiple optimizers,
 // LR schedulers, activation checkpointing, gradient scaling, and eval
 #include "olmo_cpp/train.hpp"
+#include "olmo_cpp/train/async_loss_reader.hpp"
 #include "olmo_cpp/data/token_dataset.hpp"
 #include "olmo_cpp/profiler.hpp"
 #include <ATen/autocast_mode.h>
@@ -283,9 +285,12 @@ void train_epoch(
 
       total_tokens += tokens_per_step;
 
-      // Defer D2H sync: only pull loss from GPU on log steps
+      // AA: non-blocking loss readout. Queue every step (cheap async copy
+      // on a side stream); read whatever's ready at log time.
+      static thread_local AsyncLossReader _loss_reader_a;
+      _loss_reader_a.queue(accum_loss_tensor);
       if (step % 10 == 0 && (!ddp || ddp->rank() == 0)) {
-        float accum_loss = accum_loss_tensor.item<float>();
+        float accum_loss = _loss_reader_a.poll();
         epoch_loss_sum += accum_loss;
         epoch_loss_count++;
         auto step_end = std::chrono::steady_clock::now();
@@ -568,9 +573,14 @@ void train(
     const bool ckpt_step = (ckpt_mgr && cfg.checkpoint_interval > 0 &&
                             (step + 1) % cfg.checkpoint_interval == 0);
     const bool need_loss_sync = log_step || eval_step || ckpt_step;
+    // AA: queue the loss every step (non-blocking async copy) and poll
+    // when we actually want to log/eval/ckpt. Removes the per-log-step
+    // stream-drain sync.
+    static thread_local AsyncLossReader _loss_reader_b;
+    _loss_reader_b.queue(accum_loss_tensor);
     float accum_loss = 0.0f;
     if (need_loss_sync) {
-      accum_loss = accum_loss_tensor.item<float>();
+      accum_loss = _loss_reader_b.poll();
       epoch_loss_sum += accum_loss;
       epoch_loss_count++;
     }
@@ -1030,9 +1040,11 @@ void train(
     total_tokens += tokens_per_step;
     state.tokens_seen = total_tokens;
 
-    // Defer D2H sync: only pull loss from GPU on log steps
+    // AA: queue + poll (non-blocking) instead of synchronous .item().
+    static thread_local AsyncLossReader _loss_reader_c;
+    _loss_reader_c.queue(accum_loss_tensor);
     if (step % cfg.log_interval == 0 && rank == 0) {
-      float accum_loss = accum_loss_tensor.item<float>();
+      float accum_loss = _loss_reader_c.poll();
       state.loss = accum_loss;
       epoch_loss_sum += accum_loss;
       epoch_loss_count++;

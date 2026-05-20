@@ -102,8 +102,12 @@ int64_t draft_model_speculative_step(
   draft_probs.reserve(static_cast<size_t>(state.draft_len));
 
   int64_t cur = all_tokens.back();
+  // M6: one reused [1,1] device buffer for the draft inputs — fill_ each step
+  // instead of a per-draft-token alloc + H->D.
+  auto inp = torch::empty({1, 1},
+                          torch::TensorOptions().dtype(torch::kInt64).device(device));
   for (int64_t k = 0; k < state.draft_len; ++k) {
-    auto inp = torch::tensor({cur}, torch::kInt64).unsqueeze(0).to(device);
+    inp.fill_(cur);
     auto logits = (*state.draft_model)->forward(inp, c10::nullopt, -100, &state.draft_kv);
     auto next = logits.select(1, 0).squeeze(0);
 

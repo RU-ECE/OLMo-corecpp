@@ -131,46 +131,39 @@ SpeculativeResult speculative_decode_step(
   }
 
   // ── Step 4: Accept matching prefix ──
-  // For each position i, check if the draft token matches what the model
-  // would have predicted at that position
+  // M7: batch the LM-head over ALL verify positions in ONE GEMM (was K separate
+  // apply_lm_head calls), and for greedy do ONE argmax over the vocab, bringing
+  // back only the [n+1] chosen ids (was K per-position .item() D->H syncs).
+  const int64_t n_draft = static_cast<int64_t>(draft_tokens.size());
+  auto all_logits = model->apply_lm_head(verify_hidden).select(0, 0);  // [n+1, V]
   int64_t accepted = 0;
-  for (int64_t i = 0; i < static_cast<int64_t>(draft_tokens.size()); ++i) {
-    auto pos_logits = model->apply_lm_head(verify_hidden.select(1, i));
-    int64_t verified_token;
 
-    if (config.greedy) {
-      verified_token = pos_logits.argmax(-1).template item<int64_t>();
-    } else {
-      // For stochastic sampling, accept if draft matches with high probability
+  if (config.greedy) {
+    auto choices = all_logits.argmax(-1).to(torch::kCPU).contiguous();  // [n+1]
+    const int64_t* mc = choices.template data_ptr<int64_t>();
+    for (int64_t i = 0; i < n_draft; ++i) {
+      result.tokens.push_back(mc[i]);
+      if (mc[i] == draft_tokens[i]) accepted++;
+      else break;
+    }
+    if (accepted == n_draft) result.tokens.push_back(mc[n_draft]);  // bonus token
+  } else {
+    for (int64_t i = 0; i < n_draft; ++i) {
+      auto pos_logits = all_logits.select(0, i);  // [V] view — no extra GEMM
       auto probs = torch::softmax(pos_logits / config.temperature, -1);
       double draft_prob = probs[draft_tokens[i]].template item<double>();
-      // Accept with probability min(1, p_model / p_draft)
-      // Simplified: accept if draft token has reasonable probability
-      if (draft_prob > 0.01) {
-        verified_token = draft_tokens[i];
-      } else {
-        verified_token = sample_token(pos_logits, config.temperature,
-                                       config.top_k, config.top_p, false);
-      }
-    }
-
-    if (verified_token == draft_tokens[i]) {
+      int64_t verified_token = (draft_prob > 0.01)
+          ? draft_tokens[i]
+          : sample_token(pos_logits, config.temperature, config.top_k, config.top_p, false);
       result.tokens.push_back(verified_token);
-      accepted++;
-    } else {
-      // First rejection: use the model's token and stop
-      result.tokens.push_back(verified_token);
-      break;
+      if (verified_token == draft_tokens[i]) accepted++;
+      else break;
     }
-  }
-
-  // If all drafts accepted, sample one more from the last position
-  if (accepted == static_cast<int64_t>(draft_tokens.size())) {
-    auto last_logits = model->apply_lm_head(
-        verify_hidden.select(1, static_cast<int64_t>(draft_tokens.size())));
-    int64_t bonus_token = sample_token(last_logits, config.temperature,
-                                        config.top_k, config.top_p, config.greedy);
-    result.tokens.push_back(bonus_token);
+    if (accepted == n_draft) {
+      int64_t bonus_token = sample_token(all_logits.select(0, n_draft),
+                                          config.temperature, config.top_k, config.top_p, false);
+      result.tokens.push_back(bonus_token);
+    }
   }
 
   result.num_accepted = accepted;

@@ -9,7 +9,7 @@ side keeps its 3 MTP heads on top (+3.2M), which is what wins inference.
 ## One-command run
 
 ```bash
-cd llm-cpp        # repo root (the dir containing CLAUDE.md + olmo-python/)
+cd <repo>         # repo root (the dir containing CMakeLists.txt + olmo-python/)
 git checkout 2fast2furious && git pull
 bash scripts/race/run_all.sh
 ```

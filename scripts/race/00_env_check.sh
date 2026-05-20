@@ -108,7 +108,9 @@ free_gb=$(df -BG --output=avail . 2>/dev/null | tail -1 | tr -dc '0-9' || echo 9
 ok "${free_gb} GB free"
 
 say "── Repo state ──"
-[[ -f CLAUDE.md && -f scripts/race/configs/race_250m_cpp.conf ]] \
+# CMakeLists.txt is the repo-root sentinel (CLAUDE.md is gitignored, so it
+# doesn't exist in a fresh clone). The conf check proves the race kit is here.
+[[ -f CMakeLists.txt && -f scripts/race/configs/race_250m_cpp.conf ]] \
   || fail "run from repo root; race configs missing"
 ok "repo layout OK ($(git rev-parse --short HEAD 2>/dev/null || echo 'no-git'))"
 

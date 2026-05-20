@@ -382,14 +382,20 @@ void Scheduler::run_decode_step_(SchedulerRequest& req) {
   // The view's stable page_table tensor was synced at construction; if we
   // added a new page above it picked it up. Good.
 
-  std::vector<int64_t> ids = {req.last_token};
-  auto input = torch::from_blob(ids.data(), {1, 1},
-                                torch::TensorOptions().dtype(torch::kInt64))
-                   .clone()
-                   .to(device_);
+  // H5 (partial): reuse one [1,1] device buffer for the decode input instead of
+  // a per-token vector + from_blob + clone + H->D. (The bigger server-side win —
+  // caching the SharedPoolKVCache view per request instead of rebuilding it
+  // every token in build_view_ — is tracked separately; it needs the page-table
+  // device tensor to grow in place when a page is added.)
+  static thread_local torch::Tensor in_buf;
+  if (!in_buf.defined() || in_buf.device() != device_) {
+    in_buf = torch::empty({1, 1},
+                          torch::TensorOptions().dtype(torch::kInt64).device(device_));
+  }
+  in_buf.fill_(req.last_token);
 
   torch::NoGradGuard no_grad;
-  auto logits = model_->forward_paged(input, view.get());
+  auto logits = model_->forward_paged(in_buf, view.get());
   auto next_logits = logits.select(1, 0).squeeze(0);
   int64_t next_id = sample_logits_(next_logits, req);
   req.generated_tokens.push_back(static_cast<int32_t>(next_id));

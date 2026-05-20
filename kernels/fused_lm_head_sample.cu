@@ -56,6 +56,7 @@
 #include <math_constants.h>   // CUDART_INF_F
 #include <cstdint>
 #include <cmath>
+#include <vector>
 
 #include "olmo_cpp/backend/fused_lm_head_sample.hpp"
 
@@ -148,6 +149,7 @@ __global__ void fused_lm_head_sample_kernel(
     float inv_T,                          // 1 / temperature
     uint64_t seed,
     uint32_t position,
+    const float* __restrict__ rep_pen,    // [V] per-row penalty factor, or nullptr
     unsigned long long* __restrict__ best_packed) {
 
   // Stage hidden into shared memory once per block.
@@ -190,6 +192,13 @@ __global__ void fused_lm_head_sample_kernel(
            + __high2float(w2) * sh_hidden[h + 1];
       }
       for (; h < H; ++h) l += __bfloat162float(w_row[h]) * sh_hidden[h];
+    }
+
+    // Repetition penalty on the raw logit, BEFORE temperature + Gumbel — same
+    // order and float math as the CPU reference (no [V] logits materialized).
+    if (rep_pen != nullptr) {
+      float pf = rep_pen[row];
+      if (pf != 1.0f) l = (l > 0.0f) ? (l / pf) : (l * pf);
     }
 
     float g = gumbel_from_philox(seed, position, static_cast<uint32_t>(row));
@@ -241,7 +250,9 @@ int64_t fused_lm_head_sample_cuda(
     torch::Tensor W_U,
     float temperature,
     uint64_t seed,
-    uint32_t position) {
+    uint32_t position,
+    const std::vector<int64_t>& rep_tokens,
+    double rep_penalty) {
 
   TORCH_CHECK(hidden.is_cuda() && W_U.is_cuda(),
               "fused_lm_head_sample_cuda: tensors must be on CUDA");
@@ -259,6 +270,26 @@ int64_t fused_lm_head_sample_cuda(
   const int64_t V = W_U_c.size(0);
   const int     H = static_cast<int>(W_U_c.size(1));
   const float inv_T = 1.0f / temperature;
+
+  // Repetition penalty: build a [V] per-row factor (1.0 except seen tokens),
+  // read once per row inside the kernel. This is a [V] float buffer (~1/H of
+  // the W_U traffic — negligible), NOT a logits materialization, and only when
+  // a penalty is actually requested.
+  torch::Tensor rep_pen;            // empty unless used
+  const float* rep_pen_ptr = nullptr;
+  if (rep_penalty != 1.0 && !rep_tokens.empty()) {
+    std::vector<int64_t> valid;
+    valid.reserve(rep_tokens.size());
+    for (int64_t t : rep_tokens) if (t >= 0 && t < V) valid.push_back(t);
+    if (!valid.empty()) {
+      rep_pen = torch::ones(
+          {V}, torch::TensorOptions().dtype(torch::kFloat32).device(hidden.device()));
+      auto ids = torch::tensor(
+          valid, torch::TensorOptions().dtype(torch::kInt64).device(hidden.device()));
+      rep_pen.index_put_({ids}, static_cast<float>(rep_penalty));
+      rep_pen_ptr = rep_pen.data_ptr<float>();
+    }
+  }
 
   // Workspace.
   auto opts_u64 = torch::TensorOptions().dtype(torch::kInt64).device(hidden.device());
@@ -281,13 +312,13 @@ int64_t fused_lm_head_sample_cuda(
     fused_lm_head_sample_kernel<float><<<blocks, threads, shmem_bytes>>>(
         hidden_c.data_ptr<float>(),
         W_U_c.data_ptr<float>(),
-        V, H, inv_T, seed, position,
+        V, H, inv_T, seed, position, rep_pen_ptr,
         reinterpret_cast<unsigned long long*>(best.data_ptr<int64_t>()));
   } else if (W_U_c.scalar_type() == torch::kBFloat16) {
     fused_lm_head_sample_kernel<__nv_bfloat16><<<blocks, threads, shmem_bytes>>>(
         hidden_c.data_ptr<float>(),
         reinterpret_cast<const __nv_bfloat16*>(W_U_c.data_ptr<at::BFloat16>()),
-        V, H, inv_T, seed, position,
+        V, H, inv_T, seed, position, rep_pen_ptr,
         reinterpret_cast<unsigned long long*>(best.data_ptr<int64_t>()));
   } else {
     TORCH_CHECK(false, "fused_lm_head_sample_cuda: W_U dtype must be FP32 or BF16");

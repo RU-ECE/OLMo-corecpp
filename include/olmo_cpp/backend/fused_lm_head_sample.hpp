@@ -30,6 +30,7 @@
 
 #include <torch/torch.h>
 #include <cstdint>
+#include <vector>
 
 namespace olmo_cpp {
 
@@ -46,12 +47,18 @@ namespace olmo_cpp {
 ///
 /// Currently CUDA-only. CPU fallback returns -1 (caller should use the
 /// non-fused path on CPU/MPS).
+///   - rep_tokens:  previously-emitted ids. Each is penalized once, inside the
+///                  kernel, BEFORE temperature + Gumbel — so no [V] logits
+///                  tensor is materialized even with rep-penalty on.
+///   - rep_penalty: 1.0 → no penalty (the rep_tokens are ignored).
 int64_t fused_lm_head_sample(
     torch::Tensor hidden,
     torch::Tensor W_U,
     float temperature,
     uint64_t seed,
-    uint32_t position);
+    uint32_t position,
+    const std::vector<int64_t>& rep_tokens = {},
+    double rep_penalty = 1.0);
 
 #ifdef OLMO_HAS_CUDA_KERNELS
 /// CUDA implementation. Caller must guarantee both tensors are on CUDA.
@@ -61,7 +68,9 @@ int64_t fused_lm_head_sample_cuda(
     torch::Tensor W_U,
     float temperature,
     uint64_t seed,
-    uint32_t position);
+    uint32_t position,
+    const std::vector<int64_t>& rep_tokens = {},
+    double rep_penalty = 1.0);
 #endif
 
 /// CPU reference. Slow but correct. Used by unit tests.
@@ -70,6 +79,8 @@ int64_t fused_lm_head_sample_cpu(
     torch::Tensor W_U,
     float temperature,
     uint64_t seed,
-    uint32_t position);
+    uint32_t position,
+    const std::vector<int64_t>& rep_tokens = {},
+    double rep_penalty = 1.0);
 
 }  // namespace olmo_cpp

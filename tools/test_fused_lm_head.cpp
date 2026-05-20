@@ -130,6 +130,49 @@ bool test_temperature_sharpens(bool verbose) {
   return ok;
 }
 
+bool test_repetition_penalty(bool verbose) {
+  // Heavily penalizing the natural argmax should make the fused sampler avoid
+  // it — proving rep-penalty is applied to the logit before temp + Gumbel,
+  // with no [V] logits tensor materialized.
+  const int64_t V = 64;
+  const int64_t H = 16;
+  auto hidden = torch::ones({H});
+  auto W_U    = torch::randn({V, H});
+  auto logits = torch::matmul(W_U, hidden);  // [V]
+  int64_t argmax = logits.argmax(-1).item<int64_t>();
+
+  const int N = 1000;
+
+  // Baseline: low temp, no penalty → argmax dominates.
+  int hits_base = 0;
+  for (int p = 0; p < N; ++p) {
+    int64_t tok = olmo_cpp::fused_lm_head_sample_cpu(
+        hidden, W_U, 0.3f, /*seed=*/777, /*pos=*/static_cast<uint32_t>(p));
+    if (tok == argmax) hits_base++;
+  }
+
+  // With a strong penalty on the argmax token, it should almost never win.
+  std::vector<int64_t> rep = {argmax};
+  int hits_pen = 0;
+  for (int p = 0; p < N; ++p) {
+    int64_t tok = olmo_cpp::fused_lm_head_sample_cpu(
+        hidden, W_U, 0.3f, /*seed=*/777, /*pos=*/static_cast<uint32_t>(p),
+        rep, /*rep_penalty=*/100.0);
+    if (tok == argmax) hits_pen++;
+  }
+
+  double base = static_cast<double>(hits_base) / N;
+  double pen  = static_cast<double>(hits_pen)  / N;
+  bool ok = (base > 0.5) && (pen < 0.05);  // dominant without, suppressed with
+
+  if (verbose || !ok) {
+    std::cout << "[" << (ok ? "PASS" : "FAIL")
+              << "] repetition_penalty  argmax_share base=" << base
+              << " penalized=" << pen << " (want base>0.5, pen<0.05)\n";
+  }
+  return ok;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -145,6 +188,7 @@ int main(int argc, char** argv) {
   run(test_determinism(verbose));
   run(test_distribution(verbose));
   run(test_temperature_sharpens(verbose));
+  run(test_repetition_penalty(verbose));
 
   std::cout << "\n" << passed << " passed, " << failed << " failed.\n";
   return failed == 0 ? 0 : 1;

@@ -837,12 +837,11 @@ int main(int argc, char** argv) {
       std::cout << "Note: --fused-sampler requires KV cache; disabling --no-kv-cache override.\n";
       use_kv_cache = true;
     }
-    if (top_k != 0 || top_p < 1.0 || repetition_penalty != 1.0) {
-      std::cout << "Note: --fused-sampler does not support top_k/top_p/repetition_penalty"
-                   " — forcing top_k=0, top_p=1.0, repetition_penalty=1.0.\n";
+    if (top_k != 0 || top_p < 1.0) {
+      std::cout << "Note: --fused-sampler does not support top_k/top_p"
+                   " — forcing top_k=0, top_p=1.0 (repetition_penalty IS fused in).\n";
       top_k = 0;
       top_p = 1.0;
-      repetition_penalty = 1.0;
     }
     if (use_speculative) {
       std::cout << "Note: --fused-sampler is incompatible with speculative decoding; disabling.\n";
@@ -1334,8 +1333,11 @@ int main(int argc, char** argv) {
             int slot = pd->enqueue(h, model->lm_head_weight(), t, fused_pos++);
             return pd->poll(slot);
           }
+          // Repetition penalty is fused into the kernel (applied to each row's
+          // logit before temperature + Gumbel) — still zero [V] materialization.
           return olmo_cpp::fused_lm_head_sample(
-              h, model->lm_head_weight(), t, fused_seed, fused_pos++);
+              h, model->lm_head_weight(), t, fused_seed, fused_pos++,
+              all_tokens, repetition_penalty);
         };
         {
           auto input = torch::from_blob(all_tokens.data(), {1, prompt_len},

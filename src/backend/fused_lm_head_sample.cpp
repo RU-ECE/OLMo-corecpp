@@ -15,6 +15,8 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <unordered_set>
+#include <vector>
 #include <torch/torch.h>
 
 namespace olmo_cpp {
@@ -64,7 +66,9 @@ int64_t fused_lm_head_sample_cpu(
     torch::Tensor W_U,
     float temperature,
     uint64_t seed,
-    uint32_t position) {
+    uint32_t position,
+    const std::vector<int64_t>& rep_tokens,
+    double rep_penalty) {
 
   TORCH_CHECK(hidden.is_cpu() && W_U.is_cpu(),
               "fused_lm_head_sample_cpu: tensors must be on CPU");
@@ -82,6 +86,15 @@ int64_t fused_lm_head_sample_cpu(
   const float* h_ptr = h_c.data_ptr<float>();
   const float* W_ptr = W_c.data_ptr<float>();
 
+  // Repetition-penalty lookup. Applied to the raw logit BEFORE temperature +
+  // Gumbel — bit-identical to the CUDA kernel (same float pf, same conditional).
+  const bool do_rep = (rep_penalty != 1.0) && !rep_tokens.empty();
+  const float pf = static_cast<float>(rep_penalty);
+  std::unordered_set<int64_t> seen;
+  if (do_rep) {
+    for (int64_t t : rep_tokens) if (t >= 0 && t < V) seen.insert(t);
+  }
+
   float best_score = -std::numeric_limits<float>::infinity();
   int64_t best_idx = -1;
 
@@ -89,6 +102,7 @@ int64_t fused_lm_head_sample_cpu(
     const float* w_row = W_ptr + i * H;
     float l = 0.0f;
     for (int64_t h = 0; h < H; ++h) l += w_row[h] * h_ptr[h];
+    if (do_rep && seen.count(i)) l = (l > 0.0f) ? (l / pf) : (l * pf);
     float g = gumbel_cpu(seed, position, static_cast<uint32_t>(i));
     float s = l * inv_T + g;
     if (s > best_score) {
@@ -104,13 +118,17 @@ int64_t fused_lm_head_sample(
     torch::Tensor W_U,
     float temperature,
     uint64_t seed,
-    uint32_t position) {
+    uint32_t position,
+    const std::vector<int64_t>& rep_tokens,
+    double rep_penalty) {
 #ifdef OLMO_HAS_CUDA_KERNELS
   if (hidden.is_cuda()) {
-    return fused_lm_head_sample_cuda(hidden, W_U, temperature, seed, position);
+    return fused_lm_head_sample_cuda(hidden, W_U, temperature, seed, position,
+                                     rep_tokens, rep_penalty);
   }
 #endif
-  return fused_lm_head_sample_cpu(hidden, W_U, temperature, seed, position);
+  return fused_lm_head_sample_cpu(hidden, W_U, temperature, seed, position,
+                                  rep_tokens, rep_penalty);
 }
 
 }  // namespace olmo_cpp

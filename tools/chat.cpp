@@ -133,6 +133,23 @@ torch::Tensor to_pinned_host(const torch::Tensor& t) {
   return t.contiguous().clone();
 }
 
+/// H2: single-token decode input without a per-token alloc + 8-byte H->D.
+/// Reuses one [1,1] int64 device buffer and fills the token via fill_, which
+/// bakes the scalar into a fill kernel (no host buffer copy). Stream ordering
+/// guarantees the forward reads it before the next iteration's fill_; safe
+/// because the returned tensor is consumed by the forward immediately.
+/// (Replaces `torch::tensor({tok}).unsqueeze(0).to(device)` in the decode
+/// loops. The paged CUDA-graph branch keeps its own static capture buffer.)
+torch::Tensor decode_input_buf(int64_t tok, torch::Device device) {
+  static thread_local torch::Tensor buf;
+  if (!buf.defined() || buf.device() != device) {
+    buf = torch::empty({1, 1},
+                       torch::TensorOptions().dtype(torch::kInt64).device(device));
+  }
+  buf.fill_(tok);
+  return buf;
+}
+
 // =====================================================================
 // FAST-INFERENCE ROADMAP — beat TensorRT-LLM at one config.
 // Branch: fast-inference. Target: Llama/OLMo-class 1B–7B on H100,
@@ -444,7 +461,7 @@ int64_t speculative_decode_step(
 
   // Step 1: Incremental backbone forward (1 token) → hidden state
   int64_t last_token = all_tokens.back();
-  auto input = torch::tensor({last_token}, torch::kInt64).unsqueeze(0).to(device);
+  auto input = decode_input_buf(last_token, device);  // H2: reused buffer, no per-token H->D
   auto hidden = model->forward_backbone(input, &kv_cache);
 #ifdef __APPLE__
   if (device.is_mps()) torch::mps::synchronize();
@@ -604,7 +621,7 @@ int64_t tree_decode_step(
   // hidden state. Mirrors the speculative path's invariant of caching
   // up through last_token before drafting.
   int64_t last_token = all_tokens.back();
-  auto input = torch::tensor({last_token}, torch::kInt64).unsqueeze(0).to(device);
+  auto input = decode_input_buf(last_token, device);  // H2: reused buffer, no per-token H->D
   auto hidden = model->forward_backbone(input, &kv_cache);
 #ifdef __APPLE__
   if (device.is_mps()) torch::mps::synchronize();
@@ -1203,7 +1220,7 @@ int main(int argc, char** argv) {
         while (step < max_total && warm_done < warmup_budget) {
           int64_t last_token = all_tokens.back();
           if (last_token == static_cast<int64_t>(tokenizer.eos_id())) break;
-          auto input = torch::tensor({last_token}, torch::kInt64).unsqueeze(0).to(device);
+          auto input = decode_input_buf(last_token, device);  // H2: reused buffer, no per-token H->D
           auto logits = model->forward_paged(input, paged.get());
           auto next_logits = logits.select(1, logits.size(1) - 1).squeeze(0);
           int64_t next_id = sample_logits(next_logits, temperature, top_k, top_p,
@@ -1292,7 +1309,7 @@ int main(int argc, char** argv) {
         for (; step < max_total; ++step) {
           int64_t last_token = all_tokens.back();
           if (last_token == static_cast<int64_t>(tokenizer.eos_id())) break;
-          auto input = torch::tensor({last_token}, torch::kInt64).unsqueeze(0).to(device);
+          auto input = decode_input_buf(last_token, device);  // H2: reused buffer, no per-token H->D
           auto logits = model->forward_paged(input, paged.get());
           auto next_logits = logits.select(1, logits.size(1) - 1).squeeze(0);
           int64_t next_id = sample_logits(next_logits, temperature, top_k, top_p,
@@ -1369,7 +1386,7 @@ int main(int argc, char** argv) {
         for (int64_t step = prompt_len + 1; step < max_total; ++step) {
           int64_t last_token = all_tokens.back();
           if (last_token == static_cast<int64_t>(tokenizer.eos_id())) break;
-          auto input = torch::tensor({last_token}, torch::kInt64).unsqueeze(0).to(device);
+          auto input = decode_input_buf(last_token, device);  // H2: reused buffer, no per-token H->D
           torch::NoGradGuard no_grad;
           int64_t next_id;
           if (use_fused_sampler) {

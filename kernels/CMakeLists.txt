@@ -29,6 +29,12 @@ target_include_directories(olmo_kernels PRIVATE
 )
 target_link_libraries(olmo_kernels PRIVATE ${TORCH_LIBRARIES} CUDA::cudart)
 
+# The kernels reference each other through the public headers, whose CUDA
+# declarations are gated behind OLMO_HAS_CUDA_KERNELS (e.g. fused_ffn_tma.cu
+# calls fused_ffn_wmma_cuda). This target obviously HAS the kernels, so the
+# macro must be defined here too — matching olmo_cpp.
+target_compile_definitions(olmo_kernels PRIVATE OLMO_HAS_CUDA_KERNELS=1)
+
 # CUDA compilation flags: fast math + architecture-aware optimization
 target_compile_options(olmo_kernels PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:

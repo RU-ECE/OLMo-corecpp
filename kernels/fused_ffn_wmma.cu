@@ -62,8 +62,6 @@ __global__ void fused_ffn_wmma_kernel(
   if (row_base >= N) return;
 
   const int warp_id = threadIdx.x / kWarpSize;
-  const int lane    = threadIdx.x % kWarpSize;
-  (void)lane;
 
   // Per-block shared memory: gate_up output tile [16, 2H] + post-silu
   // act tile [16, H]. For H=2048 these are 64KB and 32KB respectively

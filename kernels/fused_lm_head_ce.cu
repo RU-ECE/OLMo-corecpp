@@ -28,6 +28,7 @@
 #include <torch/torch.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
+#include <math_constants.h>   // CUDART_INF_F
 #include <cmath>
 #include <cstdint>
 

@@ -95,12 +95,13 @@ __device__ __forceinline__ void cp_async_bulk_tensor_2d(
 // On sm_90+, x is loaded via TMA. On older arches the body is a stub —
 // host dispatch will never reach it because the runtime check routes
 // older devices to fused_ffn_wmma_cuda.
+// The TMA descriptor is passed by value as a grid constant. The parameter
+// type must be IDENTICAL in the host (launch) and device passes — switching
+// it on __CUDA_ARCH__ makes the host see `void*` while the launch passes a
+// CUtensorMap, which doesn't convert. Keep it CUtensorMap on every pass;
+// the TMA *instructions* are still guarded by __CUDA_ARCH__ >= 900 below.
 __global__ void fused_ffn_tma_kernel(
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
     const __grid_constant__ CUtensorMap x_desc,
-#else
-    const void* /*x_desc_unused*/,
-#endif
     const __nv_bfloat16* __restrict__ w_gate_up,
     const __nv_bfloat16* __restrict__ w_down,
     __nv_bfloat16* __restrict__ y_out,
@@ -231,6 +232,7 @@ __global__ void fused_ffn_tma_kernel(
   // fused_ffn_wmma_cuda), but we keep the symbol so the launch site
   // links. No-op body keeps device-side preprocessing legal — the TMA
   // PTX is preprocessed out above.
+  (void)x_desc;
   (void)w_gate_up; (void)w_down; (void)y_out; (void)gate_up_out;
   (void)N; (void)d; (void)H;
 #endif

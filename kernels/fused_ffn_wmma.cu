@@ -201,6 +201,14 @@ torch::Tensor fused_ffn_wmma_cuda(torch::Tensor x,
   const size_t shmem = (16 * (2 * H) + 16 * H) * sizeof(__nv_bfloat16)
                      + (size_t)kWarpsPerBlock * kWmmaM * kWmmaN * sizeof(float);
   // ^ trailing term: per-warp scratch for wmma::store_matrix_sync.
+  // Opt into >48 KB dynamic shared memory. The host dispatcher
+  // (fused_ffn.cpp) already guarantees shmem ≤ device opt-in max before
+  // routing here, so this set always succeeds.
+  if (shmem > 48 * 1024) {
+    cudaFuncSetAttribute(fused_ffn_wmma_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(shmem));
+  }
   const int grid = (N + 16 - 1) / 16;
   fused_ffn_wmma_kernel<<<grid, kThreadsPerBlock, shmem>>>(
       reinterpret_cast<const __nv_bfloat16*>(x_c.data_ptr<at::BFloat16>()),
@@ -239,6 +247,11 @@ fused_ffn_wmma_train_cuda(torch::Tensor x,
   const size_t shmem = (16 * (2 * H) + 16 * H) * sizeof(__nv_bfloat16)
                      + (size_t)kWarpsPerBlock * kWmmaM * kWmmaN * sizeof(float);
   // ^ trailing term: per-warp scratch for wmma::store_matrix_sync.
+  if (shmem > 48 * 1024) {
+    cudaFuncSetAttribute(fused_ffn_wmma_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(shmem));
+  }
   const int grid = (N + 16 - 1) / 16;
   fused_ffn_wmma_kernel<<<grid, kThreadsPerBlock, shmem>>>(
       reinterpret_cast<const __nv_bfloat16*>(x_c.data_ptr<at::BFloat16>()),

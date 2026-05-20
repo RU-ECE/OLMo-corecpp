@@ -277,6 +277,13 @@ torch::Tensor fused_ffn_tma_cuda(torch::Tensor x,
       + kWarpsPerBlock * kWmmaM * kWmmaN * sizeof(float)  // per-warp WMMA scratch
       + 16;                                          // mbarrier slack
 
+  // Opt into >48 KB dynamic shared memory. Host dispatcher guards that
+  // shmem ≤ device opt-in max before routing here.
+  if (shmem > 48 * 1024) {
+    cudaFuncSetAttribute(fused_ffn_tma_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(shmem));
+  }
   const int grid = (N + 16 - 1) / 16;
   fused_ffn_tma_kernel<<<grid, kThreadsPerBlock, shmem>>>(
       *reinterpret_cast<const CUtensorMap*>(x_desc_storage),

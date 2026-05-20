@@ -12,6 +12,10 @@
 
 #include <torch/torch.h>
 
+#if defined(USE_CUDA) || defined(OLMO_HAS_CUDA_KERNELS)
+#  include <cuda_runtime.h>
+#endif
+
 namespace olmo_cpp {
 
 namespace {
@@ -91,9 +95,17 @@ fused_qkv_rope(torch::Tensor x,
       const int64_t d = x.size(2);
       const int64_t N = B * S;
       const int64_t F = (n_q_heads + 2 * n_kv_heads) * head_dim;
-      const size_t  shmem_bytes = (size_t)16 * F * sizeof(uint16_t);
+      // Actual kernel shmem = [16, F] bf16 output tile + per-warp fp32
+      // scratch (4 warps × 16×16). Compare against the device's opt-in
+      // max (the launcher raises the cap via cudaFuncSetAttribute).
+      const size_t shmem_bytes = (size_t)16 * F * sizeof(uint16_t)
+                               + (size_t)4 * 16 * 16 * sizeof(float);
+      int max_optin = 0;
+      cudaDeviceGetAttribute(&max_optin,
+                             cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                             x.device().index());
       const bool aligned = (N % 16 == 0) && (d % 16 == 0) && (F % 16 == 0);
-      const bool shmem_ok = (shmem_bytes <= 96 * 1024);
+      const bool shmem_ok = (max_optin > 0) && (shmem_bytes <= (size_t)max_optin);
       if (aligned && shmem_ok) {
         return fused_qkv_rope_wmma_cuda(x, w_qkv, cos, sin,
                                           n_q_heads, n_kv_heads, head_dim);

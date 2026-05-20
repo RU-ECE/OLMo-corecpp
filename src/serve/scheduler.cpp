@@ -20,6 +20,7 @@
 #include "olmo_cpp/serve/scheduler.hpp"
 #include "olmo_cpp/model/paged_kv_cache.hpp"
 #include "olmo_cpp/backend/paged_attention.hpp"
+#include "olmo_cpp/backend/gpu_sample.hpp"
 
 #include <torch/torch.h>
 #include <algorithm>
@@ -307,47 +308,19 @@ std::unique_ptr<IPagedKVCache> Scheduler::build_view_(SchedulerRequest& req) {
 
 int64_t Scheduler::sample_logits_(torch::Tensor logits_1d,
                                    SchedulerRequest& req) {
-  if (req.temperature <= 0.0) {
-    return logits_1d.argmax(-1).item<int64_t>();
-  }
-  auto x = logits_1d.cpu().contiguous().to(torch::kFloat32);
-  const int64_t V = x.size(0);
-  // Repetition penalty: damp logits for previously-seen tokens.
+  // Defer to the shared device-resident sampler: repetition penalty,
+  // temperature, top-k, softmax, top-p (O(V) bucket-radix kernel) and the draw
+  // all run on the device the logits live on; the only D->H is the token id —
+  // not the full [V] vocab this used to .cpu() every step. (Sampling uses
+  // torch's generator rather than req.rng; greedy is deterministic.)
+  std::vector<int64_t> rep_tokens;
   if (req.repetition_penalty != 1.0) {
-    auto acc = x.accessor<float, 1>();
-    auto penalize = [&](int32_t id) {
-      if (id < 0 || id >= V) return;
-      float s = acc[id];
-      acc[id] = s > 0 ? s / static_cast<float>(req.repetition_penalty)
-                      : s * static_cast<float>(req.repetition_penalty);
-    };
-    for (auto t : req.prompt_tokens)    penalize(t);
-    for (auto t : req.generated_tokens) penalize(t);
+    rep_tokens.reserve(req.prompt_tokens.size() + req.generated_tokens.size());
+    for (auto t : req.prompt_tokens)    rep_tokens.push_back(static_cast<int64_t>(t));
+    for (auto t : req.generated_tokens) rep_tokens.push_back(static_cast<int64_t>(t));
   }
-  x = x / req.temperature;
-  if (req.top_k > 0 && req.top_k < V) {
-    auto [vals, _] = x.topk(req.top_k);
-    auto thresh = vals.index({req.top_k - 1}).item<float>();
-    x = torch::where(x < thresh,
-                     torch::full_like(x, -std::numeric_limits<float>::infinity()),
-                     x);
-  }
-  auto probs = torch::softmax(x, -1);
-  if (req.top_p < 1.0) {
-    auto [sorted, sorted_idx] = probs.sort(-1, true);
-    auto cumul = sorted.cumsum(-1);
-    auto mask = (cumul - sorted) > req.top_p;
-    sorted.index_put_({mask}, 0.0f);
-    probs.zero_();
-    probs.scatter_(-1, sorted_idx, sorted);
-    auto sum = probs.sum().item<float>();
-    if (sum > 0) probs = probs / sum;
-  }
-  std::vector<double> p(V);
-  auto p_ptr = probs.data_ptr<float>();
-  for (int64_t i = 0; i < V; ++i) p[i] = p_ptr[i];
-  std::discrete_distribution<int64_t> dist(p.begin(), p.end());
-  return dist(req.rng);
+  return gpu_sample(logits_1d, req.temperature, req.top_k, req.top_p,
+                    rep_tokens, req.repetition_penalty);
 }
 
 void Scheduler::run_prefill_chunk_(SchedulerRequest& req) {

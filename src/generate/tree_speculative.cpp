@@ -129,8 +129,9 @@ std::vector<int64_t> tree_speculative_step(
   // 4. Walk the tree. Start at the root (the seed_token). The root's
   // predicted logits give the model's expected next token; if a child
   // of the root carries that token, accept it and descend. Repeat.
-  auto logits_cpu = logits.select(0, 0).to(torch::kCPU).to(torch::kFloat32);
-  auto argmax = std::get<1>(logits_cpu.max(/*dim=*/-1)).contiguous();   // [N]
+  // Argmax over the vocab ON-DEVICE, then bring back only the [N] chosen ids
+  // (not the [N, V] logits). The tree walk indexes am_ptr by node cursor.
+  auto argmax = logits.select(0, 0).argmax(/*dim=*/-1).to(torch::kCPU).contiguous();  // [N]
   auto am_ptr = argmax.data_ptr<int64_t>();
 
   std::vector<int64_t> accepted;

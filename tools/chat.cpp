@@ -73,6 +73,7 @@
 #include "olmo_cpp/backend/cuda_backend.hpp"
 #include "olmo_cpp/backend/simd_backend.hpp"
 #include "olmo_cpp/backend/topp_radix.hpp"
+#include "olmo_cpp/backend/gpu_sample.hpp"
 #include "olmo_cpp/backend/fused_lm_head_sample.hpp"
 #include "olmo_cpp/backend/lm_head_gemv.hpp"
 #include "olmo_cpp/backend/persistent_decode.hpp"
@@ -318,6 +319,18 @@ int64_t sample_logits(torch::Tensor logits, double temperature,
                       const std::vector<int64_t>& rep_tokens,
                       double rep_penalty,
                       std::mt19937& gen) {
+  // ── GPU-resident fast path (fast-inference [6]/[7], wired live) ──
+  // Everything stays on-device through the shared sampler; only the token id
+  // (8 bytes) crosses D->H, vs the full [V] (~200 KB/token) the host path
+  // below copies. Greedy (temperature 0, the race path) is deterministic and
+  // identical to the host path; sampled output uses torch's CUDA generator.
+  if (logits.is_cuda()) {
+    (void)gen;
+    return olmo_cpp::gpu_sample(logits, temperature, top_k, top_p,
+                                rep_tokens, rep_penalty);
+  }
+
+  // ── Host fallback (CPU / MPS) ──
   // Bring to host via pinned memory (faster D->H on CUDA) and own the
   // resulting buffer so we can mutate it in place. (fast-inference [12d])
   auto logits_cpu = to_pinned_host(logits);
@@ -469,34 +482,16 @@ int64_t speculative_decode_step(
   auto temp_tokens = all_tokens;
   temp_tokens.push_back(main_token);
 
-  // For num_drafts == 1 the stack/unstack is wasted work — stack
-  // allocates a [1, V] copy and select(0, 0) returns a view back. Just
-  // pinned-copy the single tensor. For k > 1 the stack is the right
-  // call: one D->H instead of k, and each select returns a view.
-  if (num_drafts == 1) {
-    auto dl0 = to_pinned_host(draft_logits_list[0]);
-    int64_t draft_tok = sample_logits(dl0, temperature, top_k, top_p,
+  // Draft sampling stays on-device. sample_logits routes CUDA logits through
+  // the GPU-resident sampler, so there's NO [k, V] device->host copy — only
+  // each drafted token id (8 bytes) returns. The loop is sequential because
+  // each draft's rep_penalty depends on the previous (temp_tokens grows).
+  for (int64_t k = 0; k < num_drafts; ++k) {
+    int64_t draft_tok = sample_logits(draft_logits_list[k], temperature, top_k, top_p,
                                       temp_tokens, repetition_penalty, rng);
     draft_tokens.push_back(draft_tok);
     temp_tokens.push_back(draft_tok);
-  } else {
-    // Stack all draft logits into one [num_drafts, V] tensor and do a
-    // single device->host copy instead of k separate ones. Sampling
-    // itself stays sequential because each step's rep_penalty depends on
-    // the previous draft (temp_tokens grows per iteration). Bandwidth
-    // win: 1 sync + 1 transfer instead of k. (fast-inference [10a])
-    auto draft_logits_stacked = torch::stack(draft_logits_list);  // [k, V] on device
-    // One pinned D->H for the whole [k, V] block; subsequent loop
-    // iterations view rows out of this buffer. (fast-inference [12d])
-    auto draft_logits_cpu = to_pinned_host(draft_logits_stacked);
-    for (int64_t k = 0; k < num_drafts; ++k) {
-      auto dl = draft_logits_cpu.select(0, k);  // [V] view, no copy
-      int64_t draft_tok = sample_logits(dl, temperature, top_k, top_p,
-                                        temp_tokens, repetition_penalty, rng);
-      draft_tokens.push_back(draft_tok);
-      temp_tokens.push_back(draft_tok);
-      if (draft_tok == eos_id) break;
-    }
+    if (draft_tok == eos_id) break;
   }
 
   total_drafted += static_cast<int64_t>(draft_tokens.size());
@@ -519,7 +514,11 @@ int64_t speculative_decode_step(
 #ifdef __APPLE__
   if (device.is_mps()) torch::mps::synchronize();
 #endif
-  verify_logits = to_pinned_host(verify_logits);  // (fast-inference [12d])
+  // Verify on-device: one argmax over the vocab for every verify position,
+  // then bring back only the [k+1] chosen ids — NOT the [k+1, V] logits
+  // (~800 KB at V=50304). (fast-inference [12d], GPU-resident)
+  auto model_choices = verify_logits.select(0, 0).argmax(-1).to(torch::kCPU).contiguous();  // [k+1]
+  const int64_t* mc = model_choices.data_ptr<int64_t>();
 
   // Step 5: Accept tokens — verify_logits[0][0] predicts what comes after main_token
   // verify_logits[0][k] predicts what comes after draft_tokens[k-1]
@@ -540,8 +539,7 @@ int64_t speculative_decode_step(
     // which predicts the token at position verify_seq[k+1]
     // So position k in verify_logits predicts what should come after draft_tokens[k-1]
     // (or after main_token when k=0)
-    auto pos_logits = verify_logits.select(0, 0).select(0, k);
-    int64_t model_choice = pos_logits.argmax(-1).item<int64_t>();
+    int64_t model_choice = mc[k];   // GPU argmax computed once, above
 
     if (model_choice == draft_tokens[k]) {
       all_tokens.push_back(draft_tokens[k]);
@@ -1407,14 +1405,14 @@ int main(int argc, char** argv) {
 #ifdef __APPLE__
           if (is_mps) torch::mps::synchronize();
 #endif
-          // Move logits to host via pinned memory (free GPU tensor right after).
-          // (fast-inference [12d])
-          auto next_logits = to_pinned_host(logits.select(1, logits.size(1) - 1).squeeze(0));
-          // Release GPU tensors
-          logits.reset();
-          input.reset();
+          // Sample on-device (GPU-resident sampler) — only the token id (8 B)
+          // returns, not the [V] logits. (fast-inference [12d])
+          auto next_logits = logits.select(1, logits.size(1) - 1).squeeze(0);
           int64_t next_id = sample_logits(next_logits, temperature, top_k, top_p,
                                           all_tokens, repetition_penalty, rng);
+          // Release GPU tensors after sampling (next_logits views into logits).
+          logits.reset();
+          input.reset();
           all_tokens.push_back(next_id);
           if (next_id == static_cast<int64_t>(tokenizer.eos_id())) break;
           std::vector<uint32_t> tok_to_decode = {static_cast<uint32_t>(next_id)};

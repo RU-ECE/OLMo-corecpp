@@ -222,6 +222,7 @@ set(OLMO_SOURCES
     src/backend/cuda_backend.cpp
     src/backend/topp_radix.cpp  # fast-inference [7]
     src/backend/fused_lm_head_sample.cpp  # fast-inference [6]
+    src/backend/gpu_sample.cpp  # device-resident sampler (every decode path)
     src/backend/paged_attention.cpp  # fast-inference [9] (CPU ref + dispatch)
     src/backend/lm_head_gemv.cpp  # fast-inference [11]
     src/backend/flash_decode.cpp  # fast-inference [12]

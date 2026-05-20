@@ -134,7 +134,16 @@ int64_t draft_model_speculative_step(
 
   const int64_t target_snap = state.target_kv.snapshot();
   auto vlogits = (*state.target_model)->forward(vinp, c10::nullopt, -100, &state.target_kv);
-  auto vlogits_cpu = vlogits.cpu().contiguous();
+  // Greedy verification needs only the per-position argmax (k+1 ids), computed
+  // on-device; only the rejection-sampling path needs the full [k+1, V]
+  // distributions on host. Don't copy the logits when we won't use them.
+  torch::Tensor vchoices_host, vlogits_cpu;
+  if (greedy) {
+    vchoices_host = vlogits.select(0, 0).argmax(-1).to(torch::kCPU).contiguous();  // [k+1]
+  } else {
+    vlogits_cpu = vlogits.cpu().contiguous();
+  }
+  const int64_t* vchoices = greedy ? vchoices_host.data_ptr<int64_t>() : nullptr;
 
   // Step 3: walk verify positions and decide acceptance.
   int64_t accepted = 0;
@@ -143,7 +152,7 @@ int64_t draft_model_speculative_step(
   // unambiguous main prediction, always accepted.
   int64_t main_tok;
   if (greedy) {
-    main_tok = argmax_1d(vlogits_cpu.select(0, 0).select(0, 0));
+    main_tok = vchoices[0];
   } else {
     auto p_main = filtered_probs(vlogits_cpu.select(0, 0).select(0, 0),
                                  temperature, top_k, top_p);
@@ -165,9 +174,8 @@ int64_t draft_model_speculative_step(
   std::uniform_real_distribution<double> uni(0.0, 1.0);
   int64_t drafts_accepted = 0;
   for (int64_t k = 0; k < static_cast<int64_t>(drafts.size()); ++k) {
-    auto vrow = vlogits_cpu.select(0, 0).select(0, k + 1);
     if (greedy) {
-      int64_t target_choice = argmax_1d(vrow);
+      int64_t target_choice = vchoices[k + 1];
       if (target_choice == drafts[k]) {
         all_tokens.push_back(drafts[k]);
         ++accepted;
@@ -179,6 +187,7 @@ int64_t draft_model_speculative_step(
         break;
       }
     } else {
+      auto vrow = vlogits_cpu.select(0, 0).select(0, k + 1);
       auto p = filtered_probs(vrow, temperature, top_k, top_p);
       const auto& q = draft_probs[static_cast<size_t>(k)];
       const double p_i = p[static_cast<size_t>(drafts[k])];

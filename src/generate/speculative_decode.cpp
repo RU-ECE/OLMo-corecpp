@@ -33,6 +33,7 @@
  *   Inference-time only. Not used during training.
  */
 #include "olmo_cpp/generate/speculative_decode.hpp"
+#include "olmo_cpp/backend/gpu_sample.hpp"
 #include "olmo_cpp/profiler.hpp"
 #include <algorithm>
 #include <cmath>
@@ -42,40 +43,12 @@ namespace olmo_cpp {
 
 int64_t sample_token(torch::Tensor logits, double temperature,
                      int64_t top_k, double top_p, bool greedy) {
-  if (greedy) {
-    return logits.argmax(-1).item<int64_t>();
-  }
-
-  // Apply temperature
-  if (temperature != 1.0 && temperature > 0) {
-    logits = logits / temperature;
-  }
-
-  // Top-k filtering
-  if (top_k > 0 && top_k < logits.size(-1)) {
-    auto [topk_values, topk_indices] = logits.topk(top_k, -1);
-    auto min_topk = topk_values.index({-1}).item<float>();
-    logits = logits.where(logits >= min_topk,
-                          torch::full_like(logits, -std::numeric_limits<float>::infinity()));
-  }
-
-  // Top-p (nucleus) filtering
-  if (top_p < 1.0) {
-    auto [sorted_logits, sorted_indices] = logits.sort(-1, /*descending=*/true);
-    auto probs = torch::softmax(sorted_logits, -1);
-    auto cumulative_probs = probs.cumsum(-1);
-
-    // Remove tokens with cumulative probability above top_p
-    auto mask = cumulative_probs - probs > top_p;
-    sorted_logits.masked_fill_(mask, -std::numeric_limits<float>::infinity());
-
-    // Scatter back
-    logits.scatter_(-1, sorted_indices, sorted_logits);
-  }
-
-  // Sample
-  auto probs = torch::softmax(logits, -1);
-  return torch::multinomial(probs, 1).item<int64_t>();
+  // Single device-resident sampler for every decode path: rep-penalty (none
+  // here), temperature, top-k, softmax, top-p (O(V) bucket-radix kernel — not
+  // the O(V log V) sort), and the draw all stay on-device; only the token id
+  // crosses D->H. greedy == temperature 0.
+  return gpu_sample(logits, greedy ? 0.0 : temperature, top_k, top_p,
+                    /*rep_tokens=*/{}, /*rep_penalty=*/1.0);
 }
 
 // Explicit template instantiation for both model types

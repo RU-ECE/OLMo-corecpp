@@ -39,11 +39,17 @@ void make_tma_descriptor(const torch::Tensor& tensor,
     case torch::kFloat32:  dt = CU_TENSOR_MAP_DATA_TYPE_FLOAT32;  break;
     default: return;  // unsupported dtype
   }
+  // TMA tensors support up to rank 5 (CUDA driver limit). The CUDA headers
+  // don't expose a portable macro for this across the 12.x series, so pin the
+  // constant rather than depend on CU_TENSOR_MAP_MAX_TENSOR_RANK (which is not
+  // declared in all toolkits, e.g. 12.1).
+  constexpr int kTmaMaxRank = 5;
   const int rank = static_cast<int>(tensor.dim());
-  cuuint64_t global_dim[CU_TENSOR_MAP_MAX_TENSOR_RANK] = {};
-  cuuint64_t global_stride[CU_TENSOR_MAP_MAX_TENSOR_RANK - 1] = {};
-  cuuint32_t box_dim[CU_TENSOR_MAP_MAX_TENSOR_RANK] = {};
-  cuuint32_t element_stride[CU_TENSOR_MAP_MAX_TENSOR_RANK] = {};
+  if (rank > kTmaMaxRank) return;  // leave descriptor zeroed; kernel bypasses TMA
+  cuuint64_t global_dim[kTmaMaxRank] = {};
+  cuuint64_t global_stride[kTmaMaxRank - 1] = {};
+  cuuint32_t box_dim[kTmaMaxRank] = {};
+  cuuint32_t element_stride[kTmaMaxRank] = {};
   for (int i = 0; i < rank; ++i) {
     global_dim[i] = static_cast<cuuint64_t>(tensor.size(rank - 1 - i));
     box_dim[i] = (i == 0) ? static_cast<cuuint32_t>(tile_cols)

@@ -113,10 +113,12 @@ say "── Repo state ──"
 ok "repo layout OK ($(git rev-parse --short HEAD 2>/dev/null || echo 'no-git'))"
 
 say "── OLMo-core (Python reference) ──"
-if [[ -d OLMo-corecpp ]]; then
-  ok "OLMo-corecpp/ present"
+if python3 -c "import olmo_core" 2>/dev/null; then
+  ok "olmo_core importable ($(python3 -c 'import olmo_core; print(olmo_core.__version__)' 2>/dev/null || echo '?'))"
+elif [[ -d olmo-python && -f olmo-python/pyproject.toml ]]; then
+  ok "olmo-python/ present (05_train_python.sh will pip install -e it)"
 else
-  warn "OLMo-corecpp/ missing — Python training side needs setup (see 05_train_python.sh)"
+  warn "olmo-python/ missing AND olmo_core not importable — Python side will fail"
 fi
 
 # Persist the resolved arch so 01_build_cpp.sh targets exactly this GPU.

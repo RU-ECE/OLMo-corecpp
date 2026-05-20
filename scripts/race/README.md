@@ -1,122 +1,122 @@
-# 250M Race — C++ vs Python on the 5060 Ti
+# Race — C++ vs Python, identical 257M backbone, on the 5060 Ti
 
 End-to-end pipeline that builds, validates, and benchmarks the C++
-implementation against a stock PyTorch baseline at matched 250M
-architecture. Both sides train the same backbone (16 layers, d=1024,
-ffn=2816, vocab=50257, tied embeddings); the C++ side keeps its MTP
-heads on top, which is what wins inference.
+implementation against the in-repo OLMo-core Python baseline at an
+**identical architecture**. Both sides train OLMo-core's `llama2_271M`
+shape dialed to 12 layers / 8 heads (~257M, untied embeddings); the C++
+side keeps its 3 MTP heads on top (+3.2M), which is what wins inference.
 
 ## One-command run
 
 ```bash
-cd llm-cpp
+cd llm-cpp        # repo root (the dir containing CLAUDE.md + olmo-python/)
+git checkout 2fast2furious && git pull
 bash scripts/race/run_all.sh
 ```
 
-The full pipeline takes ~60–90 minutes on a 5060 Ti: ~5 min for env
-checks + build, ~5 min for correctness, ~5 min to download/tokenize
-TinyStories on first run, ~25 min per side for training, ~2 min for
-inference races, then analysis.
-
-After it finishes, read:
+~60–90 min on a 5060 Ti. Reads when done:
 
 ```
 scripts/race/results/RESULT.md
-scripts/race/results/loss_curve.png    (if matplotlib is installed)
+scripts/race/results/loss_curve.png      (if matplotlib installed)
 scripts/race/results/throughput.png
 ```
 
+## Prerequisites (the professor installs these once)
+
+The 5060 Ti is **Blackwell / sm_120**. That requires:
+
+1. **CUDA Toolkit ≥ 12.8** (sm_120 support landed in 12.8):
+   ```bash
+   nvcc --version                       # must be ≥ 12.8
+   export PATH=/usr/local/cuda-12.8/bin:$PATH
+   export CUDAToolkit_ROOT=/usr/local/cuda-12.8
+   ```
+2. **PyTorch with sm_120 kernels** (cu128 wheel, PyTorch ≥ 2.7):
+   ```bash
+   pip3 install --upgrade torch --index-url https://download.pytorch.org/whl/cu128
+   python3 -c "import torch; print(torch.cuda.get_arch_list())"   # must contain sm_120
+   ```
+
+`00_env_check.sh` enforces both — it bails with the exact fix if either
+is too old, *before* the 5-minute build. The in-repo OLMo-core
+(`olmo-python/`) is pip-installed automatically by phase 05.
+
 ## Phase-by-phase
 
-Every phase logs to `scripts/race/results/<phase>/`. You can skip
-phases that already succeeded:
+Every phase logs to `scripts/race/results/<phase>/`. Skip completed
+phases with `SKIP_PHASES`:
 
 ```bash
-SKIP_PHASES="00 01 03" bash scripts/race/run_all.sh
+SKIP_PHASES="00 01 02 03" bash scripts/race/run_all.sh
 ```
 
 | phase | script | what it does |
 |---|---|---|
-| 00 | `00_env_check.sh` | nvidia-smi, sm_120, cmake/nvcc, pytorch+cuda, disk |
-| 01 | `01_build_cpp.sh` | `cmake -DCMAKE_CUDA_ARCHITECTURES=120` + parallel build |
-| 02 | `02_verify_correctness.sh` | runs `test_paged_kv`, `test_prefix_cache`, `test_scheduler`, `test_fused_ce`, `test_fused_qkv_rope`, and **`test_cuda_parity`** (the GPU validation of the 3 correctness fixes in the audit) |
-| 03 | `03_prepare_data.sh` | downloads TinyStories, tokenizes with GPT-2 BPE → `data/race_tokens.npy` |
-| 04 | `04_train_cpp.sh` | trains C++ 250M w/ MTP, parses step/loss/tok-s to `metrics.csv` |
-| 05 | `05_train_python.sh` | trains Python 250M backbone (no MTP) via OLMo-core's training script |
-| 06 | `06_infer_cpp.sh` | 5 trials × 256 tokens, MTP speculative + paged KV, reports median tok/s |
-| 07 | `07_infer_python.sh` | 5 trials × 256 tokens, vanilla PyTorch generation, reports median tok/s |
+| 00 | `00_env_check.sh` | nvidia-smi, **enforces CUDA 12.8 + torch sm_120**, cmake/nvcc/gcc, disk |
+| 01 | `01_build_cpp.sh` | `cmake -DCMAKE_CUDA_ARCHITECTURES=<gpu> -DOLMO_BUILD_KERNELS=ON` + parallel build (re-checks the Blackwell floor first) |
+| 02 | `02_verify_correctness.sh` | `test_paged_kv`, `test_prefix_cache`, `test_scheduler`, `test_fused_ce`, `test_fused_qkv_rope`, and **`test_cuda_parity`** (GPU validation of the 3 correctness fixes) |
+| 03 | `03_prepare_data.sh` | downloads TinyStories, GPT-2 BPE → `data/race_tokens.npy` |
+| 04 | `04_train_cpp.sh` | trains C++ side (with MTP) → `metrics.csv` |
+| 05 | `05_train_python.sh` | `pip install -e olmo-python`, then `torchrun olmo_train_race.py` (matched llama2_271M, no MTP) → `metrics.csv` |
+| 06 | `06_infer_cpp.sh` | 5×256 tokens, paged KV + MTP speculative, median tok/s |
+| 07 | `07_infer_python.sh` | 5×256 tokens, vanilla PyTorch generation, median tok/s |
 | 08 | `08_analyze.py` | reads all metrics, writes `RESULT.md` + plots |
 
-## Configs
+## The two sides are the same model
 
-- `configs/race_250m_cpp.conf` — C++ side. SwiGLU FFN, RMSNorm, RoPE,
-  tied embeddings, `num_mtp_heads=3`, no FP8 / SubQ / structural /
-  multi-res / GQA — only MTP on top of the backbone.
-- `configs/race_250m_python.yaml` — Python side. Same backbone. No
-  MTP. Field names match OLMo-core's TransformerConfig/TrainerConfig.
+| | C++ (`race_250m_cpp.conf`) | Python (`olmo_train_race.py`) |
+|---|---|---|
+| factory | hand-matched | `TransformerConfig.llama2_271M(n_layers=12, n_heads=8)` |
+| d_model | 1024 | 1024 |
+| n_layers | 12 | 12 |
+| n_heads | 8 (head_dim 128) | 8 (head_dim 128) |
+| ffn_hidden | 2816 | 2816 |
+| vocab | 50304 (GPT-2 padded) | 50304 |
+| norm | RMSNorm, eps 1e-5 | RMSNorm, eps 1e-5 |
+| activation | SwiGLU | SwiGLU |
+| rope_theta | 10000 | 10000 |
+| embeddings | untied | untied |
+| **MTP heads** | **3 (+3.2M)** | **none** |
+| backbone params | ~257M | ~257M |
 
-Total parameter count:
-- C++:  ~257 M backbone + ~3.2 M MTP heads  ≈ **260 M**
-- Python:  ~257 M backbone (matches C++ backbone exactly)
+Same lr (3e-4), weight decay (0.1), betas (0.9, 0.95), cosine schedule
+with 100-step warmup, bf16, batch 32 (4 micro × 8 accum), seq 1024,
+same `data/race_tokens.npy`, same seed. MTP is the only architectural
+asymmetry — by design, since it's what the C++ inference side leans on.
 
-## Python training entry point
+## Which optimizations are enabled
 
-`05_train_python.sh` auto-detects three common OLMo-core invocations:
-
-1. `OLMo-corecpp/src/scripts/train.py` (script path)
-2. `OLMo-corecpp/scripts/train.py` (older path)
-3. `python -m olmo_core.train` (installed package)
-
-If your OLMo-core ships a different entry point, override:
-
-```bash
-export OLMO_TRAIN_CMD="python my_train_script.py"
-bash scripts/race/run_all.sh
-```
-
-If the log format differs from what the metrics parser expects, set
-`OLMO_LOG_REGEX` to a Python regex with three groups: `(step, loss, tok_per_s)`.
+See `OPTIMIZATIONS.md` for the full map. Short version: every kernel
+optimization is compiled in (`OLMO_BUILD_KERNELS=ON`), and the config
+sets the flags that matter — `fused=0` (routes through `AttentionImpl`,
+which has the kernel wirings), `cuda_graph=1`, `bf16=1`,
+`foreach_optimizer=1`, `gpu_data=1`.
 
 ## Python inference baseline
 
 `python_inference_baseline.py` is a self-contained PyTorch generation
-loop matching the YAML config exactly. It loads the Python-trained
-checkpoint, generates 256 tokens greedily with a KV cache, and prints
-the same `[N tokens, X tok/s]` trailer the C++ chat tool prints. The
-analyzer scrapes both with the same regex.
-
-To benchmark vllm or HuggingFace `generate()` instead, set:
+loop (KV-cached, greedy) matching the model architecture. It prints the
+same `[N tokens, X tok/s]` trailer the C++ chat tool prints, so the
+analyzer scrapes both identically. To benchmark vLLM / HF `generate()`
+instead:
 
 ```bash
-export PY_INFER_CMD="python my_vllm_runner.py"
+export PY_INFER_CMD="python my_vllm_runner.py"   # must accept --checkpoint --prompt
+                                                  # --max-new-tokens --device
 bash scripts/race/07_infer_python.sh
 ```
 
-The runner must accept `--checkpoint`, `--prompt`, `--max-new-tokens`,
-`--device`, and emit a trailing `[N tokens, X tok/s]` line.
-
-## What "perfect" means here
-
-- **Determinism:** both sides pin seeds and use the same tokenized
-  data. Loss curves are directly comparable.
-- **Correctness gate:** training cannot proceed until `test_cuda_parity`
-  passes on real hardware. The three correctness fixes shipped in the
-  recent audit (WMMA UB, half-rotation inverse RoPE, missing
-  AutogradCUDA wrappers) are validated against ATen references first.
-- **Repeatability:** every phase writes its own log + CSV under
-  `scripts/race/results/<phase>/`. Re-running is `bash run_all.sh`;
-  skip already-passed phases with `SKIP_PHASES`.
-- **Fair comparison:** matched backbone, matched batch, matched lr,
-  matched data. MTP is the only architectural asymmetry — that's what
-  the inference race highlights.
-
 ## Common failures
 
-- **`test_cuda_parity` fails on `forward y` for fused FFN:** the WMMA
-  UB fix or the AutogradCUDA wrapper isn't picked up. Verify your build
-  used `OLMO_BUILD_KERNELS=ON` and you're on commit `ef689f4` or later.
-- **`05_train_python.sh` exits "OLMo-core training entry not found":**
-  set `OLMO_TRAIN_CMD` to whatever your OLMo-core install uses.
-- **Python inference baseline can't load checkpoint:** the format may
-  not match. The baseline expects either `{"model": state_dict}` or a
-  bare state_dict, with keys matching its `Transformer` class.
+- **`00_env_check.sh` fails on nvcc or torch:** it prints the exact
+  CUDA-12.8 / cu128 install command. Run it, re-run the phase.
+- **`test_cuda_parity` fails:** a correctness fix isn't compiled in.
+  Confirm `OLMO_BUILD_KERNELS=ON` and you're on commit `9e72d9a`+.
+- **Phase 05 `pip install -e olmo-python` fails:** inspect the error;
+  usually a missing build dep. `cd olmo-python && pip install -e .`
+  surfaces it directly.
+- **Data dtype mismatch in phase 05:** OLMo-core's `NumpyFSLDataset`
+  expects uint16/uint32 token IDs. `03_prepare_data.sh` prints the
+  dtype of `race_tokens.npy`; if OLMo-core rejects it, set the dataset
+  dtype in `olmo_train_race.py`'s `NumpyFSLDatasetConfig`.

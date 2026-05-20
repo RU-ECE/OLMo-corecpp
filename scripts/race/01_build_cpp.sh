@@ -99,16 +99,18 @@ tail -8 "$CFG_LOG"
 say "compiling with $(nproc) jobs (first build ~5 min) → $BUILD_LOG"
 # Full output to the log; mirror the tail to the terminal. On failure,
 # surface the ACTUAL compiler errors instead of make's summary lines.
+# -k (keep-going): don't stop at the first failed .cu — compile every
+# source so a single run surfaces ALL compiler errors at once.
 set +e
-make -j"$(nproc)" >"$BUILD_LOG" 2>&1
+make -k -j"$(nproc)" >"$BUILD_LOG" 2>&1
 build_rc=$?
 set -e
 tail -15 "$BUILD_LOG"
 if [[ $build_rc -ne 0 ]]; then
-  printf "\033[1;31m  ✗ build failed — first compiler errors:\033[0m\n"
-  grep -nE 'error:|fatal error|Error [0-9]' "$BUILD_LOG" | head -40
+  printf "\033[1;31m  ✗ build failed — all compiler errors:\033[0m\n"
+  grep -nE 'error:|fatal error' "$BUILD_LOG" | head -60
   fail "build failed. Full log: $BUILD_LOG
-       Paste the errors above (or that log) so the kernel can be fixed."
+       Paste the errors above (or that log) so the kernels can be fixed."
 fi
 
 say "build complete"

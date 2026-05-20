@@ -22,6 +22,8 @@ add_library(olmo_kernels SHARED
     rms_norm_backward.cu       # B3 — fused RMSNorm backward
 )
 target_include_directories(olmo_kernels PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include   # public headers: olmo_cpp/backend/*.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}              # kernel-local .cuh (cuda_reduce, mma_sync)
     ${CMAKE_CURRENT_SOURCE_DIR}/..
     ${TORCH_INCLUDE_DIRS}
 )

@@ -17,7 +17,7 @@ mkdir -p "$results_dir"
 
 say() { printf "\033[1;36m[infer-cpp]\033[0m %s\n" "$*"; }
 
-CKPT="${CPP_CKPT:-scripts/race/results/cpp_ckpt/last.pt}"
+CKPT="${CPP_CKPT:-scripts/race/results/cpp_ckpt/model.pt}"
 CONF=scripts/race/configs/race_250m_cpp.conf
 VOCAB=data/gpt2/vocab.json
 MERGES=data/gpt2/merges.txt

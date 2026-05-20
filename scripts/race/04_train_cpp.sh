@@ -33,14 +33,14 @@ end=$(date +%s)
 say "wall clock: $((end - start)) s"
 
 # Extract step-time + loss + tok/s from the log into a CSV the analyzer reads.
-# olmo_train prints lines like:
-#   step  100 | loss 5.234 | step_ms 152.3 | tok/s 13456
+# olmo_train (src/train.cpp) prints lines like:
+#   Epoch 0 | Step 100/1000  loss: 5.2341  lr: 3.00e-04  step_ms: 152  tok/s: 13456
 python3 - <<EOF
 import re, csv
 rows = []
 with open("$LOG") as f:
     for line in f:
-        m = re.search(r"step\s+(\d+).*?loss\s+([\d\.eE+-]+).*?step_ms\s+([\d\.]+).*?tok/s\s+([\d\.]+)", line)
+        m = re.search(r"Step\s+(\d+)\b.*?loss:\s*([\d\.eE+-]+).*?step_ms:\s*(\d+).*?tok/s:\s*(\d+)", line)
         if m:
             rows.append({"step": int(m.group(1)),
                          "loss": float(m.group(2)),

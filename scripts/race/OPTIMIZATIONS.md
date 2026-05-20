@@ -7,9 +7,9 @@ shipped to where it fires (or doesn't) on a 5060 Ti race run.
 
 | optimization | fires from | how to disable (don't) |
 |---|---|---|
-| WMMA fused FFN (kernels/fused_ffn_wmma.cu)             | `fused_ffn()` host dispatcher for bf16 + aligned shapes | unavailable on sm < 80 |
-| TMA async-load fused FFN (kernels/fused_ffn_tma.cu)    | host dispatcher routes here first; runtime checks compute cap and falls back to WMMA on sm < 90 | only on sm_90+ |
-| WMMA fused QKV+RoPE (kernels/fused_qkv_rope_wmma.cu)   | `fused_qkv_rope()` for bf16 + aligned shapes | n/a |
+| WMMA fused FFN (kernels/fused_ffn_wmma.cu)             | `fused_ffn()` for bf16 + aligned shapes **when the tiles fit in shared memory**. At the race's H=2816 the kernel needs ~270 KB > Blackwell's ~227 KB cap, so it falls back to the cuBLAS chain (fast_linear + vectorized silu_mul + fast_linear) — still fast. Fires for smaller H. | unavailable on sm < 80 |
+| TMA async-load fused FFN (kernels/fused_ffn_tma.cu)    | same dispatcher; sm_90+ + shmem fit. Also falls back to cuBLAS at H=2816. | only on sm_90+ |
+| WMMA fused QKV+RoPE (kernels/fused_qkv_rope_wmma.cu)   | `fused_qkv_rope()` for bf16 + aligned shapes; ~100 KB at head_dim=128, fits via cudaFuncSetAttribute opt-in on Blackwell → **fires on the race** | n/a |
 | Fused LM-head + softmax-CE (kernels/fused_lm_head_ce.cu) | `transformer.cpp::forward_with_loss` calls `fused_lm_head_ce_autograd` for main + MTP heads | requires labels |
 | Fused RMSNorm backward (kernels/rms_norm_backward.cu)  | `RmsNormFn::backward` (cuda_ops_autograd.cpp) routes here for bf16/fp32 CUDA tensors | n/a |
 | WMMA fp32→bf16 store vectorization (B2)                | inside the WMMA kernels above | n/a |
@@ -42,7 +42,7 @@ which **lack** the QKV+RoPE and fast_linear out-proj wirings.
 | flag | value | purpose |
 |---|---|---|
 | `[optimization] fused`             | **0** | route through standard `Transformer` / `AttentionImpl` — that's where the kernel wirings are |
-| `[optimization] cuda_graph`        | **1** | capture the whole fwd+bwd step into a CUDA graph for replay |
+| `[optimization] cuda_graph`        | **0** | OFF — capture exists only in the FusedTransformer path (fused=1, no kernel wirings) and is incompatible with the A3 fused-CE backward's .item() sync. Known follow-on. |
 | `[optimization] foreach_optimizer` | 1   | use ForeachAdamW (`_foreach_*` batched ops) instead of per-param AdamW loop |
 | `[optimization] gpu_data`          | 1   | whole tokenized corpus lives in VRAM (no per-step H2D copy) |
 | `[optimization] zero1`             | 0   | single-GPU race; ZeRO-1 sharding only helps multi-GPU |
@@ -74,25 +74,25 @@ the structural reasons C++ wins:
    means the chat tool drafts 2-4 tokens per verify forward instead of
    1. Python has no MTP heads, so it does linear per-token decode.
 
-2. **Whole-step CUDA graph capture** — `cuda_graph = 1` rolls the
-   1000+ launches of fwd+bwd+optimizer-step into one replayed graph.
-   Python OLMo-core can do this too in principle but it's not the
-   default path.
-
-3. **cuBLASLt direct (D3/D5)** — every Linear in the forward+backward
+2. **cuBLASLt direct (D3/D5)** — every Linear in the forward+backward
    skips the ATen dispatcher and uses heuristic-selected algos per shape.
 
-4. **Fused LM-head + softmax-CE (A3)** — the `[B*S, V]` logits tensor
-   never materializes in training. At V=50257 and B*S=4096 this is
+3. **Fused LM-head + softmax-CE (A3)** — the `[B*S, V]` logits tensor
+   never materializes in training. At V=50304 and B*S=4096 this is
    ~800 MB of HBM traffic saved per step.
 
-5. **AutogradCUDA wrapper for RMSNorm + B3 fused backward** — every
-   RMSNorm backward (24 sites/step × 12 layers in our 250M backbone)
-   is one fused kernel instead of ~10 ATen ops.
+4. **AutogradCUDA wrapper for RMSNorm + B3 fused backward** — every
+   RMSNorm backward is one fused kernel instead of ~10 ATen ops.
 
-6. **TMA async-load on sm_90+** — on Hopper or Blackwell, the FFN
-   kernel overlaps x-tile loads with WMMA compute. The 5060 Ti is
-   sm_120 (Blackwell) so this path lights up.
+5. **Fused QKV+RoPE kernel** — one launch produces Q/K/V in head-major
+   layout with RoPE applied (fires on the race at head_dim=128).
 
-If anything in this list isn't firing on the actual run, the C++ side
-is leaving performance on the table.
+Note: at the race's H=2816 the fused FFN *kernel* doesn't fire (shmem
+over budget); the FFN still runs as fast cuBLASLt GEMMs + the
+vectorized silu_mul kernel. The fused FFN kernel is for smaller H.
+
+CUDA graph capture is OFF (see Tier 3) — incompatible with the A3
+fused-CE backward's .item() sync, and only wired on the fused=1 path.
+
+If anything else in this list isn't firing on the actual run, the C++
+side is leaving performance on the table.

@@ -57,6 +57,8 @@
  *   The other half is the FFN (feed_forward.cpp).
  */
 #include "olmo_cpp/model/fused_attention.hpp"
+#include "olmo_cpp/backend/fused_qkv_rope.hpp"   // H3: fused QKV+RoPE kernel
+#include "olmo_cpp/backend/cublas_direct.hpp"    // H3: fast_linear (cuBLASLt direct)
 #include "olmo_cpp/profiler.hpp"
 #include <ATen/ops/scaled_dot_product_attention.h>
 #include <limits>
@@ -106,6 +108,47 @@ torch::Tensor FusedAttentionImpl::forward(
 
   auto B = x.size(0);
   auto S = x.size(1);
+
+  // ── H3: fully fused QKV+RoPE kernel + cuBLASLt-direct out-proj ──
+  // Mirrors AttentionImpl's hot path. One launch produces q/k/v in head-major
+  // layout with RoPE applied (replaces the ATen Linear + split + reshape +
+  // separate rope below), and the output projection skips the ATen dispatcher
+  // via fast_linear. Only when on CUDA, no QK-norm, RoPE active, no QKV bias,
+  // and not in sliding-window mode (that path keeps its cached mask below).
+  const bool can_use_fused_qkv =
+      x.is_cuda() && !q_norm_ && !k_norm_ && rope_bufs != nullptr &&
+      !w_qkv_->bias.defined() && sliding_window_size_ <= 0;
+  if (can_use_fused_qkv) {
+    const int64_t s_offset = start_pos.value_or(0);
+    auto cos_full = rope_bufs->pos_cos.narrow(0, s_offset, S);
+    auto sin_full = rope_bufs->pos_sin.narrow(0, s_offset, S);
+    auto cos_half = cos_full.narrow(-1, 0, head_dim_ / 2);
+    auto sin_half = sin_full.narrow(-1, 0, head_dim_ / 2);
+    auto out = fused_qkv_rope_autograd(x, w_qkv_->weight, cos_half, sin_half,
+                                       n_heads_, n_kv_heads_, head_dim_);
+    auto q = std::get<0>(out);  // [B, n_q,  S, head_dim] with RoPE applied
+    auto k = std::get<1>(out);
+    auto v = std::get<2>(out);
+    if (layer_cache) {
+      auto [full_k, full_v] = layer_cache->update(k, v);
+      k = full_k;
+      v = full_v;
+    }
+    if (n_heads_rep_ > 1) {
+      auto kS = k.size(2);
+      k = k.unsqueeze(2).expand({B, n_kv_heads_, n_heads_rep_, kS, head_dim_})
+           .reshape({B, n_heads_, kS, head_dim_});
+      v = v.unsqueeze(2).expand({B, n_kv_heads_, n_heads_rep_, kS, head_dim_})
+           .reshape({B, n_heads_, kS, head_dim_});
+    }
+    bool is_causal_fused =
+        (S > 1) && (layer_cache == nullptr || layer_cache->seq_len() == S);
+    auto attn_out =
+        at::scaled_dot_product_attention(q, k, v, c10::nullopt, 0.0, is_causal_fused);
+    attn_out = attn_out.transpose(1, 2).reshape({B, S, -1});
+    return fast_linear(attn_out, w_out_->weight,
+                       w_out_->bias.defined() ? w_out_->bias : torch::Tensor());
+  }
 
   // ── Fused QKV projection (1 GEMM instead of 3) ──
   auto qkv = w_qkv_(x);  // [B, S, q_size + 2 * kv_size]

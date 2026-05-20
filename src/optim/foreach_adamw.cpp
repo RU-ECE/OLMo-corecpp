@@ -158,9 +158,12 @@ torch::Tensor ForeachAdamW::step(LossClosure closure) {
       // Per-param step counter tensor. _fused_adamw_ wants TensorList of
       // 0-D step tensors. We share a single step value across all params
       // by reusing one tensor (the API still accepts a list).
-      auto step_t = torch::tensor(static_cast<int64_t>(step_count_),
-                                   torch::TensorOptions().dtype(torch::kFloat32)
-                                       .device(params_vec.front().device()));
+      // torch::full constructs the 0-D step scalar directly on the device
+      // (fill kernel) — avoids the per-step 4-byte H->D that torch::tensor(x)
+      // followed by .to(device) would incur.
+      auto step_t = torch::full({}, static_cast<double>(step_count_),
+                                 torch::TensorOptions().dtype(torch::kFloat32)
+                                     .device(params_vec.front().device()));
       std::vector<at::Tensor> step_list(params_vec.size(), step_t);
       std::vector<at::Tensor> max_exp_avg_sq_empty;  // amsgrad=false; unused
       at::_fused_adamw_(

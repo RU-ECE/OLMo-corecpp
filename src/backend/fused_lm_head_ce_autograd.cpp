@@ -74,13 +74,17 @@ struct FusedLMHeadCEFunction
     // Build mask of valid rows: labels != ignore_index AND label in [0, V).
     auto valid_mask = (labels != ignore_index) &
                       (labels >= 0) & (labels < V);
-    const int64_t valid_count_int =
-        std::max<int64_t>(1, valid_mask.to(torch::kInt64).sum().item<int64_t>());
-    const double inv_count =
-        grad_loss.item<double>() / static_cast<double>(valid_count_int);
+    auto valid_f = valid_mask.to(softmax.dtype());            // [N], 0/1 in compute dtype
+    // Keep count AND scale as DEVICE scalars — no .item() D2H sync in the
+    // backward (this ran every step, once per MTP head, stalling the pipeline).
+    // Count/divide in fp32 (bf16 can't represent counts > 256 exactly), then
+    // cast the scalar back to compute dtype so grad_logits keeps its dtype.
+    auto valid_count = valid_mask.to(torch::kFloat32).sum().clamp_min(1.0);   // [.]
+    auto scale = (grad_loss.to(torch::kFloat32) / valid_count)
+                     .to(softmax.dtype());                                     // [.]
 
-    // grad_logits = (softmax - onehot) * inv_count, zeroed where invalid.
-    // Scatter -1 at (row, label) for valid rows. Use a safe label index
+    // grad_logits = (softmax - onehot) * scale, zeroed where invalid.
+    // Scatter 1 at (row, label) for valid rows. Use a safe label index
     // (clamp to 0 for invalid rows; their contribution is masked out).
     auto safe_labels = labels.clamp(0, V - 1).to(torch::kInt64);
     auto onehot = torch::zeros_like(softmax);
@@ -88,10 +92,7 @@ struct FusedLMHeadCEFunction
         /*dim=*/1,
         safe_labels.unsqueeze(1),
         torch::ones_like(safe_labels.unsqueeze(1), softmax.options()));
-    auto grad_logits = softmax - onehot;
-    // Zero rows where labels are ignored (or out of range).
-    grad_logits = grad_logits * valid_mask.to(softmax.dtype()).unsqueeze(1);
-    grad_logits = grad_logits * static_cast<double>(inv_count);
+    auto grad_logits = (softmax - onehot) * valid_f.unsqueeze(1) * scale;
 
     // grad_h = grad_logits @ W.  Shapes: [N, V] @ [V, d] = [N, d].
     auto grad_h = fast_matmul(grad_logits, W, /*transa=*/false, /*transb=*/false);

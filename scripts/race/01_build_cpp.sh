@@ -59,19 +59,57 @@ LIBTORCH_PATH=$(python3 -c "import torch; print(torch.utils.cmake_prefix_path)")
 [[ -d "$LIBTORCH_PATH" ]] || fail "libtorch cmake dir not found via pip torch"
 ok "libtorch: $LIBTORCH_PATH"
 
+# ── Pin the CUDA toolkit to the validated nvcc ──
+# CMake's FindCUDAToolkit defaults to /usr/local/cuda, which on mixed-toolchain
+# boxes can be an OLDER CUDA (e.g. 12.1) than the nvcc on PATH (12.8). The
+# compiler can then differ from the headers/libs. Derive the home from the
+# nvcc we just validated and pin both, so the whole toolchain is consistent.
+NVCC_BIN=$(command -v nvcc)
+CUDA_HOME=$(cd "$(dirname "$NVCC_BIN")/.." && pwd)
+say "CUDA toolkit: $CUDA_HOME  (nvcc $NVCC_VER)"
+if [[ -L /usr/local/cuda || -d /usr/local/cuda ]]; then
+  ULC_VER=$(/usr/local/cuda/bin/nvcc --version 2>/dev/null | grep -oE 'release [0-9]+\.[0-9]+' | awk '{print $2}' || echo "?")
+  if [[ "$ULC_VER" != "$NVCC_VER" && "$ULC_VER" != "?" ]]; then
+    printf "\033[1;33m  ⚠ /usr/local/cuda is CUDA %s but PATH nvcc is %s — pinning to %s\033[0m\n" \
+           "$ULC_VER" "$NVCC_VER" "$CUDA_HOME"
+  fi
+fi
+
 # ── Configure + build ──
-say "configuring (Release, sm_${ARCH}, kernels ON)"
-mkdir -p build
+mkdir -p build scripts/race/results
+CFG_LOG=$(pwd)/scripts/race/results/cmake_configure.log
+BUILD_LOG=$(pwd)/scripts/race/results/build.log
 cd build
+
+say "configuring (Release, sm_${ARCH}, kernels ON) → $CFG_LOG"
+set +e
 cmake .. \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_PREFIX_PATH="$LIBTORCH_PATH" \
+  -DCMAKE_CUDA_COMPILER="$NVCC_BIN" \
+  -DCUDAToolkit_ROOT="$CUDA_HOME" \
   -DCMAKE_CUDA_ARCHITECTURES="$ARCH" \
   -DOLMO_BUILD_KERNELS=ON \
-  2>&1 | tail -25
+  >"$CFG_LOG" 2>&1
+cfg_rc=$?
+set -e
+tail -8 "$CFG_LOG"
+[[ $cfg_rc -eq 0 ]] || { grep -nE 'CMake Error|error:' "$CFG_LOG" | head -20; fail "cmake configure failed — full log: $CFG_LOG"; }
 
-say "compiling with $(nproc) jobs (first build ~5 min)"
-make -j"$(nproc)" 2>&1 | tail -20
+say "compiling with $(nproc) jobs (first build ~5 min) → $BUILD_LOG"
+# Full output to the log; mirror the tail to the terminal. On failure,
+# surface the ACTUAL compiler errors instead of make's summary lines.
+set +e
+make -j"$(nproc)" >"$BUILD_LOG" 2>&1
+build_rc=$?
+set -e
+tail -15 "$BUILD_LOG"
+if [[ $build_rc -ne 0 ]]; then
+  printf "\033[1;31m  ✗ build failed — first compiler errors:\033[0m\n"
+  grep -nE 'error:|fatal error|Error [0-9]' "$BUILD_LOG" | head -40
+  fail "build failed. Full log: $BUILD_LOG
+       Paste the errors above (or that log) so the kernel can be fixed."
+fi
 
 say "build complete"
 for t in olmo_train chat prepare_data test_cuda_parity test_fused_ce test_fused_qkv_rope; do

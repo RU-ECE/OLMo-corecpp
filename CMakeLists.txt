@@ -240,7 +240,8 @@ set(OLMO_SOURCES
     src/backend/cublas_direct.cpp   # L (direct cuBLASLt fast path)
     src/optim/eight_bit_adamw.cpp   # O (8-bit Adam moment states)
     src/backend/int4_kv.cpp         # U (INT4 KV codec)
-    src/backend/tma_loads.cpp       # W (Blackwell TMA descriptor builder)
+    # NOTE: tma_loads.cpp (TMA descriptor builder) is compiled into olmo_kernels,
+    # not here — its only caller is fused_ffn_tma.cu. See kernels/CMakeLists.txt.
     src/backend/fp8_cublaslt.cpp    # S (FP8 cuBLASLt entry point)
     src/generate/tree_speculative.cpp  # 8.1 (tree speculative)
     src/backend/fused_qkv_rope_autograd.cpp  # G backward (autograd-aware)

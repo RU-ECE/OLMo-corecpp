@@ -20,6 +20,11 @@ add_library(olmo_kernels SHARED
     fused_ffn_tma.cu           # I + item W: TMA async-load variant (sm_90+)
     fused_lm_head_ce.cu        # A3 — fused LM-head + softmax-CE
     rms_norm_backward.cu       # B3 — fused RMSNorm backward
+    # Host-side TMA descriptor builder. Lives HERE (not in olmo_cpp) because
+    # make_tma_descriptor is called only by fused_ffn_tma.cu and by nothing in
+    # olmo_cpp — keeping it in the static lib left it an orphan object that the
+    # olmo_kernels shared lib could not resolve. Co-locate with its caller.
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/backend/tma_loads.cpp  # W (TMA descriptor)
 )
 target_include_directories(olmo_kernels PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../include   # public headers: olmo_cpp/backend/*.hpp
@@ -27,7 +32,9 @@ target_include_directories(olmo_kernels PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/..
     ${TORCH_INCLUDE_DIRS}
 )
-target_link_libraries(olmo_kernels PRIVATE ${TORCH_LIBRARIES} CUDA::cudart)
+# CUDA::cuda_driver provides cuTensorMapEncodeTiled (driver API) used by
+# tma_loads.cpp. cudart alone does not export it.
+target_link_libraries(olmo_kernels PRIVATE ${TORCH_LIBRARIES} CUDA::cudart CUDA::cuda_driver)
 
 # The kernels reference each other through the public headers, whose CUDA
 # declarations are gated behind OLMO_HAS_CUDA_KERNELS (e.g. fused_ffn_tma.cu

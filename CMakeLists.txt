@@ -181,6 +181,12 @@ set(OLMO_SOURCES
     src/model/mup_init.cpp
     src/model/convolution.cpp
     src/model/gated_attention.cpp
+    # Wave / Hyena sequence mixers
+    src/model/wave_attention.cpp
+    src/model/hyena_ssm.cpp
+    src/model/wave_block.cpp
+    src/model/wave_transformer.cpp
+    src/train_wave.cpp
     # Model: MoE
     src/model/moe/router.cpp
     src/model/moe/loss.cpp

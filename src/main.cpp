@@ -8,6 +8,7 @@
 #include "olmo_cpp/config.hpp"
 #include "olmo_cpp/model/transformer.hpp"
 #include "olmo_cpp/model/fused_transformer.hpp"
+#include "olmo_cpp/model/wave_transformer.hpp"
 #include "olmo_cpp/model/mup_init.hpp"
 #include "olmo_cpp/train.hpp"
 #include "olmo_cpp/seed.hpp"
@@ -202,6 +203,18 @@ int main(int argc, char** argv) {
       else                              cfg.attention_backend = olmo_cpp::TransformerConfig::AttentionBackend::SDPA;
     }
 
+    // Sequence mixer: attention, wave, hyena, hybrid_wave, hybrid_hyena
+    {
+      auto s = model_ini.get_or<std::string>("sequence_mixer", "attention");
+      if      (s == "wave")         cfg.sequence_mixer = olmo_cpp::TransformerConfig::SequenceMixerType::Wave;
+      else if (s == "hyena")        cfg.sequence_mixer = olmo_cpp::TransformerConfig::SequenceMixerType::Hyena;
+      else if (s == "hybrid_wave")  cfg.sequence_mixer = olmo_cpp::TransformerConfig::SequenceMixerType::HybridWave;
+      else if (s == "hybrid_hyena") cfg.sequence_mixer = olmo_cpp::TransformerConfig::SequenceMixerType::HybridHyena;
+      else                          cfg.sequence_mixer = olmo_cpp::TransformerConfig::SequenceMixerType::Attention;
+    }
+    cfg.hyena_order        = model_ini.get_or<int64_t>("hyena_order", 2);
+    cfg.hyena_filter_order = model_ini.get_or<int64_t>("hyena_filter_order", 64);
+
     // Gated attention: none, headwise, elementwise
     {
       auto s = model_ini.get_or<std::string>("gated_attention", "none");
@@ -377,7 +390,15 @@ int main(int argc, char** argv) {
     std::cout << "Config: " << conf_path << "\n";
 
     // Create and train model
-    if (use_fused) {
+    const bool use_wave_model =
+        cfg.sequence_mixer != olmo_cpp::TransformerConfig::SequenceMixerType::Attention;
+
+    if (use_wave_model) {
+      auto model = olmo_cpp::WaveTransformer(cfg);
+      model->init_weights();
+      run(model, cfg, train_cfg, device, use_mup, false,
+          use_multi_res, enable_profile, save_path, seed_state);
+    } else if (use_fused) {
       auto model = olmo_cpp::FusedTransformer(cfg);
       run(model, cfg, train_cfg, device, use_mup, true,
           use_multi_res, enable_profile, save_path, seed_state);

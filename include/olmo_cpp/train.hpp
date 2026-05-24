@@ -34,6 +34,7 @@
 #include "olmo_cpp/config.hpp"
 #include "olmo_cpp/model/transformer.hpp"
 #include "olmo_cpp/model/fused_transformer.hpp"
+#include "olmo_cpp/model/wave_transformer.hpp"
 #include <torch/torch.h>
 #include <optional>
 #include <string>
@@ -216,6 +217,18 @@ void train(
 /// overload that wires in CUDA graph capture and SGP.
 void train(
     FusedTransformer& model,
+    const TransformerConfig& model_cfg,
+    const TrainConfig& train_cfg,
+    torch::Device device,
+    std::vector<std::shared_ptr<Callback>> callbacks = {},
+    std::shared_ptr<Evaluator> evaluator = nullptr);
+
+/// Training loop for WaveTransformer (wave-field / Hyena SSM).
+/// Shares the same optimizer/LR-scheduler/dataset infrastructure as the
+/// Transformer overload but dispatches through WaveTransformer::forward.
+/// CUDA graphs and DDP are not wired — research-only single-GPU path.
+void train(
+    WaveTransformer& model,
     const TransformerConfig& model_cfg,
     const TrainConfig& train_cfg,
     torch::Device device,

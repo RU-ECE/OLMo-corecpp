@@ -168,6 +168,20 @@ struct TransformerConfig {
   /// Kernel width for the conv (causal, left-padded).
   int64_t conv_kernel_size = 4;
 
+  // === Wave / Hyena sequence mixer ===
+  /// Replaces the QK attention kernel with a physics-based or SSM mixer.
+  ///   Attention    — standard transformer attention (default)
+  ///   Wave         — content-modulated damped-wave FFT convolution
+  ///   Hyena        — order-N Hyena SSM with implicit positional-MLP filters
+  ///   HybridWave   — even layers = Wave, odd layers = standard Attention
+  ///   HybridHyena  — even layers = Hyena, odd layers = standard Attention
+  enum class SequenceMixerType { Attention, Wave, Hyena, HybridWave, HybridHyena };
+  SequenceMixerType sequence_mixer = SequenceMixerType::Attention;
+  /// Hyena operator order (depth of composition). 2 or 3.
+  int64_t hyena_order = 2;
+  /// Embedding dimension of the positional MLP that generates Hyena filters.
+  int64_t hyena_filter_order = 64;
+
   // === Multi-Token Prediction (MTP) ===
   /// Number of look-ahead heads predicting tokens at offset +2, +3, ... .
   /// 0 disables MTP entirely (DeepSeek-V3 style auxiliary head).

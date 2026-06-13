@@ -303,6 +303,9 @@ target_include_directories(olmo_cpp PUBLIC
     ${JSON_INCLUDE_DIR}
 )
 target_link_libraries(olmo_cpp PUBLIC ${TORCH_LIBRARIES} ZLIB::ZLIB)
+if(CUDA_FOUND OR CMAKE_CUDA_COMPILER)
+  target_link_libraries(olmo_cpp PUBLIC CUDA::cublas CUDA::cublasLt CUDA::cudart)
+endif()
 target_compile_options(olmo_cpp PRIVATE -O3 -march=native)
 
 # ========================================================================

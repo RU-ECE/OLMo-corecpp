@@ -67,13 +67,25 @@ int main(int argc, char** argv) {
 
     olmo_cpp::Transformer model(cfg);
     auto device = torch::kCPU;
-    // Load checkpoint if it exists; otherwise use random weights so the
-    // scheduler infra test can run before any training has happened.
+    // Load checkpoint if it exists, forcing all tensors onto CPU so a
+    // checkpoint saved on CUDA doesn't crash on load. Fall back to random
+    // weights if the file is absent or the load fails for any reason —
+    // the scheduler logic test doesn't need trained weights.
     {
       std::ifstream f(ckpt);
-      if (f.good()) {
-        f.close();
-        torch::load(model, ckpt);
+      const bool file_exists = f.good();
+      f.close();
+      if (file_exists) {
+        try {
+          torch::serialize::InputArchive archive;
+          archive.load_from(ckpt, torch::Device(torch::kCPU));
+          model->load(archive);
+          std::cout << "[test_scheduler] loaded checkpoint: " << ckpt << "\n";
+        } catch (const std::exception& e) {
+          std::cout << "[test_scheduler] checkpoint load failed (" << e.what()
+                    << ") — using random weights\n";
+          model->init_weights();
+        }
       } else {
         std::cout << "[test_scheduler] no checkpoint at " << ckpt
                   << " — using random weights (scheduler logic test only)\n";

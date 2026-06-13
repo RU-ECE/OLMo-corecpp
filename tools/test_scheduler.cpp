@@ -28,6 +28,7 @@
 #include "olmo_cpp/data/bpe_tokenizer.hpp"
 
 #include <torch/torch.h>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -65,8 +66,20 @@ int main(int argc, char** argv) {
     cfg.validate();
 
     olmo_cpp::Transformer model(cfg);
-    torch::load(model, ckpt);
     auto device = torch::kCPU;
+    // Load checkpoint if it exists; otherwise use random weights so the
+    // scheduler infra test can run before any training has happened.
+    {
+      std::ifstream f(ckpt);
+      if (f.good()) {
+        f.close();
+        torch::load(model, ckpt);
+      } else {
+        std::cout << "[test_scheduler] no checkpoint at " << ckpt
+                  << " — using random weights (scheduler logic test only)\n";
+        model->init_weights();
+      }
+    }
     model->to(device);
     model->eval();
 

@@ -19,7 +19,6 @@
  */
 
 #include "olmo_cpp/backend/fused_qkv_rope.hpp"
-#include "olmo_cpp/backend/cublas_direct.hpp"
 
 #include <torch/torch.h>
 #include <torch/csrc/autograd/custom_function.h>
@@ -110,8 +109,8 @@ struct FusedQKVRopeFunction
     //   grad_w_qkv  = g_qkv.T @ x_flat       [total, B*S] @ [B*S, d]   → [total, d]
     auto g_qkv_flat = g_qkv.view({B * S, total});
     auto x_flat     = x.view({B * S, d});
-    auto grad_x_flat   = fast_matmul(g_qkv_flat, w_qkv, /*transa=*/false, /*transb=*/false);
-    auto grad_w_qkv    = fast_matmul(g_qkv_flat, x_flat, /*transa=*/true,  /*transb=*/false);
+    auto grad_x_flat   = torch::matmul(g_qkv_flat, w_qkv);
+    auto grad_w_qkv    = torch::matmul(g_qkv_flat.transpose(0, 1), x_flat);
     auto grad_x        = grad_x_flat.view(x.sizes());
 
     return {grad_x, grad_w_qkv, torch::Tensor(), torch::Tensor(),

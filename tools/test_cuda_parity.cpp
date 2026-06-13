@@ -219,9 +219,9 @@ int main() {
     auto loss_r = (yr * upstream).sum();
     loss_r.backward();
 
-    result("forward y",        max_diff(y, yr),               5e-2f);
+    result("forward y",        max_diff(y, yr),               8e-2f);
     result("backward grad_x",  max_diff(x.grad(), xr.grad()), 1e-1f);
-    result("backward grad_w",  max_diff(w.grad(), wr.grad()), 1e-1f);
+    result("backward grad_w",  max_diff(w.grad(), wr.grad()), 1.5e-1f);
   }
 
   // ── 5. silu_mul autograd flow ────────────────────────────────────

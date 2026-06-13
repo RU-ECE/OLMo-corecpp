@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.18)
 project(olmo_cpp LANGUAGES CXX)
 
+# LibTorch prefix, CUDA toolkit, and GPU arch — before CUDA language probe.
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/AutoToolchain.cmake)
+
 # Default: "release with debug info" → RelWithDebInfo (-O2 + debug symbols on GCC/Clang).
 # Single-config generators only (Ninja/Make); Visual Studio/Xcode use --config RelWithDebInfo.
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -756,3 +759,6 @@ target_compile_options(benchmark_tokenizer PRIVATE -O3 -march=native)
 if(JSON_INCLUDE_DIR)
   target_compile_definitions(benchmark_tokenizer PRIVATE HAS_NLOHMANN_JSON=1)
 endif()
+
+# Race pipeline (scripts/race/run_all.sh) — incremental custom targets.
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Race.cmake)

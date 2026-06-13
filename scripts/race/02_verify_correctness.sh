@@ -13,6 +13,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
+BUILD_DIR="${BUILD_DIR:-build}"
 results_dir=scripts/race/results/correctness
 mkdir -p "$results_dir"
 
@@ -32,16 +33,16 @@ run_test() {
 }
 
 say "── CPU parity tests (sanity) ──"
-run_test "test_fused_ce"        ./build/test_fused_ce
-run_test "test_fused_qkv_rope"  ./build/test_fused_qkv_rope
+run_test "test_fused_ce"        "$BUILD_DIR/test_fused_ce"
+run_test "test_fused_qkv_rope"  "$BUILD_DIR/test_fused_qkv_rope"
 
 say "── Infra tests ──"
-run_test "test_paged_kv"        ./build/test_paged_kv
-run_test "test_prefix_cache"    ./build/test_prefix_cache
-run_test "test_scheduler"       ./build/test_scheduler
+run_test "test_paged_kv"        "$BUILD_DIR/test_paged_kv"
+run_test "test_prefix_cache"    "$BUILD_DIR/test_prefix_cache"
+run_test "test_scheduler"       "$BUILD_DIR/test_scheduler"
 
 say "── CUDA parity (real GPU validation of the 3 correctness fixes) ──"
-run_test "test_cuda_parity"     ./build/test_cuda_parity
+run_test "test_cuda_parity"     "$BUILD_DIR/test_cuda_parity"
 
 printf "\n\033[1;32mALL CORRECTNESS GATES PASSED\033[0m\n"
 printf "Logs: %s\n" "$results_dir"

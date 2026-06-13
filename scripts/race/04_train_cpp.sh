@@ -12,6 +12,7 @@ mkdir -p "$results_dir"
 
 say() { printf "\033[1;36m[cpp]\033[0m %s\n" "$*"; }
 
+BUILD_DIR="${BUILD_DIR:-build}"
 CONF=scripts/race/configs/race_250m_cpp.conf
 LOG="$results_dir/train.log"
 METRICS="$results_dir/metrics.csv"
@@ -26,7 +27,7 @@ start=$(date +%s)
   echo "[host] $(hostname) | $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
   echo "[conf] $CONF"
   echo
-  ./build/olmo_train "$CONF"
+  "$BUILD_DIR/olmo_train" "$CONF"
 } 2>&1 | tee "$LOG"
 end=$(date +%s)
 

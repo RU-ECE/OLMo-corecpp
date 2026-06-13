@@ -15,6 +15,10 @@
 
 #include <torch/torch.h>
 
+#if defined(USE_CUDA) || defined(OLMO_HAS_CUDA_KERNELS)
+#  include <cuda_runtime.h>
+#endif
+
 namespace olmo_cpp {
 
 torch::Tensor fused_lm_head_ce_cpu(torch::Tensor h,
@@ -43,6 +47,11 @@ torch::Tensor fused_lm_head_ce(torch::Tensor h,
                                  int64_t ignore_index) {
 #ifdef OLMO_HAS_CUDA_KERNELS
   if (h.is_cuda() && weight.is_cuda() && labels.is_cuda()) {
+    cudaDeviceProp props;
+    cudaGetDeviceProperties(&props, h.device().index());
+    if (props.major >= 12) {
+      return fused_lm_head_ce_cpu(h, weight, labels, ignore_index);
+    }
     return fused_lm_head_ce_cuda(h, weight, labels, ignore_index);
   }
 #endif

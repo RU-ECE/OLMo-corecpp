@@ -14,6 +14,7 @@ cd "$(dirname "$0")/../.."
 
 say() { printf "\033[1;36m[data]\033[0m %s\n" "$*"; }
 
+BUILD_DIR="${BUILD_DIR:-build}"
 OUT=data/race_tokens.npy
 VOCAB=data/gpt2/vocab.json
 MERGES=data/gpt2/merges.txt
@@ -32,7 +33,7 @@ if [[ -f "$OUT" ]]; then
   say "data/race_tokens.npy exists ($((size/1024/1024)) MB) — skipping tokenization"
 else
   say "tokenizing TinyStories → $OUT (~5 min first time)"
-  ./build/prepare_data \
+  "$BUILD_DIR/prepare_data" \
     --download-hf roneneldan/TinyStories \
     --output "$OUT" \
     --vocab-file "$VOCAB" \

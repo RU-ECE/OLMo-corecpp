@@ -31,7 +31,9 @@ namespace olmo_cpp {
 
 namespace {
 
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
 using namespace nvcuda;
+#endif
 
 constexpr int kWmmaM = 16;
 constexpr int kWmmaN = 16;
@@ -253,6 +255,9 @@ torch::Tensor fused_ffn_tma_cuda(torch::Tensor x,
   if (props.major < 9) {
     return fused_ffn_wmma_cuda(x, w_gate_up, w_down);
   }
+  if (props.major >= 12) {
+    return fused_ffn_wmma_cuda(x, w_gate_up, w_down);
+  }
 
   c10::cuda::CUDAGuard guard(x.device());
   auto x_c  = x.contiguous();
@@ -311,6 +316,11 @@ fused_ffn_tma_train_cuda(torch::Tensor x,
   if (props.major < 9) {
     return fused_ffn_wmma_train_cuda(x, w_gate_up, w_down);
   }
+  // TMA path is validated on Hopper (sm_90). Blackwell (sm_120) uses WMMA
+  // until the TMA descriptor/coords are re-verified on sm_120 hardware.
+  if (props.major >= 12) {
+    return fused_ffn_wmma_train_cuda(x, w_gate_up, w_down);
+  }
 
   c10::cuda::CUDAGuard guard(x.device());
   auto x_c  = x.contiguous();
@@ -334,7 +344,14 @@ fused_ffn_tma_train_cuda(torch::Tensor x,
         16 * d * sizeof(__nv_bfloat16)
       + 16 * (2 * H) * sizeof(__nv_bfloat16)
       + 16 * H * sizeof(__nv_bfloat16)
-      + 16;
+      + kWarpsPerBlock * kWmmaM * kWmmaN * sizeof(float)  // per-warp WMMA scratch
+      + 16;                                          // mbarrier slack
+
+  if (shmem > 48 * 1024) {
+    cudaFuncSetAttribute(fused_ffn_tma_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(shmem));
+  }
 
   const int grid = (N + 16 - 1) / 16;
   fused_ffn_tma_kernel<<<grid, kThreadsPerBlock, shmem>>>(

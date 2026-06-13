@@ -54,4 +54,6 @@ set_target_properties(olmo_kernels PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
     PREFIX ""
     CUDA_SEPARABLE_COMPILATION ON
+    # Single-GPU build: don't inherit PyTorch's fat-binary sm_50..sm_120 list.
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
 )

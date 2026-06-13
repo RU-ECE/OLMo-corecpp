@@ -36,6 +36,24 @@ namespace olmo_cpp {
 
 namespace {
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
+__global__ void fused_qkv_rope_wmma_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ w_qkv,
+    const __nv_bfloat16* __restrict__ cos,
+    const __nv_bfloat16* __restrict__ sin,
+    __nv_bfloat16* __restrict__ q_out,
+    __nv_bfloat16* __restrict__ k_out,
+    __nv_bfloat16* __restrict__ v_out,
+    int N, int d, int S, int F,
+    int n_q, int n_kv, int hd) {
+  (void)x; (void)w_qkv; (void)cos; (void)sin;
+  (void)q_out; (void)k_out; (void)v_out;
+  (void)N; (void)d; (void)S; (void)F; (void)n_q; (void)n_kv; (void)hd;
+}
+
+#else
+
 using namespace nvcuda;
 
 constexpr int kWmmaM = 16;
@@ -157,6 +175,8 @@ __global__ void fused_qkv_rope_wmma_kernel(
     v_out[base + di] = __float2bfloat16(v_val);
   }
 }
+
+#endif  // __CUDA_ARCH__ < 800
 
 }  // namespace
 

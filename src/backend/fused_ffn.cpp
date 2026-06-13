@@ -85,6 +85,13 @@ fused_ffn_train(torch::Tensor x,
   if (x.is_cuda() && x.scalar_type() == torch::kBFloat16) {
     const int64_t d = x.size(-1);
     const int64_t H = w_gate_up.size(0) / 2;
+    // WMMA/TMA fused kernels are not yet parity-validated on Blackwell
+    // (sm_120). Route through cuBLAS until the tensor-core path is fixed.
+    cudaDeviceProp props;
+    cudaGetDeviceProperties(&props, x.device().index());
+    if (props.major >= 12) {
+      return ffn_cublas_chain(x, w_gate_up, w_down, /*want_gate_up=*/true);
+    }
     if (d % 16 == 0 && H % 16 == 0 && ffn_fused_shmem_fits(d, H, x.device())) {
       return fused_ffn_tma_train_cuda(x, w_gate_up, w_down);
     }
@@ -109,6 +116,11 @@ torch::Tensor fused_ffn(torch::Tensor x,
   if (x.is_cuda() && x.scalar_type() == torch::kBFloat16) {
     const int64_t d = x.size(-1);
     const int64_t H = w_gate_up.size(0) / 2;
+    cudaDeviceProp props;
+    cudaGetDeviceProperties(&props, x.device().index());
+    if (props.major >= 12) {
+      return ffn_cublas_chain(x, w_gate_up, w_down, /*want_gate_up=*/false).first;
+    }
     if (d % 16 == 0 && H % 16 == 0 && ffn_fused_shmem_fits(d, H, x.device())) {
       // Tensor-core path — TMA variant on sm_90+, plain WMMA otherwise.
       // fused_ffn_tma_cuda itself runtime-checks and falls back to the

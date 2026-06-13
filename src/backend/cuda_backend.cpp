@@ -30,6 +30,7 @@
 
 #ifdef USE_CUDA
 #include <torch/library.h>
+#include <cuda_runtime.h>
 #endif
 
 namespace olmo_cpp {
@@ -51,6 +52,18 @@ namespace {
 /// ATen. (BF16 is the default for H100 / A100 mixed-precision training.)
 inline bool supported_dtype(torch::ScalarType t) {
   return t == torch::kFloat32 || t == torch::kBFloat16;
+}
+
+inline bool use_custom_cuda_kernels(torch::Device dev) {
+#if defined(USE_CUDA) || defined(OLMO_HAS_CUDA_KERNELS)
+  if (!dev.is_cuda()) return false;
+  cudaDeviceProp props;
+  cudaGetDeviceProperties(&props, dev.index());
+  return props.major < 12;
+#else
+  (void)dev;
+  return false;
+#endif
 }
 
 #ifdef OLMO_HAS_CUDA_KERNELS
@@ -75,7 +88,8 @@ torch::Tensor CUDABackend::rms_norm(torch::Tensor x, torch::Tensor weight, doubl
       torch::Tensor(const torch::Tensor&, const c10::optional<torch::Tensor>&, double);
   // Cached on first call; thread-safe magic static.
   static const auto op = resolve_op("olmo_ops::rms_norm");
-  if (op.has_value() && x.is_cuda() && supported_dtype(x.scalar_type())) {
+  if (op.has_value() && x.is_cuda() && supported_dtype(x.scalar_type())
+      && use_custom_cuda_kernels(x.device())) {
     // Schema takes Tensor? — convert undefined Tensor() into nullopt.
     c10::optional<torch::Tensor> w = weight.defined()
         ? c10::optional<torch::Tensor>(weight) : c10::nullopt;
@@ -127,7 +141,8 @@ torch::Tensor CUDABackend::residual_rms_norm(torch::Tensor x, torch::Tensor resi
       const torch::Tensor&, const torch::Tensor&,
       const c10::optional<torch::Tensor>&, double);
   static const auto op = resolve_op("olmo_ops::residual_rms_norm");
-  if (op.has_value() && x.is_cuda() && supported_dtype(x.scalar_type())) {
+  if (op.has_value() && x.is_cuda() && supported_dtype(x.scalar_type())
+      && use_custom_cuda_kernels(x.device())) {
     c10::optional<torch::Tensor> w = weight.defined()
         ? c10::optional<torch::Tensor>(weight) : c10::nullopt;
     auto results = op->typed<FnType>().call(x, residual, w, eps);
@@ -148,7 +163,8 @@ torch::Tensor CUDABackend::rms_norm_add(torch::Tensor x, torch::Tensor residual,
       const torch::Tensor&, const torch::Tensor&,
       const c10::optional<torch::Tensor>&, double);
   static const auto op = resolve_op("olmo_ops::rms_norm_add");
-  if (op.has_value() && x.is_cuda() && supported_dtype(x.scalar_type())) {
+  if (op.has_value() && x.is_cuda() && supported_dtype(x.scalar_type())
+      && use_custom_cuda_kernels(x.device())) {
     c10::optional<torch::Tensor> w = weight.defined()
         ? c10::optional<torch::Tensor>(weight) : c10::nullopt;
     return op->typed<FnType>().call(x, residual, w, eps);

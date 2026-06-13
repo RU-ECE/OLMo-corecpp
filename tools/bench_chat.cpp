@@ -144,7 +144,7 @@ int main(int argc, char** argv) {
 #endif
 
   olmo_cpp::Transformer model(cfg);
-  torch::load(model, checkpoint_path);
+  torch::load(model, checkpoint_path, torch::kCPU);
   model->to(device);
   model->eval();
   torch::NoGradGuard no_grad;

@@ -82,6 +82,13 @@ fused_qkv_rope(torch::Tensor x,
                int64_t head_dim) {
 #ifdef OLMO_HAS_CUDA_KERNELS
   if (x.is_cuda()) {
+    cudaDeviceProp props;
+    cudaGetDeviceProperties(&props, x.device().index());
+    // CUDA fused kernels not yet parity-validated on Blackwell; ATen path.
+    if (props.major >= 12) {
+      return fused_qkv_rope_cpu(x, w_qkv, cos, sin,
+                                 n_q_heads, n_kv_heads, head_dim);
+    }
     // Prefer the WMMA tensor-core variant on bf16 + aligned shapes +
     // when the [16, F] tile fits in shared memory. F = (n_q+2*n_kv)*hd.
     // Limit: 96 KB (sm_80 conservative); Blackwell sm_120 has 228 KB
@@ -106,7 +113,8 @@ fused_qkv_rope(torch::Tensor x,
                              x.device().index());
       const bool aligned = (N % 16 == 0) && (d % 16 == 0) && (F % 16 == 0);
       const bool shmem_ok = (max_optin > 0) && (shmem_bytes <= (size_t)max_optin);
-      if (aligned && shmem_ok) {
+      const bool wmma_ok = props.major < 12;
+      if (aligned && shmem_ok && wmma_ok) {
         return fused_qkv_rope_wmma_cuda(x, w_qkv, cos, sin,
                                           n_q_heads, n_kv_heads, head_dim);
       }

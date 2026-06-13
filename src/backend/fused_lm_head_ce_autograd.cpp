@@ -95,9 +95,8 @@ struct FusedLMHeadCEFunction
     auto grad_logits = (softmax - onehot) * valid_f.unsqueeze(1) * scale;
 
     // grad_h = grad_logits @ W.  Shapes: [N, V] @ [V, d] = [N, d].
-    auto grad_h = fast_matmul(grad_logits, W, /*transa=*/false, /*transb=*/false);
-    // grad_W = grad_logits.T @ h. Shapes: [V, N] @ [N, d] = [V, d].
-    auto grad_W = fast_matmul(grad_logits, h, /*transa=*/true,  /*transb=*/false);
+    auto grad_h = torch::matmul(grad_logits, W);
+    auto grad_W = torch::matmul(grad_logits.transpose(0, 1), h);
 
     return {grad_h, grad_W, torch::Tensor(), torch::Tensor()};
   }

@@ -17,15 +17,16 @@ mkdir -p "$results_dir"
 
 say() { printf "\033[1;36m[infer-cpp]\033[0m %s\n" "$*"; }
 
+BUILD_DIR="${BUILD_DIR:-build}"
 CKPT="${CPP_CKPT:-scripts/race/results/cpp_ckpt/model.pt}"
-CONF=scripts/race/configs/race_250m_cpp.conf
+CONF=scripts/race/configs/race_250m_cpp.json
 VOCAB=data/gpt2/vocab.json
 MERGES=data/gpt2/merges.txt
 
 if [[ ! -f "$CKPT" ]]; then
-  say "WARN: no C++ checkpoint at $CKPT — pre-trained checkpoint not yet produced"
-  say "      run 04_train_cpp.sh first, or set CPP_CKPT=<path> to point at one"
-  say "      using last checkpoint from training (if any) — otherwise this will fail"
+  say "ERROR: no C++ checkpoint at $CKPT"
+  say "       run phase 04 (race_train_cpp) first, or set CPP_CKPT=<path>"
+  exit 1
 fi
 
 PROMPT="Once upon a time in a small village by the mountain, there lived"
@@ -36,6 +37,50 @@ say "ckpt:   $CKPT"
 say "prompt: $PROMPT"
 say "trials: $TRIALS × $TOKENS tokens"
 
+# Reject stale/wrong checkpoints before launching chat (e.g. old TorchScript
+# 125M/768d exports vs race_250m_cpp 1024d C++ torch::save output).
+python3 - <<EOF
+import json, sys, torch
+from pathlib import Path
+
+ckpt = Path("$CKPT")
+conf = Path("$CONF")
+cfg = json.load(open(conf))
+
+try:
+    obj = torch.load(ckpt, map_location="cpu", weights_only=False)
+except Exception as e:
+    print(f"[infer-cpp] ERROR: cannot read checkpoint: {e}", file=sys.stderr)
+    sys.exit(1)
+
+if hasattr(obj, "state_dict"):
+    sd = obj.state_dict()
+elif isinstance(obj, dict) and "state_dict" in obj:
+    sd = obj["state_dict"]
+else:
+    print("[infer-cpp] ERROR: unexpected checkpoint format", file=sys.stderr)
+    sys.exit(1)
+
+key = "embeddings.weight"
+if key not in sd:
+    print(f"[infer-cpp] ERROR: checkpoint missing {key!r}", file=sys.stderr)
+    sys.exit(1)
+
+vocab, d_model = sd[key].shape
+exp_v, exp_d = cfg["vocab_size"], cfg["d_model"]
+if vocab != exp_v or d_model != exp_d:
+    print(
+        f"[infer-cpp] ERROR: checkpoint embed [{vocab}, {d_model}] "
+        f"does not match config [{exp_v}, {exp_d}]",
+        file=sys.stderr,
+    )
+    print(
+        "[infer-cpp]        finish phase 04 (race_train_cpp) or set CPP_CKPT",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+EOF
+
 LOG="$results_dir/infer.log"
 RESULTS_CSV="$results_dir/results.csv"
 echo "trial,tok_per_s,total_tokens,wall_seconds,accept_rate" > "$RESULTS_CSV"
@@ -44,7 +89,7 @@ echo "trial,tok_per_s,total_tokens,wall_seconds,accept_rate" > "$RESULTS_CSV"
 for trial in $(seq 1 "$TRIALS"); do
   say "trial $trial/$TRIALS …"
   trial_log="$results_dir/trial_${trial}.log"
-  echo "$PROMPT" | ./build/chat \
+  echo "$PROMPT" | "$BUILD_DIR/chat" \
       --checkpoint "$CKPT" \
       --config "$CONF" \
       --vocab-file "$VOCAB" \

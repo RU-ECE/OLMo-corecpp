@@ -30,6 +30,22 @@ namespace olmo_cpp {
 
 namespace {
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800)
+// WMMA headers omit nvcuda::wmma below sm_80. Host dispatch never routes
+// here on such devices (falls back to the FMA-loop kernel).
+__global__ void fused_ffn_wmma_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ w_gate_up,
+    const __nv_bfloat16* __restrict__ w_down,
+    __nv_bfloat16* __restrict__ y,
+    __nv_bfloat16* __restrict__ gate_up_out,
+    int N, int d, int H) {
+  (void)x; (void)w_gate_up; (void)w_down; (void)y; (void)gate_up_out;
+  (void)N; (void)d; (void)H;
+}
+
+#else
+
 using namespace nvcuda;
 
 constexpr int kWmmaM = 16;
@@ -174,6 +190,8 @@ __global__ void fused_ffn_wmma_kernel(
     }
   }
 }
+
+#endif  // __CUDA_ARCH__ < 800
 
 }  // namespace
 

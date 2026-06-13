@@ -113,6 +113,21 @@ torch::Device select_device(const std::string& preferred) {
   return torch::Device(torch::kCPU);
 }
 
+/// Old checkpoints omit the mtp_heads submodule; match TransformerImpl's
+/// "only register when non-empty" rule so torch::load does not fail.
+void align_mtp_config_with_checkpoint(olmo_cpp::TransformerConfig& cfg,
+                                      const std::string& checkpoint_path) {
+  if (cfg.num_mtp_heads <= 0) return;
+  torch::serialize::InputArchive archive;
+  archive.load_from(checkpoint_path, torch::kCPU);
+  for (const auto& key : archive.keys()) {
+    if (key == "mtp_heads") return;
+  }
+  std::cerr << "Note: checkpoint has no mtp_heads weights; "
+               "loading with num_mtp_heads=0 (speculative decoding disabled)\n";
+  cfg.num_mtp_heads = 0;
+}
+
 /// Bring a tensor to host via *pinned* (page-locked) memory. Pinned pages
 /// skip the driver's pageable-staging copy, ~2x faster D->H transfer on
 /// PCIe. Always returns a fresh writable owned buffer. On CPU/MPS this
@@ -875,9 +890,12 @@ int main(int argc, char** argv) {
     // -----------------------------------------------------------------
     auto cfg = olmo_cpp::load_config_from_json(config_path);
     cfg.validate();
+    align_mtp_config_with_checkpoint(cfg, checkpoint_path);
 
     olmo_cpp::Transformer model(cfg);
-    torch::load(model, checkpoint_path);
+    // Remap serialized tensors to CPU — checkpoints may embed MPS/CUDA
+    // device tags from the training host; we move to `device` next.
+    torch::load(model, checkpoint_path, torch::kCPU);
 
     // (fast-inference [17]) Optional draft model for two-model speculative.
     std::unique_ptr<olmo_cpp::Transformer> draft_model;
@@ -885,7 +903,7 @@ int main(int argc, char** argv) {
       auto draft_cfg = olmo_cpp::load_config_from_json(draft_config_path);
       draft_cfg.validate();
       draft_model = std::make_unique<olmo_cpp::Transformer>(draft_cfg);
-      torch::load(*draft_model, draft_checkpoint_path);
+      torch::load(*draft_model, draft_checkpoint_path, torch::kCPU);
       (*draft_model)->to(device);
       (*draft_model)->eval();
       std::cout << "Loaded draft model from " << draft_checkpoint_path

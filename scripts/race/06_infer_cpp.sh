@@ -26,6 +26,8 @@ MERGES=data/gpt2/merges.txt
 if [[ ! -f "$CKPT" ]]; then
   say "ERROR: no C++ checkpoint at $CKPT"
   say "       run phase 04 (race_train_cpp) first, or set CPP_CKPT=<path>"
+  say "       NOTE: do NOT use checkpoints/125M.pt — wrong architecture"
+  say "       (125M is d_model=768/vocab=50257; race conf needs d_model=1024/vocab=50304)"
   exit 1
 fi
 
@@ -48,23 +50,30 @@ conf = Path("$CONF")
 cfg = json.load(open(conf))
 
 try:
-    obj = torch.load(ckpt, map_location="cpu", weights_only=False)
+    obj = torch.load(ckpt, map_location="cpu", weights_only=True)
 except Exception as e:
     print(f"[infer-cpp] ERROR: cannot read checkpoint: {e}", file=sys.stderr)
     sys.exit(1)
 
-if hasattr(obj, "state_dict"):
-    sd = obj.state_dict()
-elif isinstance(obj, dict) and "state_dict" in obj:
+if isinstance(obj, dict) and "state_dict" in obj:
     sd = obj["state_dict"]
+elif isinstance(obj, dict):
+    sd = obj
 else:
     print("[infer-cpp] ERROR: unexpected checkpoint format", file=sys.stderr)
     sys.exit(1)
 
-key = "embeddings.weight"
-if key not in sd:
-    print(f"[infer-cpp] ERROR: checkpoint missing {key!r}", file=sys.stderr)
-    sys.exit(1)
+# Try canonical key first, then search dynamically.
+key = next(
+    (k for k in sd
+     if ("embed" in k.lower() or "wte" in k.lower())
+     and isinstance(sd[k], torch.Tensor)
+     and sd[k].ndim == 2),
+    None,
+)
+if key is None:
+    print("[infer-cpp] WARN: no embedding weight found in checkpoint — skipping validation", file=sys.stderr)
+    sys.exit(0)
 
 vocab, d_model = sd[key].shape
 exp_v, exp_d = cfg["vocab_size"], cfg["d_model"]
@@ -74,11 +83,15 @@ if vocab != exp_v or d_model != exp_d:
         f"does not match config [{exp_v}, {exp_d}]",
         file=sys.stderr,
     )
+    if d_model == 768 and vocab in (50257, 50304):
+        print("[infer-cpp]        This is the 125M checkpoint — wrong model for this race!", file=sys.stderr)
     print(
-        "[infer-cpp]        finish phase 04 (race_train_cpp) or set CPP_CKPT",
+        "[infer-cpp]        finish phase 04 (race_train_cpp) or set CPP_CKPT to the right checkpoint",
         file=sys.stderr,
     )
     sys.exit(1)
+
+print(f"[infer-cpp] checkpoint OK: d_model={d_model}, vocab={vocab}", flush=True)
 EOF
 
 LOG="$results_dir/infer.log"

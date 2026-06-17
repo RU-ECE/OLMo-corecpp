@@ -480,6 +480,79 @@ void train(
   torch::Tensor accum_loss_tensor = torch::zeros({}, torch::TensorOptions().device(device));
   auto model_params = model->parameters();
 
+  // ── CUDA Graph: capture one forward+backward step for zero-kernel-launch replay ──
+  // Eliminates per-kernel CPU dispatch overhead and enables the GPU to pipeline
+  // operations without CPU stalls. Optimizer step stays OUTSIDE the graph
+  // (LR and bias correction change per step). DDP allreduce is also outside
+  // (cross-device). Requires fixed batch/seq shapes (no curriculum).
+  bool graph_active = false;
+#ifdef USE_CUDA
+  at::cuda::CUDAGraph train_graph;
+  torch::Tensor graph_input, graph_labels, graph_loss;
+  at::cuda::CUDAStream capture_stream =
+      at::cuda::getStreamFromPool(/*isHighPriority=*/false, device.index());
+
+  bool want_graph = cfg.use_cuda_graph && device.is_cuda()
+                    && (!ddp || !ddp->is_distributed());
+  if (want_graph) {
+    auto int_opts = torch::TensorOptions().dtype(torch::kLong).device(device);
+    graph_input  = torch::empty({cfg.batch_size, cfg.seq_len}, int_opts);
+    graph_labels = torch::empty({cfg.batch_size, cfg.seq_len}, int_opts);
+
+    if (rank == 0) std::cout << "CUDA Graph: warming up (3 steps)...\n";
+    {
+      c10::cuda::CUDAStreamGuard stream_guard(capture_stream);
+      for (int w = 0; w < 3; ++w) {
+        if (dataset) {
+          auto [in, lab] = dataset->get_batch(cfg.batch_size, device);
+          graph_input.copy_(in);
+          graph_labels.copy_(lab);
+        } else {
+          graph_input.copy_(torch::randint(0, model_cfg.vocab_size,
+              {cfg.batch_size, cfg.seq_len}, int_opts));
+          graph_labels.copy_(torch::randint(0, model_cfg.vocab_size,
+              {cfg.batch_size, cfg.seq_len}, int_opts));
+        }
+        optimizer->zero_grad();
+        {
+          AutocastGuard ac(cfg.use_amp, device);
+          graph_loss = model->forward(graph_input, graph_labels, -100)
+                       / static_cast<float>(cfg.grad_accum_steps);
+        }
+        graph_loss.backward();
+        clip_grad_norm_gpu(model_params, cfg.max_grad_norm);
+        optimizer->step();
+      }
+    }
+
+    if (rank == 0) {
+      std::cout << "CUDA Graph: capturing forward+backward"
+                << " (will replay " << cfg.grad_accum_steps << "x per step)...\n";
+    }
+    // Release reserved-but-unused memory from warmup so the graph's private
+    // pool can allocate cleanly without competing with the warmup pool.
+    c10::cuda::CUDACachingAllocator::emptyCache();
+
+    {
+      c10::cuda::CUDAStreamGuard stream_guard(capture_stream);
+      // Must use memset zero_grad (not set_to_none) — graph captures the
+      // gradient tensor addresses, which must remain valid across replays.
+      optimizer->zero_grad();
+      train_graph.capture_begin();
+      {
+        AutocastGuard ac(cfg.use_amp, device);
+        graph_loss = model->forward(graph_input, graph_labels, -100)
+                     / static_cast<float>(cfg.grad_accum_steps);
+      }
+      graph_loss.backward();
+      train_graph.capture_end();
+    }
+
+    graph_active = true;
+    if (rank == 0) std::cout << "CUDA Graph: captured successfully\n";
+  }
+#endif  // USE_CUDA
+
   // ---- Training loop ----
   for (int64_t step = 0; step < cfg.num_steps; ++step) {
     state.step_start = std::chrono::steady_clock::now();
@@ -551,34 +624,54 @@ void train(
 
     cb_mgr.on_step_start(state);
 
-    optimizer->zero_grad(true);
-    accum_loss_tensor.zero_();
-
-    for (int64_t accum = 0; accum < cfg.grad_accum_steps; ++accum) {
-      torch::Tensor input, labels;
-      if (dataset) {
-        auto [in, lab] = dataset->get_batch(cur_batch_size, device);
-        input = in; labels = lab;
-        dataset->prefetch_next(cur_batch_size, device);
-      } else {
-        input = torch::randint(0, model_cfg.vocab_size, {cur_batch_size, cur_seq_len},
-                               torch::TensorOptions().dtype(torch::kLong).device(device));
-        labels = torch::randint(0, model_cfg.vocab_size, {cur_batch_size, cur_seq_len},
-                                torch::TensorOptions().dtype(torch::kLong).device(device));
+#ifdef USE_CUDA
+    if (graph_active) {
+      // ---- CUDA Graph path ----
+      // Zero gradients once (memset — graph holds fixed gradient tensor addresses).
+      optimizer->zero_grad();
+      accum_loss_tensor.zero_();
+      for (int64_t accum = 0; accum < cfg.grad_accum_steps; ++accum) {
+        if (dataset) {
+          auto [in, lab] = dataset->get_batch(cfg.batch_size, device);
+          graph_input.copy_(in);
+          graph_labels.copy_(lab);
+        }
+        train_graph.replay();
+        accum_loss_tensor.add_(graph_loss.detach());
       }
+    } else
+#endif
+    {
+      // ---- Standard path (non-graph or CPU) ----
+      optimizer->zero_grad(true);
+      accum_loss_tensor.zero_();
 
-      torch::Tensor loss;
-      {
-        AutocastGuard ac(cfg.use_amp, device);
-        loss = model->forward(input, labels, -100) / static_cast<float>(cfg.grad_accum_steps);
-      }
+      for (int64_t accum = 0; accum < cfg.grad_accum_steps; ++accum) {
+        torch::Tensor input, labels;
+        if (dataset) {
+          auto [in, lab] = dataset->get_batch(cur_batch_size, device);
+          input = in; labels = lab;
+          dataset->prefetch_next(cur_batch_size, device);
+        } else {
+          input = torch::randint(0, model_cfg.vocab_size, {cur_batch_size, cur_seq_len},
+                                 torch::TensorOptions().dtype(torch::kLong).device(device));
+          labels = torch::randint(0, model_cfg.vocab_size, {cur_batch_size, cur_seq_len},
+                                  torch::TensorOptions().dtype(torch::kLong).device(device));
+        }
 
-      if (grad_scaler) {
-        grad_scaler->scale(loss).backward();
-      } else {
-        loss.backward();
+        torch::Tensor loss;
+        {
+          AutocastGuard ac(cfg.use_amp, device);
+          loss = model->forward(input, labels, -100) / static_cast<float>(cfg.grad_accum_steps);
+        }
+
+        if (grad_scaler) {
+          grad_scaler->scale(loss).backward();
+        } else {
+          loss.backward();
+        }
+        accum_loss_tensor.add_(loss.detach());
       }
-      accum_loss_tensor.add_(loss.detach());
     }
 
     // Defer loss D2H sync: only pull from GPU when actually needed.

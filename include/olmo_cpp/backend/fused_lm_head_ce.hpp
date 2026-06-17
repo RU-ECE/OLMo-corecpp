@@ -54,10 +54,10 @@ torch::Tensor fused_lm_head_ce_cpu(torch::Tensor h,
                                      torch::Tensor labels,
                                      int64_t ignore_index);
 
-/// Autograd-aware variant. Forward calls fused_lm_head_ce, saves
-/// (h, weight, labels, ignore_index, valid_count) for backward.
-/// Backward recomputes logits, derives grad_h and grad_w via direct
-/// cuBLASLt matmuls.
+/// Autograd-aware chunked CE.  Tiles the vocabulary in Vc=4096 columns so
+/// the full [N,V] logit tensor is never materialised.  Peak live allocation
+/// is n_chunks × [N,Vc] ≈ 13 GB (vs ~53 GB) — fits CUDA-graph private pool.
+/// Backward is handled by PyTorch autograd (mm + element-wise ops).
 torch::Tensor fused_lm_head_ce_autograd(torch::Tensor h,
                                           torch::Tensor weight,
                                           torch::Tensor labels,

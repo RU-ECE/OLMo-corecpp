@@ -78,6 +78,7 @@ class AsyncLossReader {
 #ifdef OLMO_HAS_CUDA_STREAM
   c10::cuda::CUDAStream copy_stream_;
   bool stream_inited_ = false;
+  cudaEvent_t compute_barrier_ = nullptr;  // cross-stream fence: compute→copy
 #endif
 };
 

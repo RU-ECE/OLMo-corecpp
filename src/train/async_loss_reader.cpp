@@ -10,6 +10,7 @@
 
 #ifdef OLMO_HAS_CUDA_STREAM
 #include <cuda_runtime.h>
+#include <ATen/cuda/CUDAContext.h>   // at::cuda::getCurrentCUDAStream()
 #endif
 
 namespace olmo_cpp {
@@ -31,6 +32,7 @@ AsyncLossReader::~AsyncLossReader() {
   for (auto& s : slots_) {
     if (s.event) cudaEventDestroy(s.event);
   }
+  if (compute_barrier_) cudaEventDestroy(compute_barrier_);
 #endif
 }
 
@@ -50,8 +52,22 @@ void AsyncLossReader::queue(const torch::Tensor& loss) {
           cudaEventCreateWithFlags(&slot.event, cudaEventDisableTiming);
         }
       }
+      // Reusable cross-stream fence event (no timing overhead).
+      if (!compute_barrier_) {
+        cudaEventCreateWithFlags(&compute_barrier_, cudaEventDisableTiming);
+      }
       stream_inited_ = true;
     }
+
+    // Cross-stream ordering fix: accum_loss_tensor.add_() ran on the compute
+    // stream. Without this fence, copy_stream_ can race ahead and read the
+    // zero-initialised value (from .zero_() earlier in the step) instead of
+    // the accumulated loss. Record on the compute stream, wait on copy_stream_
+    // so the cast+copy are guaranteed to see the updated device memory.
+    cudaStream_t compute_stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaEventRecord(compute_barrier_, compute_stream);
+    cudaStreamWaitEvent(copy_stream_.stream(), compute_barrier_, 0);
+
     c10::cuda::CUDAStreamGuard guard(copy_stream_);
     auto loss_f = loss.detach().to(torch::kFloat32).reshape({1});
     s.pinned_host.copy_(loss_f, /*non_blocking=*/true);

@@ -1,110 +1,106 @@
 /**
  * src/backend/fused_lm_head_ce_autograd.cpp
  *
- * Autograd Function for the LM-head cross-entropy loss.
+ * Chunked cross-entropy for the LM head.  Replaces the earlier approach of
+ * materialising the full [N, V] logit tensor (N=B*S=32768, V=50304, bf16 = 3.3 GB).
  *
- * Forward: fast_linear (cuBLASLt GEMM, tensor cores) → standard PyTorch CE.
- *   The original "A3 fused" approach used a scalar GEMV kernel that reads W
- *   [V, d] non-coalesced once per output row (32768 reads × 103 MB = 1.8 TB
- *   of non-coalesced HBM traffic at ~100 GB/s ≈ 18 s per head).
- *   cuBLASLt reads W once, reuses it across all N rows via the L2 cache, and
- *   uses tensor cores → ~2 ms for the GEMM + ~1 ms for CE per head.
- *   The 3.3 GB logit tensor is allocated but freed immediately by CE; the
- *   HBM cost of writing and reading it back is 3.3 GB / 3.35 TB/s ≈ 1 ms.
+ * Why chunked?
+ * -----------
+ * With 4 LM heads (main + 3 MTP) and a CUDA graph, every tensor allocated
+ * during capture lives permanently in the graph's private pool.  Four heads,
+ * each with 4–5 intermediate [N, V] tensors, needed ~53 GB simultaneously —
+ * causing OOM on an 80 GB H100.
  *
- * Backward: recompute logits = fast_linear(h, W), derive softmax, subtract
- *   one_hot, scale by grad / valid_count, then two GEMMs for grad_h, grad_W.
+ * The chunked approach tiles the vocabulary dimension in Vc=4096 columns.
+ * The largest live tensor at any moment is [N, Vc] ≈ 256 MB, so the private
+ * pool for CE is n_chunks × [N, Vc] ≈ 13 × 256 MB × 4 heads ≈ 13 GB instead
+ * of ~53 GB.  cuda_graph=1 now fits.
+ *
+ * Algorithm (online log-sum-exp, same as Flash-Attention's online softmax):
+ * ----------
+ * Invariant after processing chunks 0…c-1:
+ *   m = max of all logits seen so far  (per row)
+ *   l = sum of exp(logit - m)          (per row)
+ *
+ * Update for chunk c:
+ *   new_m = max(m, chunk_max)
+ *   l     = l * exp(m - new_m) + sum(exp(lc - new_m))
+ *   m     = new_m
+ *
+ * At the end: log_Z = log(l) + m = logsumexp over all V logits.
+ * CE per row = -logit[label] + log_Z.
+ *
+ * Autodiff:
+ * ---------
+ * No custom Function wrapper: all ops (mm, max, exp, sum, gather, etc.) are
+ * standard PyTorch ops whose backward is already registered.  PyTorch's
+ * autograd handles the backward transparently.  The backward GEMMs are
+ * grad_h += grad_lc @ Wc  and  grad_Wc = h.T @ grad_lc (cuBLAS, same speed
+ * as our earlier matmul-based custom backward).
+ *
+ * CUDA-graph compatibility:
+ * -------------------------
+ * n_chunks = ceil(V / Vc) is a compile-time constant.  All tensor shapes are
+ * fixed per-step.  weight.narrow(0, v0, Vc_actual) produces tensors of fixed
+ * shape for each loop iteration (last chunk has Vc_actual = V % Vc, also
+ * fixed).  No CPU–GPU synchronisation inside the loop.
  */
 
-#include "olmo_cpp/backend/cublas_direct.hpp"
-
 #include <torch/torch.h>
-#include <torch/csrc/autograd/custom_function.h>
+#include <algorithm>
 
 namespace olmo_cpp {
-
-namespace {
-
-struct FusedLMHeadCEFunction
-    : public torch::autograd::Function<FusedLMHeadCEFunction> {
-  static torch::Tensor forward(torch::autograd::AutogradContext* ctx,
-                                 torch::Tensor h,
-                                 torch::Tensor weight,
-                                 torch::Tensor labels,
-                                 int64_t ignore_index) {
-    // cuBLASLt GEMM (tensor cores) + standard CE: ~2ms per head vs ~18s
-    // for the scalar GEMV in fused_lm_head_ce (non-coalesced W reads).
-    auto logits = fast_linear(h, weight, torch::Tensor());   // [N, V]
-    namespace F = torch::nn::functional;
-    auto loss = F::cross_entropy(
-        logits, labels,
-        F::CrossEntropyFuncOptions().ignore_index(ignore_index));
-    ctx->save_for_backward({h, weight, labels});
-    ctx->saved_data["ignore_index"] = ignore_index;
-    return loss;
-  }
-
-  static torch::autograd::tensor_list backward(
-      torch::autograd::AutogradContext* ctx,
-      torch::autograd::tensor_list grad_outputs) {
-    auto saved = ctx->get_saved_variables();
-    auto h      = saved[0];
-    auto W      = saved[1];
-    auto labels = saved[2];
-    const int64_t ignore_index = ctx->saved_data["ignore_index"].toInt();
-    auto grad_loss = grad_outputs[0];
-
-    const int64_t N = h.size(0);
-    const int64_t d = h.size(1);
-    const int64_t V = W.size(0);
-
-    // Recompute logits = h @ W.T via cuBLASLt-direct.
-    auto logits = fast_linear(h, W, torch::Tensor());      // [N, V], dtype = h
-
-    // softmax in compute-dtype. Numerically stable: subtract per-row max
-    // before exp, divide by sum.
-    auto max_per_row = std::get<0>(logits.max(/*dim=*/1, /*keepdim=*/true));
-    auto exp_shift   = (logits - max_per_row).exp();
-    auto softmax     = exp_shift / exp_shift.sum(/*dim=*/1, /*keepdim=*/true);
-
-    // Build mask of valid rows: labels != ignore_index AND label in [0, V).
-    auto valid_mask = (labels != ignore_index) &
-                      (labels >= 0) & (labels < V);
-    auto valid_f = valid_mask.to(softmax.dtype());            // [N], 0/1 in compute dtype
-    // Keep count AND scale as DEVICE scalars — no .item() D2H sync in the
-    // backward (this ran every step, once per MTP head, stalling the pipeline).
-    // Count/divide in fp32 (bf16 can't represent counts > 256 exactly), then
-    // cast the scalar back to compute dtype so grad_logits keeps its dtype.
-    auto valid_count = valid_mask.to(torch::kFloat32).sum().clamp_min(1.0);   // [.]
-    auto scale = (grad_loss.to(torch::kFloat32) / valid_count)
-                     .to(softmax.dtype());                                     // [.]
-
-    // grad_logits = (softmax - onehot) * scale, zeroed where invalid.
-    // Scatter 1 at (row, label) for valid rows. Use a safe label index
-    // (clamp to 0 for invalid rows; their contribution is masked out).
-    auto safe_labels = labels.clamp(0, V - 1).to(torch::kInt64);
-    auto onehot = torch::zeros_like(softmax);
-    onehot.scatter_(
-        /*dim=*/1,
-        safe_labels.unsqueeze(1),
-        torch::ones_like(safe_labels.unsqueeze(1), softmax.options()));
-    auto grad_logits = (softmax - onehot) * valid_f.unsqueeze(1) * scale;
-
-    // grad_h = grad_logits @ W.  Shapes: [N, V] @ [V, d] = [N, d].
-    auto grad_h = torch::matmul(grad_logits, W);
-    auto grad_W = torch::matmul(grad_logits.transpose(0, 1), h);
-
-    return {grad_h, grad_W, torch::Tensor(), torch::Tensor()};
-  }
-};
-
-}  // namespace
 
 torch::Tensor fused_lm_head_ce_autograd(torch::Tensor h,
                                           torch::Tensor weight,
                                           torch::Tensor labels,
                                           int64_t ignore_index) {
-  return FusedLMHeadCEFunction::apply(h, weight, labels, ignore_index);
+  const int64_t N  = h.size(0);
+  const int64_t V  = weight.size(0);
+  const int64_t Vc = 4096;                            // tile width over vocab
+  const int64_t n_chunks = (V + Vc - 1) / Vc;
+
+  // All running accumulators in fp32 for numerical stability.
+  auto fp32_opts = h.options().dtype(torch::kFloat32);
+  // m starts at -∞ so the first chunk's max always wins.
+  auto m       = torch::full({N}, -1e38f, fp32_opts);  // running per-row max
+  auto l       = torch::zeros({N}, fp32_opts);          // running sum-exp
+  auto labeled = torch::zeros({N}, fp32_opts);          // logit at target label
+
+  for (int64_t c = 0; c < n_chunks; ++c) {
+    const int64_t v0       = c * Vc;
+    const int64_t Vc_act   = std::min(Vc, V - v0);
+
+    // [N, Vc_act] in bf16 via cuBLAS tensor cores, cast to fp32 for stable CE.
+    auto Wc = weight.narrow(0, v0, Vc_act);              // view of weight, no copy
+    auto lc = torch::mm(h, Wc.t()).to(torch::kFloat32); // [N, Vc_act] fp32
+
+    // Online logsumexp update.
+    auto cm    = std::get<0>(lc.max(/*dim=*/1));         // [N]
+    auto new_m = torch::max(m, cm);                      // [N]
+    l = l * (m - new_m).exp() +
+        (lc - new_m.unsqueeze(1)).exp().sum(/*dim=*/1);
+    m = new_m;
+
+    // Accumulate the logit at the target label if it lives in this chunk.
+    auto in_chunk  = (labels >= v0) & (labels < v0 + Vc_act);          // [N] bool
+    auto local_idx = (labels - v0).clamp(0, Vc_act - 1);               // [N] int64
+    auto gathered  = lc.gather(1, local_idx.unsqueeze(1)).squeeze(1);  // [N]
+    labeled = labeled + gathered * in_chunk.to(torch::kFloat32);
+  }
+
+  // CE per row = -logit[label] + log(sum_exp) + max_logit
+  auto log_Z  = l.log() + m;                              // [N]
+  auto ce_row = -labeled + log_Z;                          // [N]
+
+  // Average over valid rows (label != ignore_index and in [0, V)).
+  auto valid  = (labels != ignore_index) & (labels >= 0) & (labels < V);
+  auto valid_f = valid.to(torch::kFloat32);
+  auto loss   = (ce_row * valid_f).sum() /
+                valid_f.sum().clamp_min(1.0f);
+
+  // Return in input dtype (bf16 if h is bf16) so the loss accumulates cleanly.
+  return loss.to(h.dtype());
 }
 
 }  // namespace olmo_cpp

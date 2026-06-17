@@ -555,7 +555,10 @@ void train(
         c10::cuda::CUDAStreamGuard stream_guard(capture_stream);
         // Must use memset zero_grad (not set_to_none) — graph captures the
         // gradient tensor addresses, which must remain valid across replays.
-        optimizer->zero_grad();
+        // zero_grad() defaults to set_to_none=true, which FREES the grad
+        // tensors; the captured graph would then write to freed memory and
+        // the optimizer would see undefined grads. Pass false to memset.
+        optimizer->zero_grad(/*set_to_none=*/false);
         train_graph.capture_begin();
         {
           AutocastGuard ac(cfg.use_amp, device);
@@ -647,7 +650,9 @@ void train(
     if (graph_active) {
       // ---- CUDA Graph path ----
       // Zero gradients once (memset — graph holds fixed gradient tensor addresses).
-      optimizer->zero_grad();
+      // MUST pass set_to_none=false: the default (true) frees the grad tensors
+      // the graph captured pointers to, corrupting every replay.
+      optimizer->zero_grad(/*set_to_none=*/false);
       accum_loss_tensor.zero_();
       for (int64_t accum = 0; accum < cfg.grad_accum_steps; ++accum) {
         if (dataset) {
@@ -1052,7 +1057,8 @@ void train(
 
       // Must use memset zero_grad (not set_to_none) — graph references
       // specific gradient tensor addresses that must remain valid.
-      optimizer->zero_grad();
+      // The default set_to_none=true frees them; pass false to memset.
+      optimizer->zero_grad(/*set_to_none=*/false);
 
       train_graph.capture_begin();
       {
@@ -1116,8 +1122,9 @@ void train(
 #ifdef USE_CUDA
     if (graph_active) {
       // ---- CUDA Graph path ----
-      // Zero gradients once (memset — graph references these tensor addresses)
-      optimizer->zero_grad();
+      // Zero gradients once (memset — graph references these tensor addresses).
+      // set_to_none=false is REQUIRED: the default frees the captured grads.
+      optimizer->zero_grad(/*set_to_none=*/false);
       accum_loss_tensor.zero_();
 
       // Replay captured micro-step for each grad_accum iteration.

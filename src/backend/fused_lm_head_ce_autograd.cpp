@@ -99,8 +99,12 @@ torch::Tensor fused_lm_head_ce_autograd(torch::Tensor h,
   auto loss   = (ce_row * valid_f).sum() /
                 valid_f.sum().clamp_min(1.0f);
 
-  // Return in input dtype (bf16 if h is bf16) so the loss accumulates cleanly.
-  return loss.to(h.dtype());
+  // Keep the loss in fp32. The CE reduction is already fp32; casting the
+  // scalar back to bf16 (8-bit mantissa, ULP ~0.06 around a CE of ~11) only
+  // throws away precision in the logged value and in the backward seed. The
+  // caller's accum_loss_tensor and the main+MTP combine are all fp32, so an
+  // fp32 scalar here is strictly cleaner and costs nothing.
+  return loss;
 }
 
 }  // namespace olmo_cpp

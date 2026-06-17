@@ -293,11 +293,19 @@ torch::Tensor apply_rope_autograd_impl(const torch::Tensor& x,
 
 }  // namespace olmo_cpp
 
-// Register autograd-aware impls at the AutogradCUDA dispatch key. The
-// dispatcher routes autograd-tracking CUDA inputs here first; we record
-// the graph and re-dispatch to the CUDA backend impl via the Function's
-// forward (under AutoDispatchBelowAutograd).
-TORCH_LIBRARY_IMPL(olmo_ops, AutogradCUDA, m) {
+// Register autograd-aware impls at the Autograd dispatch key.
+//
+// PyTorch ≥ 2.3 changed custom-op dispatch: the AutogradCUDA key no longer
+// fires for TORCH_LIBRARY_IMPL registrations. The generic Autograd key is
+// the correct target — it fires for all backends (CPU and CUDA) when a
+// tensor has requires_grad=True. Inside each Function::forward we use
+// AutoDispatchBelowAutograd so the call re-dispatches to the backend-specific
+// impl (CUDA or CPU) rather than looping back here.
+//
+// Consequence: this impl is also reached for CPU tensors with requires_grad.
+// We only ship CUDA forward kernels, so CPU training would fail with a
+// TORCH_CHECK. That is acceptable — we never train on CPU in this project.
+TORCH_LIBRARY_IMPL(olmo_ops, Autograd, m) {
   m.impl("rms_norm",     TORCH_FN(olmo_cpp::rms_norm_autograd_impl));
   m.impl("rms_norm_add", TORCH_FN(olmo_cpp::rms_norm_add_autograd_impl));
   m.impl("silu_mul",     TORCH_FN(olmo_cpp::silu_mul_autograd_impl));

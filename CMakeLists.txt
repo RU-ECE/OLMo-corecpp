@@ -252,7 +252,8 @@ set(OLMO_SOURCES
     src/backend/fused_ffn_autograd.cpp       # I backward (autograd-aware)
     src/backend/fused_lm_head_ce.cpp         # A3 — fused LM-head + CE dispatcher
     src/backend/fused_lm_head_ce_autograd.cpp  # A3 backward (recompute + grad routing)
-    src/backend/cuda_ops_autograd.cpp        # CRITICAL — AutogradCUDA wrappers for olmo_ops::*
+    # cuda_ops_autograd.cpp moved to kernels/olmo_ops_autograd.cpp (shared lib) — linker strips
+    # static-lib objects with no exported symbols; see kernels/olmo_ops_autograd.cpp for details.
     src/backend/subq_backward.cpp            # HH SubQ STE backward
     # Seed and profiling infrastructure
     src/seed.cpp

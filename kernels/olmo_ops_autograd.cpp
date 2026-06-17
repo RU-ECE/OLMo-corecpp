@@ -1,34 +1,35 @@
 /**
- * src/backend/cuda_ops_autograd.cpp
+ * kernels/olmo_ops_autograd.cpp
  *
- * AutogradCUDA wrappers for the olmo_ops:: custom kernels.
+ * Autograd wrappers for the olmo_ops:: custom kernels.
  *
- * Background: kernels/rms_norm.cu, silu_mul.cu, and rope.cu register
- * their fused implementations only at the `CUDA` dispatch key. When
- * training on CUDA with autograd-tracking inputs, the dispatcher
- * looks for `AutogradCUDA`, doesn't find it, falls back to dispatch
- * at the backend key, and the output tensor is produced without a
- * grad_fn. Gradients then cannot flow back through any of these
- * ops — training silently produces wrong models.
+ * IMPORTANT: This file MUST live in olmo_kernels (shared library), NOT in
+ * olmo_cpp (static library). The TORCH_LIBRARY_IMPL static constructor has no
+ * exported symbols, so the linker strips it silently from static archives —
+ * the Autograd dispatch key registration never fires. Shared libraries load all
+ * object files unconditionally, so placement here guarantees execution.
  *
- * Fix: provide an AutogradCUDA impl per op via torch::autograd::Function.
+ * Init ordering within olmo_kernels.so:
+ *   PyTorch's TORCH_LIBRARY_IMPL defers impl registration when the schema has
+ *   not been registered yet. TORCH_LIBRARY(olmo_ops, m) lives in rms_norm.cu
+ *   (same shared lib). Whichever static constructor runs first is fine —
+ *   PyTorch applies deferred impls once the schema appears.
+ *
+ * Background: kernels/rms_norm.cu, silu_mul.cu, and rope.cu register their
+ * fused implementations only at the `CUDA` dispatch key. When training on
+ * CUDA with autograd-tracking inputs, the dispatcher looks for `Autograd`,
+ * doesn't find it, falls back to the backend key, and the output tensor is
+ * produced without a grad_fn. Gradients then cannot flow back through any of
+ * these ops — training silently produces wrong models.
+ *
+ * Fix: provide an Autograd impl per op via torch::autograd::Function.
  * Forward calls the underlying kernel via the dispatcher with
  * AutoDispatchBelowAutograd active (skips this autograd key, hits the
- * CUDA impl). Backward computes the standard gradient via ATen ops.
- *
- * Backward kernels (fused, tensor-core) are item B3 — that's a perf
- * follow-on. This file ships the CORRECTNESS fix only.
+ * CUDA impl). Backward computes the standard gradient via ATen ops and the
+ * fused B3 CUDA backward kernel.
  */
 
 #include <torch/torch.h>
-
-// The op schema (TORCH_LIBRARY(olmo_ops, ...)) is registered in the .cu
-// files, which only compile when CUDA kernels are enabled. On non-CUDA
-// builds the schema doesn't exist; trying to TORCH_LIBRARY_IMPL against
-// it would fail at static init. Compile this file's body only when the
-// kernel library is present.
-#if defined(USE_CUDA) || defined(OLMO_HAS_CUDA_KERNELS)
-
 #include <torch/csrc/autograd/custom_function.h>
 #include <ATen/core/dispatch/Dispatcher.h>
 
@@ -302,14 +303,20 @@ torch::Tensor apply_rope_autograd_impl(const torch::Tensor& x,
 // AutoDispatchBelowAutograd so the call re-dispatches to the backend-specific
 // impl (CUDA or CPU) rather than looping back here.
 //
-// Consequence: this impl is also reached for CPU tensors with requires_grad.
-// We only ship CUDA forward kernels, so CPU training would fail with a
-// TORCH_CHECK. That is acceptable — we never train on CPU in this project.
+// This file MUST be in olmo_kernels (shared library). If placed in olmo_cpp
+// (static library), the linker strips the object file since all symbols here
+// are in anonymous namespace and nothing in the link graph references them by
+// name. Shared libraries load all objects unconditionally, so the static
+// constructor always fires.
+//
+// PyTorch handles cross-TU init ordering within this .so via deferred
+// registration: if TORCH_LIBRARY_IMPL fires before TORCH_LIBRARY has
+// registered the schema, the impl is queued and applied when the schema
+// appears. Both live in this .so, so the queue always drains before the
+// binary starts executing user code.
 TORCH_LIBRARY_IMPL(olmo_ops, Autograd, m) {
   m.impl("rms_norm",     TORCH_FN(olmo_cpp::rms_norm_autograd_impl));
   m.impl("rms_norm_add", TORCH_FN(olmo_cpp::rms_norm_add_autograd_impl));
   m.impl("silu_mul",     TORCH_FN(olmo_cpp::silu_mul_autograd_impl));
   m.impl("apply_rope",   TORCH_FN(olmo_cpp::apply_rope_autograd_impl));
 }
-
-#endif  // USE_CUDA || OLMO_HAS_CUDA_KERNELS

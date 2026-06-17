@@ -2,6 +2,7 @@
 # Auto-detected and linked when CUDA compiler is available
 
 add_library(olmo_kernels SHARED
+    olmo_ops_autograd.cpp        # Autograd key registration (must be in shared lib — see file header)
     rms_norm.cu
     rope.cu
     silu_mul.cu

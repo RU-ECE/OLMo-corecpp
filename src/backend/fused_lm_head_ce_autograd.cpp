@@ -1,31 +1,21 @@
 /**
  * src/backend/fused_lm_head_ce_autograd.cpp
  *
- * Autograd Function wrapping fused_lm_head_ce (item A3).
+ * Autograd Function for the LM-head cross-entropy loss.
  *
- * Forward: call fused_lm_head_ce (CUDA kernel or CPU ref) to get the
- * scalar mean loss. Save (h, weight, labels, ignore_index) for backward.
+ * Forward: fast_linear (cuBLASLt GEMM, tensor cores) → standard PyTorch CE.
+ *   The original "A3 fused" approach used a scalar GEMV kernel that reads W
+ *   [V, d] non-coalesced once per output row (32768 reads × 103 MB = 1.8 TB
+ *   of non-coalesced HBM traffic at ~100 GB/s ≈ 18 s per head).
+ *   cuBLASLt reads W once, reuses it across all N rows via the L2 cache, and
+ *   uses tensor cores → ~2 ms for the GEMM + ~1 ms for CE per head.
+ *   The 3.3 GB logit tensor is allocated but freed immediately by CE; the
+ *   HBM cost of writing and reading it back is 3.3 GB / 3.35 TB/s ≈ 1 ms.
  *
- * Backward through:
- *     loss = mean_{n: labels[n] != ignore_index} (
- *               logsumexp(h[n] @ W^T) - (h[n] @ W^T)[labels[n]] )
- *
- *     d loss / d logits[n, v] = (softmax(logits[n])[v] - 1[v == labels[n]])
- *                                  / valid_count           for non-ignored n
- *                            = 0                            otherwise
- *
- *     d loss / d h    = (softmax - onehot) @ W
- *     d loss / d W    = (softmax - onehot).T @ h
- *
- * We recompute logits = h @ W.T via fast_linear, derive softmax,
- * subtract one_hot at the label positions (and zero out ignored rows),
- * scale by grad_loss / valid_count, then do two fast_matmul calls.
- * Costs one extra GEMM vs the unfused backward, saves the
- * [B*S, V] logits + log_softmax materialization in forward — wash on
- * compute, big win on HBM at large V.
+ * Backward: recompute logits = fast_linear(h, W), derive softmax, subtract
+ *   one_hot, scale by grad / valid_count, then two GEMMs for grad_h, grad_W.
  */
 
-#include "olmo_cpp/backend/fused_lm_head_ce.hpp"
 #include "olmo_cpp/backend/cublas_direct.hpp"
 
 #include <torch/torch.h>
@@ -42,7 +32,13 @@ struct FusedLMHeadCEFunction
                                  torch::Tensor weight,
                                  torch::Tensor labels,
                                  int64_t ignore_index) {
-    auto loss = fused_lm_head_ce(h, weight, labels, ignore_index);
+    // cuBLASLt GEMM (tensor cores) + standard CE: ~2ms per head vs ~18s
+    // for the scalar GEMV in fused_lm_head_ce (non-coalesced W reads).
+    auto logits = fast_linear(h, weight, torch::Tensor());   // [N, V]
+    namespace F = torch::nn::functional;
+    auto loss = F::cross_entropy(
+        logits, labels,
+        F::CrossEntropyFuncOptions().ignore_index(ignore_index));
     ctx->save_for_backward({h, weight, labels});
     ctx->saved_data["ignore_index"] = ignore_index;
     return loss;

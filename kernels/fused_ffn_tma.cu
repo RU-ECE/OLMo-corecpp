@@ -139,6 +139,14 @@ __global__ void fused_ffn_tma_kernel(
   }
   __syncthreads();
   mbarrier_wait(mbar, /*phase=*/0);
+  // TMA writes sh_x via the async proxy; WMMA load_matrix_sync reads via
+  // the generic proxy.  On Hopper (sm_90+) these are separate memory
+  // proxies and the mbarrier completion alone does NOT make async writes
+  // visible to generic reads.  A fence.proxy.async is required to bridge
+  // the two proxies before any subsequent shared-memory access.
+  // Without this, load_matrix_sync reads stale/uninitialised sh_x data,
+  // producing large errors (~128) in the gate_up matmul.
+  asm volatile("fence.proxy.async;" ::: "memory");
 
   // Phase 1 — WMMA matmul gate_up = sh_x @ w_gate_up.T.
   const int col_tiles_2H = (2 * H) / kWmmaN;

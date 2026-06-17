@@ -480,11 +480,24 @@ void train(
   torch::Tensor accum_loss_tensor = torch::zeros({}, torch::TensorOptions().device(device));
   auto model_params = model->parameters();
 
-  // ── CUDA Graph: capture one forward+backward step for zero-kernel-launch replay ──
-  // Eliminates per-kernel CPU dispatch overhead and enables the GPU to pipeline
-  // operations without CPU stalls. Optimizer step stays OUTSIDE the graph
-  // (LR and bias correction change per step). DDP allreduce is also outside
-  // (cross-device). Requires fixed batch/seq shapes (no curriculum).
+  // ── CUDA warmup + optional graph capture ────────────────────────────────────
+  //
+  // WARMUP (always, on CUDA):
+  //   3 full forward+backward+step passes on a non-default stream before the
+  //   timed training loop. Primes the JIT compiler (PTX→SASS per kernel),
+  //   the cuBLAS/cuDNN algorithm selectors, and the CUDA caching allocator's
+  //   block pool. Without warmup, step 0 alone takes 20-30s on H100 due to
+  //   first-time kernel compilation — masking the true steady-state speed.
+  //
+  // GRAPH CAPTURE (only when cuda_graph=1):
+  //   After warmup, capture one forward+backward as a replayable CUDA graph.
+  //   Eliminates per-kernel CPU dispatch overhead. Blocked when:
+  //     - DDP (allreduce is cross-device, cannot be captured).
+  //     - The fused_lm_head_ce backward materialises [N,V] logit tensors.
+  //       With N=32768 and V=50304, 4 LM heads (main+3 MTP) each need ~17 GB
+  //       simultaneously in the graph's private pool → OOM on 80 GB H100.
+  //       Fix: a fused CE-backward kernel that avoids logit materialisation.
+  //       Until then, leave cuda_graph=0 for configs with num_mtp_heads > 0.
   bool graph_active = false;
 #ifdef USE_CUDA
   at::cuda::CUDAGraph train_graph;
@@ -494,12 +507,14 @@ void train(
 
   bool want_graph = cfg.use_cuda_graph && device.is_cuda()
                     && (!ddp || !ddp->is_distributed());
-  if (want_graph) {
+
+  if (device.is_cuda()) {
     auto int_opts = torch::TensorOptions().dtype(torch::kLong).device(device);
     graph_input  = torch::empty({cfg.batch_size, cfg.seq_len}, int_opts);
     graph_labels = torch::empty({cfg.batch_size, cfg.seq_len}, int_opts);
 
-    if (rank == 0) std::cout << "CUDA Graph: warming up (3 steps)...\n";
+    // ---- Warmup (always) ----
+    if (rank == 0) std::cout << "CUDA warmup (3 steps)...\n";
     {
       c10::cuda::CUDAStreamGuard stream_guard(capture_stream);
       for (int w = 0; w < 3; ++w) {
@@ -524,32 +539,36 @@ void train(
         optimizer->step();
       }
     }
+    if (rank == 0) std::cout << "CUDA warmup done.\n";
 
-    if (rank == 0) {
-      std::cout << "CUDA Graph: capturing forward+backward"
-                << " (will replay " << cfg.grad_accum_steps << "x per step)...\n";
-    }
-    // Release reserved-but-unused memory from warmup so the graph's private
-    // pool can allocate cleanly without competing with the warmup pool.
-    c10::cuda::CUDACachingAllocator::emptyCache();
-
-    {
-      c10::cuda::CUDAStreamGuard stream_guard(capture_stream);
-      // Must use memset zero_grad (not set_to_none) — graph captures the
-      // gradient tensor addresses, which must remain valid across replays.
-      optimizer->zero_grad();
-      train_graph.capture_begin();
-      {
-        AutocastGuard ac(cfg.use_amp, device);
-        graph_loss = model->forward(graph_input, graph_labels, -100)
-                     / static_cast<float>(cfg.grad_accum_steps);
+    // ---- Graph capture (only when requested and OOM-safe) ----
+    if (want_graph) {
+      if (rank == 0) {
+        std::cout << "CUDA Graph: capturing forward+backward"
+                  << " (will replay " << cfg.grad_accum_steps << "x per step)...\n";
       }
-      graph_loss.backward();
-      train_graph.capture_end();
-    }
+      // Release reserved-but-unused memory from warmup so the graph's private
+      // pool can allocate cleanly without competing with the warmup pool.
+      c10::cuda::CUDACachingAllocator::emptyCache();
 
-    graph_active = true;
-    if (rank == 0) std::cout << "CUDA Graph: captured successfully\n";
+      {
+        c10::cuda::CUDAStreamGuard stream_guard(capture_stream);
+        // Must use memset zero_grad (not set_to_none) — graph captures the
+        // gradient tensor addresses, which must remain valid across replays.
+        optimizer->zero_grad();
+        train_graph.capture_begin();
+        {
+          AutocastGuard ac(cfg.use_amp, device);
+          graph_loss = model->forward(graph_input, graph_labels, -100)
+                       / static_cast<float>(cfg.grad_accum_steps);
+        }
+        graph_loss.backward();
+        train_graph.capture_end();
+      }
+
+      graph_active = true;
+      if (rank == 0) std::cout << "CUDA Graph: captured successfully\n";
+    }
   }
 #endif  // USE_CUDA
 

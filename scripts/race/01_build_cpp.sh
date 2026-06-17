@@ -78,14 +78,15 @@ fi
 # ── Configure + build ──
 # Wipe any stale CMakeCache.txt — it embeds the absolute source path and will
 # refuse to reconfigure if the repo was cloned to a different directory.
-if [[ -f build/CMakeCache.txt ]]; then
+BUILD_DIR="${BUILD_DIR:-build}"
+if [[ -f "$BUILD_DIR/CMakeCache.txt" ]]; then
   say "removing stale build cache (was built from a different path)"
-  rm -rf build/CMakeFiles build/CMakeCache.txt build/cmake_install.cmake
+  rm -rf "$BUILD_DIR/CMakeFiles" "$BUILD_DIR/CMakeCache.txt" "$BUILD_DIR/cmake_install.cmake"
 fi
-mkdir -p build scripts/race/results
+mkdir -p "$BUILD_DIR" scripts/race/results
 CFG_LOG=$(pwd)/scripts/race/results/cmake_configure.log
 BUILD_LOG=$(pwd)/scripts/race/results/build.log
-cd build
+cd "$BUILD_DIR"
 
 say "configuring (Release, sm_${ARCH}, kernels ON) → $CFG_LOG"
 set +e

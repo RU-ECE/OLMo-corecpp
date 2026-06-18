@@ -178,7 +178,7 @@ void DDPContext::register_grad_hooks(std::vector<torch::Tensor>& parameters,
     // Capture bidx + this by value; `this` is the DDPContext.
     p.register_hook([this, bidx](const at::Tensor& grad) -> at::Tensor {
       if (!this->sync_required_) return grad;
-      std::lock_guard<std::mutex> lock(this->hook_state_.mu);
+      std::lock_guard<std::mutex> lock(*this->hook_state_.mu);
       Bucket& b = this->hook_state_.buckets[bidx];
       b.grads.push_back(grad);
       b.ready_count++;
@@ -202,7 +202,7 @@ void DDPContext::allreduce_gradients(const std::vector<torch::Tensor>& parameter
   if (has_hooks()) {
     std::vector<c10::intrusive_ptr<c10d::Work>> works_to_wait;
     {
-      std::lock_guard<std::mutex> lock(hook_state_.mu);
+      std::lock_guard<std::mutex> lock(*hook_state_.mu);
       works_to_wait = std::move(hook_state_.pending_works);
       hook_state_.pending_works.clear();
       // Reset bucket fill state. The grad tensor references are owned by

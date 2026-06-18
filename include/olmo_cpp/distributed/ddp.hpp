@@ -126,7 +126,10 @@ class DDPContext {
   struct HookState {
     std::vector<Bucket> buckets;
     std::vector<c10::intrusive_ptr<c10d::Work>> pending_works;
-    std::mutex mu;
+    // Heap-held so HookState (and thus DDPContext) stays MOVABLE — a bare
+    // std::mutex member is non-movable, which broke
+    // `std::optional<DDPContext> init_from_env() { return DDPContext(...); }`.
+    std::unique_ptr<std::mutex> mu = std::make_unique<std::mutex>();
   };
   HookState hook_state_;
   bool sync_required_ = true;

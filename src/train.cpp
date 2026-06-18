@@ -441,11 +441,15 @@ void train(
   if (ddp && ddp->is_distributed()) {
     for (auto& p : model->parameters()) ddp_params.push_back(p);
     // T-1: register autograd hooks so per-bucket allreduce overlaps with
-    // backward. allreduce_gradients() at end-of-step becomes a finalize
-    // (wait + divide). For grad_accum > 1 the driver controls hook
-    // dispatch via set_sync_required() — disabled on non-final accum
-    // steps so we only collective the final summed gradient.
-    ddp->register_grad_hooks(ddp_params);
+    // backward; allreduce_gradients() at end-of-step is then a finalize.
+    // Rung 1d: NOT under CUDA graphs — autograd hooks don't re-fire on graph
+    // replay (only captured CUDA kernels do), so we'd allreduce once at capture
+    // and never again. With graphs we skip hooks and allreduce end-of-step
+    // (outside the captured fwd+bwd) via the no-hook path in allreduce_gradients.
+    const bool will_graph = cfg.use_cuda_graph && device.is_cuda();
+    if (!will_graph) {
+      ddp->register_grad_hooks(ddp_params);
+    }
   }
 
   // ---- Callback manager ----
@@ -509,8 +513,11 @@ void train(
   at::cuda::CUDAStream capture_stream =
       at::cuda::getStreamFromPool(/*isHighPriority=*/false, device.index());
 
-  bool want_graph = cfg.use_cuda_graph && device.is_cuda()
-                    && (!ddp || !ddp->is_distributed());
+  // Rung 1d: graphs ARE allowed under DDP now. We capture fwd+bwd and run the
+  // gradient allreduce OUTSIDE the captured region (end-of-step), since NCCL
+  // collectives / autograd hooks can't be naively graph-captured. Grad hooks
+  // are skipped above when graphing so allreduce_gradients() reduces end-of-step.
+  bool want_graph = cfg.use_cuda_graph && device.is_cuda();
 
   if (device.is_cuda()) {
     auto int_opts = torch::TensorOptions().dtype(torch::kLong).device(device);
@@ -934,11 +941,15 @@ void train(
   if (ddp && ddp->is_distributed()) {
     for (auto& p : model->parameters()) ddp_params.push_back(p);
     // T-1: register autograd hooks so per-bucket allreduce overlaps with
-    // backward. allreduce_gradients() at end-of-step becomes a finalize
-    // (wait + divide). For grad_accum > 1 the driver controls hook
-    // dispatch via set_sync_required() — disabled on non-final accum
-    // steps so we only collective the final summed gradient.
-    ddp->register_grad_hooks(ddp_params);
+    // backward; allreduce_gradients() at end-of-step is then a finalize.
+    // Rung 1d: NOT under CUDA graphs — autograd hooks don't re-fire on graph
+    // replay (only captured CUDA kernels do), so we'd allreduce once at capture
+    // and never again. With graphs we skip hooks and allreduce end-of-step
+    // (outside the captured fwd+bwd) via the no-hook path in allreduce_gradients.
+    const bool will_graph = cfg.use_cuda_graph && device.is_cuda();
+    if (!will_graph) {
+      ddp->register_grad_hooks(ddp_params);
+    }
   }
 
   // ---- Callback manager ----
@@ -1023,8 +1034,11 @@ void train(
   // After capture, replay happens on whatever stream is current (default is fine).
   at::cuda::CUDAStream capture_stream = at::cuda::getStreamFromPool(/*isHighPriority=*/false, device.index());
 
-  bool want_graph = cfg.use_cuda_graph && device.is_cuda()
-                    && (!ddp || !ddp->is_distributed());
+  // Rung 1d: graphs ARE allowed under DDP now. We capture fwd+bwd and run the
+  // gradient allreduce OUTSIDE the captured region (end-of-step), since NCCL
+  // collectives / autograd hooks can't be naively graph-captured. Grad hooks
+  // are skipped above when graphing so allreduce_gradients() reduces end-of-step.
+  bool want_graph = cfg.use_cuda_graph && device.is_cuda();
   if (want_graph) {
     auto int_opts = torch::TensorOptions().dtype(torch::kLong).device(device);
     graph_input  = torch::empty({cfg.batch_size, cfg.seq_len}, int_opts);

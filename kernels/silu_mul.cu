@@ -79,6 +79,7 @@
  */
 #include <torch/torch.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 
@@ -220,16 +221,17 @@ torch::Tensor silu_mul_cuda_impl(
   int threads = 256;
   int blocks  = std::min(static_cast<int64_t>((n + threads - 1) / threads),
                          static_cast<int64_t>(65535));
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   // Dispatch on dtype. Note: scalar_type() returns torch's dtype enum.
   if (gate.scalar_type() == torch::kBFloat16) {
-    silu_mul_bf16_kernel<<<blocks, threads>>>(
+    silu_mul_bf16_kernel<<<blocks, threads, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(gate_c.data_ptr<at::BFloat16>()),
         reinterpret_cast<const __nv_bfloat16*>(up_c.data_ptr<at::BFloat16>()),
         reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
         n);
   } else {
-    silu_mul_f32_kernel<<<blocks, threads>>>(
+    silu_mul_f32_kernel<<<blocks, threads, 0, stream>>>(
         gate_c.data_ptr<float>(),
         up_c.data_ptr<float>(),
         out.data_ptr<float>(),

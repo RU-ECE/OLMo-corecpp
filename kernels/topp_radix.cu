@@ -49,6 +49,7 @@
 #include <cuda_runtime.h>
 #include <torch/torch.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <math_constants.h>
 #include <algorithm>
 #include <cmath>
@@ -238,18 +239,19 @@ void topp_radix_filter_cuda(torch::Tensor probs, float top_p, float min_p) {
 
   int blocks = static_cast<int>(std::min<int64_t>((V + kThreads - 1) / kThreads, 65535));
 
-  topp_histogram_kernel<<<blocks, kThreads>>>(
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  topp_histogram_kernel<<<blocks, kThreads, 0, stream>>>(
       probs.data_ptr<float>(), V, min_p,
       count.data_ptr<int>(), mass.data_ptr<float>());
 
-  topp_find_cutoff_kernel<<<1, 32>>>(
+  topp_find_cutoff_kernel<<<1, 32, 0, stream>>>(
       mass.data_ptr<float>(), top_p, cutoff_bucket.data_ptr<int>());
 
-  topp_mask_kernel<<<blocks, kThreads>>>(
+  topp_mask_kernel<<<blocks, kThreads, 0, stream>>>(
       probs.data_ptr<float>(), V, min_p,
       cutoff_bucket.data_ptr<int>(), surviving_sum.data_ptr<float>());
 
-  topp_renorm_kernel<<<blocks, kThreads>>>(
+  topp_renorm_kernel<<<blocks, kThreads, 0, stream>>>(
       probs.data_ptr<float>(), V, surviving_sum.data_ptr<float>());
 }
 

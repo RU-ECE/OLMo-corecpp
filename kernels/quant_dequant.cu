@@ -26,6 +26,7 @@
 #include <cuda_runtime.h>
 #include <torch/torch.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
 #include <cstdint>
 
@@ -123,7 +124,8 @@ torch::Tensor dequantize_fp8_cuda(const Fp8Quantized& q) {
 
   auto out = torch::empty(packed.sizes(),
       torch::TensorOptions().dtype(torch::kFloat32).device(q.weight.device()));
-  dequant_fp8_kernel<<<grid_for(N), kThreads>>>(
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  dequant_fp8_kernel<<<grid_for(N), kThreads, 0, stream>>>(
       packed.data_ptr<uint8_t>(), scale, N, out.data_ptr<float>());
   return out;
 }
@@ -146,7 +148,8 @@ torch::Tensor dequantize_int4_awq_cuda(const Int4Quantized& q) {
 
   auto out = torch::empty({V, H},
       torch::TensorOptions().dtype(torch::kFloat32).device(q.weight.device()));
-  dequant_int4_awq_kernel<<<grid_for(total), kThreads>>>(
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  dequant_int4_awq_kernel<<<grid_for(total), kThreads, 0, stream>>>(
       packed.data_ptr<uint8_t>(),
       reinterpret_cast<const __nv_bfloat16*>(scales_bf.data_ptr<at::BFloat16>()),
       V, H, q.group_size,
@@ -278,7 +281,8 @@ torch::Tensor fp8_gemv_cuda(const Fp8Quantized& w, torch::Tensor x) {
       torch::TensorOptions().dtype(torch::kFloat32).device(W.device()));
   const float scale = w.scale.item<float>();
   const int threads = 128;
-  fp8_gemv_kernel<<<static_cast<int>(out_features), threads>>>(
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  fp8_gemv_kernel<<<static_cast<int>(out_features), threads, 0, stream>>>(
       W.data_ptr<uint8_t>(),
       xc.data_ptr<float>(),
       scale,
@@ -304,7 +308,8 @@ torch::Tensor int4_gemv_cuda(const Int4Quantized& w, torch::Tensor x) {
   auto y = torch::empty({out_features},
       torch::TensorOptions().dtype(torch::kFloat32).device(W.device()));
   const int threads = 128;
-  int4_awq_gemv_kernel<<<static_cast<int>(out_features), threads>>>(
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  int4_awq_gemv_kernel<<<static_cast<int>(out_features), threads, 0, stream>>>(
       W.data_ptr<uint8_t>(),
       xc.data_ptr<float>(),
       reinterpret_cast<const __nv_bfloat16*>(S.data_ptr<at::BFloat16>()),

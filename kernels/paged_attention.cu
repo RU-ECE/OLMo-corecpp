@@ -17,6 +17,7 @@
 #include <cuda_runtime.h>
 #include <torch/torch.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <math_constants.h>
 #include <cstdint>
 #include <cmath>
@@ -228,7 +229,8 @@ torch::Tensor paged_attention_decode_cuda(
   // Layout: q[D] + accum[D] + warp scratch[kMaxWarps].
   const size_t shmem = static_cast<size_t>(2 * head_dim + kMaxWarps) * sizeof(float);
 
-  paged_attention_decode_kernel<<<n_q_heads, kThreads, shmem>>>(
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  paged_attention_decode_kernel<<<n_q_heads, kThreads, shmem, stream>>>(
       q_c.data_ptr<float>(),
       k_c.data_ptr<float>(),
       v_c.data_ptr<float>(),
@@ -345,7 +347,8 @@ void paged_kv_write_dyn_cuda(
   dim3 grid(S, n_kv_heads);
   const int kThreads = 32;  // small per-block work; head_dim is the inner loop bound
 
-  paged_kv_write_kernel_dyn<<<grid, kThreads>>>(
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  paged_kv_write_kernel_dyn<<<grid, kThreads, 0, stream>>>(
       ks.data_ptr<float>(),
       vs.data_ptr<float>(),
       k_pool.data_ptr<float>(),
@@ -390,7 +393,8 @@ torch::Tensor paged_attention_decode_dyn_cuda(
   auto out = torch::empty({n_q_heads, head_dim}, q_c.options());
   const size_t shmem = static_cast<size_t>(2 * head_dim + kMaxWarps) * sizeof(float);
 
-  paged_attention_decode_kernel_dyn<<<n_q_heads, kThreads, shmem>>>(
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  paged_attention_decode_kernel_dyn<<<n_q_heads, kThreads, shmem, stream>>>(
       q_c.data_ptr<float>(),
       k_c.data_ptr<float>(),
       v_c.data_ptr<float>(),
@@ -518,7 +522,8 @@ torch::Tensor paged_attention_decode_int4_cuda(
   auto out = torch::empty({n_q_heads, head_dim}, q_c.options());
   const size_t shmem = (2 * head_dim + kMaxWarps) * sizeof(float);
 
-  paged_attention_decode_int4_kernel<<<n_q_heads, kThreads, shmem>>>(
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  paged_attention_decode_int4_kernel<<<n_q_heads, kThreads, shmem, stream>>>(
       q_c.data_ptr<float>(),
       kp.data_ptr<uint8_t>(),
       reinterpret_cast<const __nv_bfloat16*>(ks.data_ptr<at::BFloat16>()),

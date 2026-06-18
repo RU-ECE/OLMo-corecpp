@@ -39,8 +39,15 @@ namespace olmo_cpp {
 /// normalizes by sqrt(mean(x^2) + eps) — there is no mean subtraction
 /// (unlike LayerNorm). The optional weight is per-channel affine scale.
 torch::Tensor IBackend::rms_norm(torch::Tensor x, torch::Tensor weight, double eps) {
-  auto variance = x.pow(2).mean(-1, true).add(eps);
-  auto x_norm = x * torch::rsqrt(variance);
+  // Compute the variance/normalization in fp32. In bf16 the sum-of-squares
+  // mean has ~8-bit mantissa, and the eps floor (1e-6) is swallowed whenever
+  // variance >~ 4e-4 (bf16 ULP > eps), removing the divide-by-zero guard and
+  // making the norm unstable. The custom CUDA kernel already accumulates in
+  // fp32; this reference fallback (CPU, and Blackwell sm_120 where the fp32
+  // kernel is gated off) must match.
+  auto xf = x.to(torch::kFloat32);
+  auto variance = xf.pow(2).mean(-1, true).add(eps);
+  auto x_norm = (xf * torch::rsqrt(variance)).to(x.dtype());
   if (weight.defined()) {
     x_norm = x_norm * weight.to(x.dtype());
   }

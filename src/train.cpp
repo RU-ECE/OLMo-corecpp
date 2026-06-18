@@ -386,7 +386,8 @@ void train(
     optim_display = "EightBitAdamW (block-quantized)";
   } else if (cfg.use_foreach_optimizer) {
     optimizer = std::make_unique<ForeachAdamW>(
-        opt_params, ForeachAdamWOptions(cfg.lr).weight_decay(cfg.weight_decay));
+        opt_params, ForeachAdamWOptions(cfg.lr).weight_decay(cfg.weight_decay)
+                        .master_weights(cfg.use_bf16));
     optim_display = "ForeachAdamW";
   } else {
     optimizer = std::make_unique<torch::optim::AdamW>(
@@ -717,9 +718,13 @@ void train(
     // stream-drain sync.
     static thread_local AsyncLossReader _loss_reader_b;
     _loss_reader_b.queue(accum_loss_tensor);
-    float accum_loss = 0.0f;
+    // Poll EVERY step: queue() runs every step, so the read head must advance
+    // every step too. Polling only on log steps (with a depth-4 ring) let the
+    // writer lap the buffer and the read head stall on cudaErrorNotReady, so
+    // the logged value desynced from the actual step. Draining each step keeps
+    // read_head in lock-step with write_head; the value is still non-blocking.
+    float accum_loss = _loss_reader_b.poll();
     if (need_loss_sync) {
-      accum_loss = _loss_reader_b.poll();
       epoch_loss_sum += accum_loss;
       epoch_loss_count++;
     }
@@ -877,7 +882,8 @@ void train(
         EightBitAdamWOptions().lr(cfg.lr).weight_decay(cfg.weight_decay));
   } else if (cfg.use_foreach_optimizer) {
     optimizer = std::make_unique<ForeachAdamW>(
-        opt_params, ForeachAdamWOptions(cfg.lr).weight_decay(cfg.weight_decay));
+        opt_params, ForeachAdamWOptions(cfg.lr).weight_decay(cfg.weight_decay)
+                        .master_weights(cfg.use_bf16));
   } else {
     optimizer = std::make_unique<torch::optim::AdamW>(
         opt_params,
@@ -1205,8 +1211,12 @@ void train(
     // AA: queue + poll (non-blocking) instead of synchronous .item().
     static thread_local AsyncLossReader _loss_reader_c;
     _loss_reader_c.queue(accum_loss_tensor);
+    // Poll every step so the ring's read head keeps pace with the per-step
+    // queue() (otherwise the writer laps the buffer and the logged loss
+    // desyncs from the step number). Non-blocking.
+    float _polled_loss = _loss_reader_c.poll();
     if (step % cfg.log_interval == 0 && rank == 0) {
-      float accum_loss = _loss_reader_c.poll();
+      float accum_loss = _polled_loss;
       state.loss = accum_loss;
       epoch_loss_sum += accum_loss;
       epoch_loss_count++;

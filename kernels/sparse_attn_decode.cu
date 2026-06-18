@@ -38,6 +38,7 @@
 #include <cuda_runtime.h>
 #include <torch/torch.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <math_constants.h>
 #include <cstdint>
 #include <algorithm>
@@ -236,7 +237,8 @@ torch::Tensor sparse_attn_decode_cuda(const torch::Tensor& q,
 
   const dim3 grid(static_cast<unsigned>(B * H));
   const dim3 block(kThreads);
-  sparse_attn_decode_kernel<<<grid, block, shmem_bytes>>>(
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  sparse_attn_decode_kernel<<<grid, block, shmem_bytes, stream>>>(
       q_c.data_ptr<float>(),
       k_c.data_ptr<float>(),
       v_c.data_ptr<float>(),

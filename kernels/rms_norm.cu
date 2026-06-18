@@ -78,6 +78,7 @@
  */
 #include <torch/torch.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 
@@ -497,15 +498,16 @@ torch::Tensor rms_norm_cuda_impl(
   // Heuristic: short rows don't benefit from a 256-thread block.
   // 128 threads keeps occupancy reasonable while reducing wasted lanes.
   int threads = (dim <= 256) ? 128 : 256;
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   if (x.scalar_type() == torch::kBFloat16) {
-    rms_norm_bf16_kernel<<<rows, threads>>>(
+    rms_norm_bf16_kernel<<<rows, threads, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x_contig.data_ptr<at::BFloat16>()),
         weight.has_value() ? reinterpret_cast<const __nv_bfloat16*>(weight->data_ptr<at::BFloat16>()) : nullptr,
         reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
         dim, static_cast<float>(eps));
   } else {
-    rms_norm_f32_kernel<<<rows, threads>>>(
+    rms_norm_f32_kernel<<<rows, threads, 0, stream>>>(
         x_contig.data_ptr<float>(),
         weight.has_value() ? weight->data_ptr<float>() : nullptr,
         out.data_ptr<float>(),
@@ -529,9 +531,10 @@ std::vector<torch::Tensor> residual_rms_norm_cuda_impl(
   c10::cuda::CUDAGuard device_guard(x.device());
 
   int threads = (dim <= 256) ? 128 : 256;
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   if (x.scalar_type() == torch::kBFloat16) {
-    residual_rms_norm_bf16_kernel<<<rows, threads>>>(
+    residual_rms_norm_bf16_kernel<<<rows, threads, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x_contig.data_ptr<at::BFloat16>()),
         reinterpret_cast<const __nv_bfloat16*>(res_contig.data_ptr<at::BFloat16>()),
         weight.has_value() ? reinterpret_cast<const __nv_bfloat16*>(weight->data_ptr<at::BFloat16>()) : nullptr,
@@ -539,7 +542,7 @@ std::vector<torch::Tensor> residual_rms_norm_cuda_impl(
         reinterpret_cast<__nv_bfloat16*>(residual_out.data_ptr<at::BFloat16>()),
         dim, static_cast<float>(eps));
   } else {
-    residual_rms_norm_f32_kernel<<<rows, threads>>>(
+    residual_rms_norm_f32_kernel<<<rows, threads, 0, stream>>>(
         x_contig.data_ptr<float>(),
         res_contig.data_ptr<float>(),
         weight.has_value() ? weight->data_ptr<float>() : nullptr,
@@ -567,18 +570,19 @@ torch::Tensor rms_norm_add_cuda_impl(
   auto out = torch::empty_like(x_contig);
   c10::cuda::CUDAGuard guard(x.device());
   int threads = (dim <= 256) ? 128 : 256;
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   if (x.scalar_type() == torch::kBFloat16) {
     TORCH_CHECK(residual.scalar_type() == torch::kBFloat16,
                 "rms_norm_add_cuda_impl: x is bf16 but residual is not");
-    rms_norm_add_bf16_kernel<<<rows, threads>>>(
+    rms_norm_add_bf16_kernel<<<rows, threads, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x_contig.data_ptr<at::BFloat16>()),
         reinterpret_cast<const __nv_bfloat16*>(res_contig.data_ptr<at::BFloat16>()),
         weight.has_value() ? reinterpret_cast<const __nv_bfloat16*>(weight->data_ptr<at::BFloat16>()) : nullptr,
         reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
         dim, static_cast<float>(eps));
   } else {
-    rms_norm_add_f32_kernel<<<rows, threads>>>(
+    rms_norm_add_f32_kernel<<<rows, threads, 0, stream>>>(
         x_contig.data_ptr<float>(),
         res_contig.data_ptr<float>(),
         weight.has_value() ? weight->data_ptr<float>() : nullptr,

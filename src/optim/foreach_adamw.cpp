@@ -38,7 +38,9 @@
 #include <ATen/ops/_foreach_addcmul.h>
 #include <ATen/ops/_foreach_addcdiv.h>
 #include <ATen/ops/_foreach_sqrt.h>
+#include <ATen/ops/_foreach_copy.h>
 #include <ATen/ops/_fused_adamw.h>
+#include <ATen/ops/_amp_foreach_non_finite_check_and_unscale.h>
 #include <ATen/Functions.h>
 #include <cmath>
 
@@ -53,11 +55,13 @@ struct ForeachAdamWParamState
     : public torch::optim::OptimizerCloneableParamState<ForeachAdamWParamState> {
   TORCH_ARG(torch::Tensor, exp_avg);     ///< First moment m, same shape as param.
   TORCH_ARG(torch::Tensor, exp_avg_sq);  ///< Second moment v, same shape as param.
+  TORCH_ARG(torch::Tensor, master);      ///< fp32 master copy (master-weights mode only).
 
   /// Save state to a checkpoint archive.
   void serialize(torch::serialize::OutputArchive& archive) const override {
     if (exp_avg().defined()) archive.write("exp_avg", exp_avg());
     if (exp_avg_sq().defined()) archive.write("exp_avg_sq", exp_avg_sq());
+    if (master().defined()) archive.write("master", master());
   }
 
   /// Load state from a checkpoint archive (tolerant of missing keys).
@@ -65,6 +69,7 @@ struct ForeachAdamWParamState
     torch::Tensor t;
     if (archive.try_read("exp_avg", t)) exp_avg(t);
     if (archive.try_read("exp_avg_sq", t)) exp_avg_sq(t);
+    if (archive.try_read("master", t)) master(t);
   }
 };
 
@@ -105,23 +110,29 @@ torch::Tensor ForeachAdamW::step(LossClosure closure) {
     const double beta2 = options.beta2();
     const double eps = options.eps();
     const double weight_decay = options.weight_decay();
+    // Master-weights mode: run the update in fp32 on a master copy, then write
+    // the result back into the (bf16) model param. Removes bf16 update-rounding.
+    const bool master = options.master_weights();
 
     // Reuse the scratch vectors across steps — clear() retains capacity so
     // we pay for one allocation per vector on the first step, zero on every
     // step thereafter.
-    auto& params_vec = params_scratch_;
-    auto& grads_vec = grads_scratch_;
+    auto& params_vec = params_scratch_;       // fp32 master (master mode) or bf16 param
+    auto& grads_vec = grads_scratch_;          // fp32 upcast grad (master mode) or raw grad
     auto& exp_avg_vec = exp_avg_scratch_;
     auto& exp_avg_sq_vec = exp_avg_sq_scratch_;
+    auto& bf16_param_vec = bf16_param_scratch_;  // write-back targets (master mode only)
     params_vec.clear();
     grads_vec.clear();
     exp_avg_vec.clear();
     exp_avg_sq_vec.clear();
+    bf16_param_vec.clear();
     const size_t n_params = group.params().size();
     params_vec.reserve(n_params);
     grads_vec.reserve(n_params);
     exp_avg_vec.reserve(n_params);
     exp_avg_sq_vec.reserve(n_params);
+    bf16_param_vec.reserve(n_params);
 
     for (auto& p : group.params()) {
       if (!p.grad().defined()) continue;
@@ -134,14 +145,28 @@ torch::Tensor ForeachAdamW::step(LossClosure closure) {
       auto it = state_.find(key);
       if (it == state_.end()) {
         auto s = std::make_unique<ForeachAdamWParamState>();
-        s->exp_avg(torch::zeros_like(p.data()));
-        s->exp_avg_sq(torch::zeros_like(p.data()));
+        if (master) {
+          // fp32 moments + fp32 master seeded from the current (bf16) param.
+          auto fp32_opts = p.data().options().dtype(torch::kFloat32);
+          s->exp_avg(torch::zeros(p.data().sizes(), fp32_opts));
+          s->exp_avg_sq(torch::zeros(p.data().sizes(), fp32_opts));
+          s->master(p.data().to(torch::kFloat32));
+        } else {
+          s->exp_avg(torch::zeros_like(p.data()));
+          s->exp_avg_sq(torch::zeros_like(p.data()));
+        }
         it = state_.emplace(key, std::move(s)).first;
       }
 
       auto& state = static_cast<ForeachAdamWParamState&>(*it->second);
-      params_vec.push_back(p.data());
-      grads_vec.push_back(p.grad());
+      if (master) {
+        params_vec.push_back(state.master());                  // fp32 master = optimizer's param
+        grads_vec.push_back(p.grad().to(torch::kFloat32));     // upcast grad to fp32
+        bf16_param_vec.push_back(p.data());                    // write-back target
+      } else {
+        params_vec.push_back(p.data());
+        grads_vec.push_back(p.grad());
+      }
       exp_avg_vec.push_back(state.exp_avg());
       exp_avg_sq_vec.push_back(state.exp_avg_sq());
     }
@@ -161,11 +186,21 @@ torch::Tensor ForeachAdamW::step(LossClosure closure) {
       // torch::full constructs the 0-D step scalar directly on the device
       // (fill kernel) — avoids the per-step 4-byte H->D that torch::tensor(x)
       // followed by .to(device) would incur.
-      auto step_t = torch::full({}, static_cast<double>(step_count_),
-                                 torch::TensorOptions().dtype(torch::kFloat32)
-                                     .device(params_vec.front().device()));
+      auto dev_opts = torch::TensorOptions().dtype(torch::kFloat32)
+                          .device(params_vec.front().device());
+      auto step_t = torch::full({}, static_cast<double>(step_count_), dev_opts);
       std::vector<at::Tensor> step_list(params_vec.size(), step_t);
       std::vector<at::Tensor> max_exp_avg_sq_empty;  // amsgrad=false; unused
+
+      // Non-finite guard (on-device, no host sync): found_inf=1 if ANY grad
+      // contains inf/nan. _fused_adamw_ then SKIPS the param + moment update,
+      // so a transient bad gradient becomes a skipped step instead of
+      // permanently latching NaN into the weights and Adam state. inv_scale=1
+      // makes the unscale a no-op on values; we only want the check side effect.
+      auto found_inf = torch::zeros({}, dev_opts);
+      auto inv_scale = torch::ones({}, dev_opts);
+      at::_amp_foreach_non_finite_check_and_unscale_(grads_vec, found_inf, inv_scale);
+
       at::_fused_adamw_(
           params_vec, grads_vec, exp_avg_vec, exp_avg_sq_vec,
           max_exp_avg_sq_empty,
@@ -178,7 +213,11 @@ torch::Tensor ForeachAdamW::step(LossClosure closure) {
           /*amsgrad=*/false,
           /*maximize=*/false,
           /*grad_scale=*/c10::nullopt,
-          /*found_inf=*/c10::nullopt);
+          /*found_inf=*/found_inf);
+
+      // Master-weights mode: cast the updated fp32 master back into the bf16
+      // model param (one fused launch). _foreach_copy_ casts on copy.
+      if (master) at::_foreach_copy_(bf16_param_vec, params_vec, /*non_blocking=*/false);
       continue;
     }
 #endif
@@ -229,6 +268,11 @@ torch::Tensor ForeachAdamW::step(LossClosure closure) {
 
     // 7. Apply update: p += step_size * m / denom
     at::_foreach_addcdiv_(params_vec, exp_avg_vec, denom, step_size);
+
+    // Master-weights mode: write the updated fp32 master back into the bf16
+    // model params. (CPU fallback path has no _amp non-finite primitive; the
+    // fused CUDA path above carries the found_inf skip.)
+    if (master) at::_foreach_copy_(bf16_param_vec, params_vec, /*non_blocking=*/false);
   }
 
   return loss;

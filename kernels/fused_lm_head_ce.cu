@@ -27,6 +27,7 @@
 #include <cuda_runtime.h>
 #include <torch/torch.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
 #include <math_constants.h>   // CUDART_INF_F
 #include <cmath>
@@ -210,8 +211,10 @@ torch::Tensor fused_lm_head_ce_cuda(torch::Tensor h,
         (size_t)kMaxD * sizeof(float)       // h_row (capacity)
       + (size_t)warps_per_block * sizeof(float) * 2;  // warp_maxes + warp_sums
 
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
   if (h.scalar_type() == torch::kBFloat16) {
-    fused_lm_head_ce_kernel<__nv_bfloat16><<<N, kThreadsPerBlock, shmem_bytes>>>(
+    fused_lm_head_ce_kernel<__nv_bfloat16><<<N, kThreadsPerBlock, shmem_bytes, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(h_c.data_ptr<at::BFloat16>()),
         reinterpret_cast<const __nv_bfloat16*>(w_c.data_ptr<at::BFloat16>()),
         l_c.data_ptr<int64_t>(),
@@ -220,7 +223,7 @@ torch::Tensor fused_lm_head_ce_cuda(torch::Tensor h,
         count.data_ptr<int>(),
         N, V, d);
   } else if (h.scalar_type() == torch::kFloat32) {
-    fused_lm_head_ce_kernel<float><<<N, kThreadsPerBlock, shmem_bytes>>>(
+    fused_lm_head_ce_kernel<float><<<N, kThreadsPerBlock, shmem_bytes, stream>>>(
         h_c.data_ptr<float>(),
         w_c.data_ptr<float>(),
         l_c.data_ptr<int64_t>(),

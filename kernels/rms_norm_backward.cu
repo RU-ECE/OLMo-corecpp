@@ -33,6 +33,7 @@
 #include <cuda_runtime.h>
 #include <torch/torch.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
 #include <cstdint>
 
@@ -189,9 +190,11 @@ rms_norm_backward_cuda(torch::Tensor grad_y,
         (size_t)(2 * D) * sizeof(float)             // sh_x + sh_gy
       + (size_t)warps_per_block * sizeof(float);    // block-reduce scratch
 
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
   if (x.scalar_type() == torch::kBFloat16) {
     rms_norm_backward_kernel<__nv_bfloat16>
-        <<<N, kThreadsPerBlock, shmem_bytes>>>(
+        <<<N, kThreadsPerBlock, shmem_bytes, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(gy_c.data_ptr<at::BFloat16>()),
         reinterpret_cast<const __nv_bfloat16*>(x_c.data_ptr<at::BFloat16>()),
         has_weight ? reinterpret_cast<const __nv_bfloat16*>(
@@ -202,7 +205,7 @@ rms_norm_backward_cuda(torch::Tensor grad_y,
         N, D, static_cast<float>(eps));
   } else if (x.scalar_type() == torch::kFloat32) {
     rms_norm_backward_kernel<float>
-        <<<N, kThreadsPerBlock, shmem_bytes>>>(
+        <<<N, kThreadsPerBlock, shmem_bytes, stream>>>(
         gy_c.data_ptr<float>(),
         x_c.data_ptr<float>(),
         has_weight ? weight_c.data_ptr<float>() : nullptr,

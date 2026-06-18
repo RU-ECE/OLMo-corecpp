@@ -52,6 +52,7 @@
 #include <cuda_runtime.h>
 #include <torch/torch.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
 #include <math_constants.h>   // CUDART_INF_F
 #include <cstdint>
@@ -297,8 +298,10 @@ int64_t fused_lm_head_sample_cuda(
   auto best     = torch::empty({1}, opts_u64);
   auto out_tok  = torch::empty({1}, opts_i64);
 
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
   // Initialize best to -inf.
-  init_best_kernel<<<1, 1>>>(reinterpret_cast<unsigned long long*>(best.data_ptr<int64_t>()));
+  init_best_kernel<<<1, 1, 0, stream>>>(reinterpret_cast<unsigned long long*>(best.data_ptr<int64_t>()));
 
   const int threads = 256;
   // Heuristic grid: aim for ~8x oversubscription on H100 (132 SMs * 8 = 1056).
@@ -309,13 +312,13 @@ int64_t fused_lm_head_sample_cuda(
   size_t shmem_bytes = static_cast<size_t>(H) * sizeof(float);
 
   if (W_U_c.scalar_type() == torch::kFloat32) {
-    fused_lm_head_sample_kernel<float><<<blocks, threads, shmem_bytes>>>(
+    fused_lm_head_sample_kernel<float><<<blocks, threads, shmem_bytes, stream>>>(
         hidden_c.data_ptr<float>(),
         W_U_c.data_ptr<float>(),
         V, H, inv_T, seed, position, rep_pen_ptr,
         reinterpret_cast<unsigned long long*>(best.data_ptr<int64_t>()));
   } else if (W_U_c.scalar_type() == torch::kBFloat16) {
-    fused_lm_head_sample_kernel<__nv_bfloat16><<<blocks, threads, shmem_bytes>>>(
+    fused_lm_head_sample_kernel<__nv_bfloat16><<<blocks, threads, shmem_bytes, stream>>>(
         hidden_c.data_ptr<float>(),
         reinterpret_cast<const __nv_bfloat16*>(W_U_c.data_ptr<at::BFloat16>()),
         V, H, inv_T, seed, position, rep_pen_ptr,
@@ -324,7 +327,7 @@ int64_t fused_lm_head_sample_cuda(
     TORCH_CHECK(false, "fused_lm_head_sample_cuda: W_U dtype must be FP32 or BF16");
   }
 
-  extract_token_kernel<<<1, 1>>>(
+  extract_token_kernel<<<1, 1, 0, stream>>>(
       reinterpret_cast<const unsigned long long*>(best.data_ptr<int64_t>()),
       out_tok.data_ptr<int64_t>());
 

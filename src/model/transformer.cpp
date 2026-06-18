@@ -142,7 +142,13 @@ void TransformerImpl::init_weights(torch::optional<torch::Generator> gen) {
   for (int64_t i = 0; i < config_.n_layers; ++i) {
     auto block = blocks_->ptr<ReorderedNormTransformerBlockImpl>(i);
     for (auto& p : block->parameters()) {
-      if (p.defined() && p.numel() > 0) {
+      // ONLY initialize 2-D weight matrices (Linear weights). 1-D params are
+      // RMSNorm/QK-norm gains (must stay 1.0) and biases (must stay 0.0);
+      // overwriting a norm gain with N(0, init_std) noise collapses that
+      // sublayer's residual contribution and destroys the tuned init. This
+      // loop previously trunc_normal_'d *every* param, zeroing all 24 block
+      // norm gains — the root of the garbage/NaN training.
+      if (p.defined() && p.dim() >= 2) {
         trunc_normal_(p, 0.0, config_.init_std, -3 * config_.init_std, 3 * config_.init_std, g);
       }
     }
@@ -155,7 +161,8 @@ void TransformerImpl::init_weights(torch::optional<torch::Generator> gen) {
   for (int64_t k = 0; k < config_.num_mtp_heads; ++k) {
     auto head = mtp_heads_->ptr<MTPHeadImpl>(k);
     for (auto& p : head->parameters()) {
-      if (p.defined() && p.numel() > 0) {
+      // Only 2-D weight matrices; keep norm gains at 1.0 and biases at 0.0.
+      if (p.defined() && p.dim() >= 2) {
         trunc_normal_(p, 0.0, config_.init_std, -3 * config_.init_std, 3 * config_.init_std, g);
       }
     }

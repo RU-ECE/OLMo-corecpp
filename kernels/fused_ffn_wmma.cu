@@ -23,6 +23,7 @@
 #include <cuda_bf16.h>
 #include <mma.h>
 #include <cstdint>
+#include <ATen/cuda/CUDAContext.h>
 
 #include "olmo_cpp/backend/fused_ffn.hpp"
 
@@ -226,7 +227,8 @@ torch::Tensor fused_ffn_wmma_cuda(torch::Tensor x,
                          static_cast<int>(shmem));
   }
   const int grid = (N + 16 - 1) / 16;
-  fused_ffn_wmma_kernel<<<grid, kThreadsPerBlock, shmem>>>(
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  fused_ffn_wmma_kernel<<<grid, kThreadsPerBlock, shmem, stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(x_c.data_ptr<at::BFloat16>()),
       reinterpret_cast<const __nv_bfloat16*>(wg.data_ptr<at::BFloat16>()),
       reinterpret_cast<const __nv_bfloat16*>(wd.data_ptr<at::BFloat16>()),
@@ -269,7 +271,8 @@ fused_ffn_wmma_train_cuda(torch::Tensor x,
                          static_cast<int>(shmem));
   }
   const int grid = (N + 16 - 1) / 16;
-  fused_ffn_wmma_kernel<<<grid, kThreadsPerBlock, shmem>>>(
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  fused_ffn_wmma_kernel<<<grid, kThreadsPerBlock, shmem, stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(x_c.data_ptr<at::BFloat16>()),
       reinterpret_cast<const __nv_bfloat16*>(wg.data_ptr<at::BFloat16>()),
       reinterpret_cast<const __nv_bfloat16*>(wd.data_ptr<at::BFloat16>()),

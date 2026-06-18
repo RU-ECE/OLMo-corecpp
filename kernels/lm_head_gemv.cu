@@ -17,6 +17,7 @@
 #include <cuda_runtime.h>
 #include <torch/torch.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
 #include <cstdint>
 #include <type_traits>
@@ -91,12 +92,14 @@ torch::Tensor lm_head_gemv_cuda(torch::Tensor hidden, torch::Tensor W_U) {
   int blocks = static_cast<int>(std::min<int64_t>((V + kThreads - 1) / kThreads, 1024));
   size_t shmem = static_cast<size_t>(H) * sizeof(float);
 
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
   if (W_c.scalar_type() == torch::kFloat32) {
-    lm_head_gemv_kernel<float><<<blocks, kThreads, shmem>>>(
+    lm_head_gemv_kernel<float><<<blocks, kThreads, shmem, stream>>>(
         h_c.data_ptr<float>(), W_c.data_ptr<float>(),
         V, H, out.data_ptr<float>());
   } else if (W_c.scalar_type() == torch::kBFloat16) {
-    lm_head_gemv_kernel<__nv_bfloat16><<<blocks, kThreads, shmem>>>(
+    lm_head_gemv_kernel<__nv_bfloat16><<<blocks, kThreads, shmem, stream>>>(
         h_c.data_ptr<float>(),
         reinterpret_cast<const __nv_bfloat16*>(W_c.data_ptr<at::BFloat16>()),
         V, H, out.data_ptr<float>());

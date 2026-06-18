@@ -29,6 +29,7 @@
 #include <cuda_bf16.h>
 #include <mma.h>
 #include <cstdint>
+#include <ATen/cuda/CUDAContext.h>
 
 #include "olmo_cpp/backend/fused_qkv_rope.hpp"
 
@@ -230,7 +231,8 @@ fused_qkv_rope_wmma_cuda(torch::Tensor x,
                          static_cast<int>(shmem));
   }
 
-  fused_qkv_rope_wmma_kernel<<<grid, kThreadsPerBlock, shmem>>>(
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  fused_qkv_rope_wmma_kernel<<<grid, kThreadsPerBlock, shmem, stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(x_c.data_ptr<at::BFloat16>()),
       reinterpret_cast<const __nv_bfloat16*>(w_c.data_ptr<at::BFloat16>()),
       reinterpret_cast<const __nv_bfloat16*>(cos_c.data_ptr<at::BFloat16>()),

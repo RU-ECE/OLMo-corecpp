@@ -17,6 +17,7 @@
 #include <cuda_runtime.h>
 #include <torch/torch.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
 #include <cfloat>
 
@@ -108,8 +109,10 @@ torch::Tensor lmhead_argmax_cuda(torch::Tensor hidden, torch::Tensor weight) {
   auto out = torch::empty({B, S},
       torch::TensorOptions().dtype(torch::kInt64).device(h.device()));
 
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
   if (h.scalar_type() == torch::kBFloat16 && w.scalar_type() == torch::kBFloat16) {
-    lmhead_argmax_kernel<__nv_bfloat16><<<static_cast<int>(N), kThreads>>>(
+    lmhead_argmax_kernel<__nv_bfloat16><<<static_cast<int>(N), kThreads, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(h.data_ptr<at::BFloat16>()),
         reinterpret_cast<const __nv_bfloat16*>(w.data_ptr<at::BFloat16>()),
         out.data_ptr<int64_t>(),
@@ -117,7 +120,7 @@ torch::Tensor lmhead_argmax_cuda(torch::Tensor hidden, torch::Tensor weight) {
   } else {
     auto hf = h.to(torch::kFloat32).contiguous();
     auto wf = w.to(torch::kFloat32).contiguous();
-    lmhead_argmax_kernel<float><<<static_cast<int>(N), kThreads>>>(
+    lmhead_argmax_kernel<float><<<static_cast<int>(N), kThreads, 0, stream>>>(
         hf.data_ptr<float>(), wf.data_ptr<float>(),
         out.data_ptr<int64_t>(),
         static_cast<int>(N), static_cast<int>(V), static_cast<int>(d));

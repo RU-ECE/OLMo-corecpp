@@ -20,6 +20,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
 #include <cstdint>
+#include <ATen/cuda/CUDAContext.h>
 
 #include "olmo_cpp/backend/fused_qkv_rope.hpp"
 #include "mma_sync.cuh"  // item 2: tensor-core building blocks for the QKV matmul
@@ -164,10 +165,11 @@ fused_qkv_rope_cuda(torch::Tensor x,
   const int threads = hd;
   const size_t shmem = hd * sizeof(float);
 
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   if (x_c.scalar_type() == torch::kBFloat16) {
     TORCH_CHECK(cos_c.scalar_type() == torch::kBFloat16,
                 "fused_qkv_rope_cuda: cos/sin must be bf16 when x is bf16");
-    fused_qkv_rope_kernel<__nv_bfloat16, __nv_bfloat16><<<grid, threads, shmem>>>(
+    fused_qkv_rope_kernel<__nv_bfloat16, __nv_bfloat16><<<grid, threads, shmem, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x_c.data_ptr<at::BFloat16>()),
         reinterpret_cast<const __nv_bfloat16*>(w_c.data_ptr<at::BFloat16>()),
         reinterpret_cast<const __nv_bfloat16*>(cos_c.data_ptr<at::BFloat16>()),
@@ -177,7 +179,7 @@ fused_qkv_rope_cuda(torch::Tensor x,
         reinterpret_cast<__nv_bfloat16*>(v.data_ptr<at::BFloat16>()),
         B, S, d, n_q, n_kv, hd);
   } else {
-    fused_qkv_rope_kernel<float, float><<<grid, threads, shmem>>>(
+    fused_qkv_rope_kernel<float, float><<<grid, threads, shmem, stream>>>(
         x_c.data_ptr<float>(),
         w_c.data_ptr<float>(),
         cos_c.to(torch::kFloat32).contiguous().data_ptr<float>(),

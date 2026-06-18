@@ -85,6 +85,7 @@
  */
 #include <torch/torch.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 
@@ -272,16 +273,17 @@ torch::Tensor apply_rope_cuda(
   int threads = 256;
   int blocks = std::min(static_cast<int64_t>((numel + threads - 1) / threads),
                         static_cast<int64_t>(65535));
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   if (x.scalar_type() == torch::kBFloat16) {
-    apply_rope_bf16_kernel<<<blocks, threads>>>(
+    apply_rope_bf16_kernel<<<blocks, threads, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x_c.data_ptr<at::BFloat16>()),
         reinterpret_cast<const __nv_bfloat16*>(cos_c.data_ptr<at::BFloat16>()),
         reinterpret_cast<const __nv_bfloat16*>(sin_c.data_ptr<at::BFloat16>()),
         reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
         numel, dim);
   } else {
-    apply_rope_f32_kernel<<<blocks, threads>>>(
+    apply_rope_f32_kernel<<<blocks, threads, 0, stream>>>(
         x_c.data_ptr<float>(),
         cos_c.data_ptr<float>(),
         sin_c.data_ptr<float>(),
@@ -317,9 +319,10 @@ std::vector<torch::Tensor> apply_rope_qk_cuda(
   int64_t combined = q_total + k_total;
   int blocks = std::min((combined + threads - 1) / threads,
                         static_cast<int64_t>(65535));
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   if (q.scalar_type() == torch::kBFloat16) {
-    apply_rope_qk_bf16_kernel<<<blocks, threads>>>(
+    apply_rope_qk_bf16_kernel<<<blocks, threads, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(q_c.data_ptr<at::BFloat16>()),
         reinterpret_cast<const __nv_bfloat16*>(k_c.data_ptr<at::BFloat16>()),
         reinterpret_cast<const __nv_bfloat16*>(cos_q_c.data_ptr<at::BFloat16>()),
@@ -330,7 +333,7 @@ std::vector<torch::Tensor> apply_rope_qk_cuda(
         reinterpret_cast<__nv_bfloat16*>(k_out.data_ptr<at::BFloat16>()),
         q_total, k_total, dim);
   } else {
-    apply_rope_qk_f32_kernel<<<blocks, threads>>>(
+    apply_rope_qk_f32_kernel<<<blocks, threads, 0, stream>>>(
         q_c.data_ptr<float>(),
         k_c.data_ptr<float>(),
         cos_q_c.data_ptr<float>(),

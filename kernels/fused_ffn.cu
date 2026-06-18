@@ -20,6 +20,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
 #include <cstdint>
+#include <ATen/cuda/CUDAContext.h>
 
 #include "olmo_cpp/backend/fused_ffn.hpp"
 #include "mma_sync.cuh"  // item 2: tensor-core mma helpers for gate_up + down matmuls
@@ -115,8 +116,9 @@ torch::Tensor fused_ffn_cuda(torch::Tensor x,
   const int threads = 128;
   const size_t shmem = (2 * H + H) * sizeof(float);
 
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   if (x_c.scalar_type() == torch::kBFloat16) {
-    fused_ffn_kernel<__nv_bfloat16><<<N, threads, shmem>>>(
+    fused_ffn_kernel<__nv_bfloat16><<<N, threads, shmem, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x_c.data_ptr<at::BFloat16>()),
         reinterpret_cast<const __nv_bfloat16*>(wg.data_ptr<at::BFloat16>()),
         reinterpret_cast<const __nv_bfloat16*>(wd.data_ptr<at::BFloat16>()),
@@ -126,7 +128,7 @@ torch::Tensor fused_ffn_cuda(torch::Tensor x,
     auto xf = x_c.to(torch::kFloat32).contiguous();
     auto wgf = wg.to(torch::kFloat32).contiguous();
     auto wdf = wd.to(torch::kFloat32).contiguous();
-    fused_ffn_kernel<float><<<N, threads, shmem>>>(
+    fused_ffn_kernel<float><<<N, threads, shmem, stream>>>(
         xf.data_ptr<float>(),
         wgf.data_ptr<float>(),
         wdf.data_ptr<float>(),

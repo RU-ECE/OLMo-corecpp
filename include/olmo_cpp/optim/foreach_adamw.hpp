@@ -40,6 +40,13 @@ struct ForeachAdamWOptions : public torch::optim::OptimizerCloneableOptions<Fore
   TORCH_ARG(double, beta2) = 0.999;         ///< Second-moment EMA decay.
   TORCH_ARG(double, eps) = 1e-8;            ///< Numerical floor in the denominator.
   TORCH_ARG(double, weight_decay) = 0.01;   ///< Decoupled weight decay (AdamW default 0.01).
+  /// When true, the optimizer keeps an fp32 master copy of each (bf16) param,
+  /// runs the whole Adam update in fp32 (master + fp32 moments + upcast grad),
+  /// then writes the result back down into the bf16 param. This is the standard
+  /// mixed-precision master-weights pattern: it removes the bf16 update-rounding
+  /// (lr*grad ~ 1e-7 vanishing against a bf16 weight ULP ~ 1e-4) that makes pure
+  /// bf16 training stall/diverge. Enable for bf16 runs; harmless (no-op) on fp32.
+  TORCH_ARG(bool, master_weights) = false;
   void set_lr(double lr) override { lr_ = lr; }
   double get_lr() const override { return lr_; }
 };
@@ -78,6 +85,10 @@ class ForeachAdamW : public torch::optim::Optimizer {
   std::vector<torch::Tensor> grads_scratch_;
   std::vector<torch::Tensor> exp_avg_scratch_;
   std::vector<torch::Tensor> exp_avg_sq_scratch_;
+  // Master-weights mode only: parallel to params_scratch_. bf16_param_scratch_
+  // holds the bf16 model params (write-back targets); params_scratch_/grads_scratch_
+  // then hold the fp32 master + fp32 upcast grads fed to the fused update.
+  std::vector<torch::Tensor> bf16_param_scratch_;
 };
 
 }  // namespace olmo_cpp

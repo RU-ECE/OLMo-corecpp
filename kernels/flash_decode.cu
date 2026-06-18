@@ -21,6 +21,7 @@
 #include <cuda_runtime.h>
 #include <torch/torch.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <math_constants.h>
 #include <cstdint>
 
@@ -149,7 +150,8 @@ torch::Tensor flash_decode_cuda(torch::Tensor q, torch::Tensor k, torch::Tensor 
   // Shared layout: q[D] + accum[D] + warp scratch[kMaxWarps].
   size_t shmem = static_cast<size_t>(2 * head_dim + kMaxWarps) * sizeof(float);
 
-  flash_decode_kernel<<<n_q_heads, kThreads, shmem>>>(
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  flash_decode_kernel<<<n_q_heads, kThreads, shmem, stream>>>(
       q_c.data_ptr<float>(),
       k_c.data_ptr<float>(),
       v_c.data_ptr<float>(),

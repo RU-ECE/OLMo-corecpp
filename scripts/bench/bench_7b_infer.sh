@@ -28,30 +28,48 @@ cd "$(dirname "$0")/../.."
 
 # ── Config ──────────────────────────────────────────────────────────────────
 BUILD_DIR="${BUILD_DIR:-build}"
-VOL="${VOL:-/media/volume/Prep_and_Voice_Training}"
 HF_MODEL="${HF_MODEL:-allenai/OLMo-2-1124-7B}"
 CONFIG="${CONFIG:-configs/olmo2_1124_7B.json}"
 OLLAMA_TAG="${OLLAMA_TAG:-olmo2:7b}"
 PROMPT_LEN="${PROMPT_LEN:-128}"
 DECODE_LEN="${DECODE_LEN:-256}"
-BATCHES="${BATCHES:-1 8 32}"
-
-WORK="$VOL/bench7b"
-HFDIR="$WORK/hf_model"
-CKPT="$WORK/olmo2_7b.pt"
-CKPT_INT4="$WORK/olmo2_7b.int4.pt"
-RESULTS="$WORK/results"
-mkdir -p "$WORK" "$RESULTS"
-
-VOCAB="data/gpt2/vocab.json"; MERGES="data/gpt2/merges.txt"   # only to satisfy bench_chat args
 
 say()  { printf "\n\033[1;36m== %s ==\033[0m\n" "$*"; }
 die()  { printf "\033[1;31mFAIL: %s\033[0m\n" "$*"; exit 1; }
 
-[[ -x "$BUILD_DIR/convert_hf"    ]] || die "$BUILD_DIR/convert_hf missing — ./scripts/build.sh --cuda"
-[[ -x "$BUILD_DIR/bench_chat"    ]] || die "$BUILD_DIR/bench_chat missing — ./scripts/build.sh --cuda"
-[[ -d "$VOL" ]] || die "volume not mounted at $VOL"
-[[ -f "$VOCAB" && -f "$MERGES" ]] || die "GPT-2 tokenizer missing — run scripts/race/03_prepare_data.sh once (just for the files)"
+[[ -x "$BUILD_DIR/convert_hf" ]] || die "$BUILD_DIR/convert_hf missing — ./scripts/build.sh --cuda"
+[[ -x "$BUILD_DIR/bench_chat" ]] || die "$BUILD_DIR/bench_chat missing — ./scripts/build.sh --cuda"
+
+# Storage: use the attached volume if present (H100 box), else a local dir
+# (e.g. the 5060 Ti box, which has no /media/volume). Override with WORK=.
+VOL="${VOL:-/media/volume/Prep_and_Voice_Training}"
+if [[ -z "${WORK:-}" ]]; then
+  if [[ -d "$VOL" ]]; then WORK="$VOL/bench7b"; else WORK="$HOME/bench7b"; fi
+fi
+HFDIR="$WORK/hf_model"; CKPT="$WORK/olmo2_7b.pt"; CKPT_INT4="$WORK/olmo2_7b.int4.pt"
+RESULTS="$WORK/results"
+mkdir -p "$WORK" "$RESULTS" || die "cannot create $WORK (set WORK=<dir with ~32GB free>)"
+say "storage: $WORK ($(df -h "$WORK" | tail -1 | awk '{print $4}') free)"
+
+# VRAM-aware: 7B bf16 (14GB) needs a big card. On <=24GB (e.g. 5060 Ti 16GB)
+# skip bf16 and benchmark INT4 only (which fits and is the fair vs-ollama-Q4
+# comparison anyway), with smaller batches.
+VRAM_MB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+if [[ -n "$VRAM_MB" && "$VRAM_MB" -lt 24000 ]]; then
+  DO_BF16=0; BATCHES="${BATCHES:-1 4}"
+  say "detected ${VRAM_MB}MB VRAM (<24GB) -> INT4 only, batches: $BATCHES (bf16 7B won't fit)"
+else
+  DO_BF16=1; BATCHES="${BATCHES:-1 8 32}"
+fi
+
+# GPT-2 tokenizer files — only needed to satisfy bench_chat's args (synthetic
+# prompt tokens; tokenizer correctness does NOT affect the speed numbers).
+VOCAB="data/gpt2/vocab.json"; MERGES="data/gpt2/merges.txt"
+if [[ ! -f "$VOCAB" || ! -f "$MERGES" ]]; then
+  mkdir -p data/gpt2
+  curl -fsSL https://huggingface.co/gpt2/raw/main/vocab.json -o "$VOCAB" || die "vocab.json fetch failed"
+  curl -fsSL https://huggingface.co/gpt2/raw/main/merges.txt -o "$MERGES" || die "merges.txt fetch failed"
+fi
 
 # ── 1. Download the HF model -> volume ──────────────────────────────────────
 say "1. download $HF_MODEL -> $HFDIR"
@@ -93,7 +111,7 @@ bench_cpp() {  # $1=label  $2=checkpoint  $3=batch
 
 say "4. C++ bench_chat (decode_len=$DECODE_LEN)"
 for b in $BATCHES; do
-  echo "--- bf16, batch $b ---"; bench_cpp bf16 "$CKPT" "$b"
+  if [[ "${DO_BF16:-1}" == "1" ]]; then echo "--- bf16, batch $b ---"; bench_cpp bf16 "$CKPT" "$b"; fi
   if [[ -n "$CKPT_INT4" ]]; then echo "--- int4, batch $b ---"; bench_cpp int4 "$CKPT_INT4" "$b"; fi
 done
 

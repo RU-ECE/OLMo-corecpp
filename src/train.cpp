@@ -416,6 +416,9 @@ void train(
   bool gpu_data_active = false;
   if (cfg.data_path && !cfg.data_path->empty()) {
     dataset.emplace(*cfg.data_path, cfg.seq_len, true);
+    // Data-parallel sharding: each DDP rank trains on a disjoint 1/world_size
+    // stride of the corpus (no-op single-GPU). Must precede reset_epoch().
+    if (ddp && ddp->is_distributed()) dataset->set_shard(ddp->rank(), ddp->world_size());
     dataset->reset_epoch();
     if (device.is_cuda()) {
       const int64_t cap = cfg.gpu_resident_data ? cfg.max_gpu_data_tokens : -1;
@@ -906,6 +909,9 @@ void train(
   bool gpu_data_active = false;
   if (cfg.data_path && !cfg.data_path->empty()) {
     dataset.emplace(*cfg.data_path, cfg.seq_len, true);
+    // Data-parallel sharding: each DDP rank trains on a disjoint 1/world_size
+    // stride of the corpus (no-op single-GPU). Must precede reset_epoch().
+    if (ddp && ddp->is_distributed()) dataset->set_shard(ddp->rank(), ddp->world_size());
     dataset->reset_epoch();
     if (device.is_cuda()) {
       const int64_t cap = cfg.gpu_resident_data ? cfg.max_gpu_data_tokens : -1;

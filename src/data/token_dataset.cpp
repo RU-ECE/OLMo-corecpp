@@ -121,21 +121,35 @@ void TokenDataset::ensure_stream_buf_capacity(int64_t batch_size) {
   stream_cap_b_ = batch_size;
 }
 
+void TokenDataset::set_shard(int rank, int world) {
+  dp_world_ = (world > 1) ? world : 1;
+  dp_rank_  = (world > 1) ? rank  : 0;
+  chunk_cursor_ = static_cast<size_t>(dp_rank_);  // rank's start offset into the stride
+}
+
 void TokenDataset::reset_epoch() {
-  chunk_cursor_ = 0;
   if (shuffle_) {
-    // Use the global seeded RNG for reproducibility (mirrors OLMo-core's
-    // seed + dp_rank approach from data_loader.py). Falls back to
-    // random_device if seed_all() hasn't been called yet.
-    try {
-      auto& state = global_seed_state();
-      std::shuffle(chunk_indices_.begin(), chunk_indices_.end(), state.rng);
-    } catch (const std::runtime_error&) {
-      std::random_device rd;
-      std::mt19937 g(rd());
+    if (dp_world_ > 1) {
+      // Sharded: shuffle DETERMINISTICALLY per epoch so every rank produces the
+      // identical order (random_device / global RNG could diverge across the
+      // separate rank processes). Each rank then strides into a disjoint slice.
+      std::mt19937_64 g(0x9E3779B97F4A7C15ULL ^ static_cast<uint64_t>(epoch_));
       std::shuffle(chunk_indices_.begin(), chunk_indices_.end(), g);
+      ++epoch_;
+    } else {
+      // Single-GPU: global seeded RNG (mirrors OLMo-core's seed approach).
+      // Falls back to random_device if seed_all() hasn't been called yet.
+      try {
+        auto& state = global_seed_state();
+        std::shuffle(chunk_indices_.begin(), chunk_indices_.end(), state.rng);
+      } catch (const std::runtime_error&) {
+        std::random_device rd;
+        std::mt19937 g(rd());
+        std::shuffle(chunk_indices_.begin(), chunk_indices_.end(), g);
+      }
     }
   }
+  chunk_cursor_ = static_cast<size_t>(dp_rank_);  // 0 when not sharded
   if (gpu_resident_) {
     // Re-upload shuffled indices to GPU (full corpus path)
     auto idx_tensor = torch::from_blob(
@@ -156,7 +170,9 @@ std::tuple<torch::Tensor, torch::Tensor> TokenDataset::prepare_batch_cpu(int64_t
       if (chunk_cursor_ >= static_cast<size_t>(num_chunks_)) {
         reset_epoch();
       }
-      offsets[static_cast<size_t>(b)] = chunk_indices_[chunk_cursor_++] * seq_len_;
+      offsets[static_cast<size_t>(b)] = chunk_indices_[chunk_cursor_] * seq_len_;
+      // Stride by dp_world_ (==1 single-GPU; skips other ranks' chunks when sharded).
+      chunk_cursor_ += static_cast<size_t>(dp_world_);
     }
   }
 

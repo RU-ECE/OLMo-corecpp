@@ -71,6 +71,13 @@ class TokenDataset {
   /// Reset shuffle indices for next epoch
   void reset_epoch();
 
+  /// Data-parallel sharding: rank `r` of `world` sees a disjoint 1/world stride
+  /// of the (identically-shuffled) chunk list, so DDP ranks train on different
+  /// data. Call once after construction with the DDP rank/world_size. world<=1
+  /// is single-GPU (no sharding). When sharded, the shuffle is seeded
+  /// deterministically per epoch so every rank produces the SAME order.
+  void set_shard(int rank, int world);
+
   /// Prepare for training on `device`.
   /// - CUDA + enough budget: full token array + chunk indices on GPU (fast path).
   /// - CUDA + not enough / max_gpu_tokens==-1: pinned CPU + double-buffered H2D (bounded memory).
@@ -100,6 +107,12 @@ class TokenDataset {
   bool shuffle_;
   std::vector<int64_t> chunk_indices_;
   size_t chunk_cursor_;
+  // Data-parallel sharding (set_shard). dp_world_ > 1 means rank dp_rank_ walks
+  // the chunk list with stride dp_world_ starting at dp_rank_. epoch_ drives a
+  // deterministic per-epoch shuffle seed so all ranks shuffle identically.
+  int dp_rank_ = 0;
+  int dp_world_ = 1;
+  int64_t epoch_ = 0;
 
   // Async prefetch state (CPU tensors path when not streaming_mode_)
   std::future<std::tuple<torch::Tensor, torch::Tensor>> prefetch_future_;

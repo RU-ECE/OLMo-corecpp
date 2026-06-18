@@ -128,6 +128,11 @@ struct TrainConfig {
   /// owns and updates 1/world_size of the parameters; an allgather
   /// after step() syncs the updated weights. Single-rank: no-op.
   bool use_zero1 = false;
+  /// FSDP (ZeRO-3): shard params + grads + optimizer state across DP ranks.
+  /// Each rank stores 1/world_size of every weight; the full param is
+  /// reconstructed (allgather) only for forward/backward, then re-sharded.
+  /// Mutually exclusive with use_cuda_graph (unshard/reshard can't be captured).
+  bool use_fsdp = false;
   /// Place the entire tokenised dataset on GPU memory if it fits.
   bool gpu_resident_data = true;      // If false: pinned host + H2D streaming (no full corpus on GPU)
   /// 0 = auto VRAM budget for full GPU residency; >0 = max token count allowed on GPU;

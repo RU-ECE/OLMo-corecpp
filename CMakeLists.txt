@@ -284,10 +284,10 @@ option(OLMO_USE_ADVANCED_PARALLEL
 list(APPEND OLMO_SOURCES src/distributed/zero1.cpp)
 
 if(OLMO_USE_NCCL)
-    # NCCL DDP path: ddp.cpp compiled with the ProcessGroupNCCL backend.
-    # No Gloo needed. FSDP (Rung 2) will be added here under ADVANCED_PARALLEL.
-    list(APPEND OLMO_SOURCES src/distributed/ddp.cpp)
-    message(STATUS "Distributed: NCCL DDP ENABLED (olmo_train multi-GPU)")
+    # NCCL multi-GPU path: ddp.cpp (DDP) + fsdp.cpp (FSDP/ZeRO-3 sharding),
+    # both with the ProcessGroupNCCL backend. No Gloo needed.
+    list(APPEND OLMO_SOURCES src/distributed/ddp.cpp src/distributed/fsdp.cpp)
+    message(STATUS "Distributed: NCCL DDP + FSDP ENABLED (olmo_train multi-GPU)")
 elseif(OLMO_USE_DDP AND GLOO_INCLUDE_DIR)
     list(APPEND OLMO_SOURCES
         src/distributed/ddp.cpp

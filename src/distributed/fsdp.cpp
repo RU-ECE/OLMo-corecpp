@@ -43,7 +43,7 @@
 
 namespace olmo_cpp {
 
-#ifdef OLMO_HAS_DDP
+#if defined(OLMO_HAS_DDP) || defined(OLMO_HAS_NCCL)
 
 // ---------------------------------------------------------------------------
 // Construction

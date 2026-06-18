@@ -50,7 +50,7 @@
 #include <optional>
 #include <unordered_map>
 
-#ifdef OLMO_HAS_DDP
+#if defined(OLMO_HAS_DDP) || defined(OLMO_HAS_NCCL)
 // c10d::Backend provides allgather / reduce_scatter / allreduce primitives.
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #endif
@@ -68,7 +68,7 @@ enum class ShardingStrategy {
 /// Shards model parameters across ranks for memory-efficient distributed training.
 class FSDPContext {
  public:
-#ifdef OLMO_HAS_DDP
+#if defined(OLMO_HAS_DDP) || defined(OLMO_HAS_NCCL)
   /// Create FSDP context. Returns nullopt if backend is null or world_size < 2.
   /// `strategy` selects between FULL_SHARD (ZeRO-3), SHARD_GRAD_OP (ZeRO-2)
   /// and NO_SHARD (DDP-equivalent).
@@ -113,7 +113,7 @@ class FSDPContext {
   ShardingStrategy strategy() const { return strategy_; }
 
  private:
-#ifdef OLMO_HAS_DDP
+#if defined(OLMO_HAS_DDP) || defined(OLMO_HAS_NCCL)
   FSDPContext(c10::intrusive_ptr<c10d::Backend> backend,
               c10::intrusive_ptr<c10d::Backend> inter_backend,
               int rank, int world_size, ShardingStrategy strategy);

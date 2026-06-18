@@ -10,22 +10,22 @@ data/*.npy
 data/*.bin
 data/*.tok
 
-# Checkpoints & model weights — NEVER commit (multi-GB)
+# Checkpoints & model weights — NEVER commit (multi-GB).
+# NOTE: .gitignore has no inline comments — keep patterns on their own lines.
 checkpoints/
 *.pt
 *.ckpt
-*.safetensors        # HuggingFace weight shards (e.g. olmo-32b/*.safetensors)
-*.gguf               # ollama / llama.cpp weights
-*.bin                # HF pytorch_model*.bin shards
 *.pth
+*.safetensors
+*.gguf
 *.onnx
+# HF pytorch_model*.bin shards (data/*.bin already covered above)
+*.bin
 
 # Downloaded reference / comparison models (HF snapshots, ollama pulls)
 olmo-32b/
-**/*-of-*.safetensors
 models/
 hf_models/
-*.hf/
 
 # IDE
 .vscode/

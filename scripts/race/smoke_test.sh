@@ -90,16 +90,22 @@ mapfile -t LOSSES < <(grep -oE 'loss:[[:space:]]*[0-9.eE+-]+|loss:[[:space:]]*na
 [[ ${#LOSSES[@]} -ge 2 ]] || fail "no loss lines in training output"
 grep -qiE 'loss:[[:space:]]*nan' "$TRAIN_LOG" && fail "training produced NaN loss"
 
-first="${LOSSES[0]}"; last="${LOSSES[-1]}"
-# Final loss must be finite and not greater than the first (allow tiny noise).
-python3 - "$first" "$last" <<'PY' || fail "loss did not decrease (first=$first last=$last)"
+# Compare the first REAL loss to the last. Step 0 logs loss 0.0000 — that's
+# the async loss reader's initial placeholder before the first GPU readout
+# lands, NOT a real loss — so ignore leading ~0 values.
+python3 - "${LOSSES[@]}" <<'PY' || fail "loss did not decrease / non-finite (see $TRAIN_LOG)"
 import sys, math
-first, last = float(sys.argv[1]), float(sys.argv[2])
-assert math.isfinite(first) and math.isfinite(last), "non-finite loss"
-# 20 steps should at least not diverge; require last <= first + small slack.
-sys.exit(0 if last <= first + 0.5 else 1)
+vals = [float(x) for x in sys.argv[1:]]
+if any(not math.isfinite(v) for v in vals):
+    print("  non-finite (NaN/inf) loss detected"); sys.exit(1)
+real = [v for v in vals if v > 1e-6]          # drop step-0 placeholder zeros
+if len(real) < 2:
+    print("  not enough real loss values"); sys.exit(1)
+first, last = real[0], real[-1]
+print(f"  first real loss {first:.4f} -> last {last:.4f}")
+sys.exit(0 if last <= first + 0.5 else 1)      # must trend down over 20 steps
 PY
-pass "loss finite and decreasing: ${first} → ${last}"
+pass "loss finite and decreasing (no NaN)"
 [[ -f "$CKPT" ]] || fail "no checkpoint saved at $CKPT"
 pass "checkpoint saved: $CKPT"
 

@@ -51,6 +51,7 @@
 #include <c10/cuda/CUDACachingAllocator.h>
 #endif
 #include "olmo_cpp/distributed/ddp.hpp"
+#include "olmo_cpp/distributed/fsdp.hpp"
 #include "olmo_cpp/distributed/zero1.hpp"
 #include "olmo_cpp/optim/lion.hpp"
 #include "olmo_cpp/optim/muon.hpp"
@@ -355,12 +356,32 @@ void train(
   // updated weights so every replica sees identical params again.
   // Single-rank / DDP-off: sharder is null, opt_params == all_params.
   std::unique_ptr<OptimizerStateSharder> zero1;
-  if (cfg.use_zero1 && ddp && ddp->is_distributed()) {
+  if (cfg.use_zero1 && ddp && ddp->is_distributed() && !cfg.use_fsdp) {
     zero1 = std::make_unique<OptimizerStateSharder>(
         ddp->backend(), ddp->rank(), ddp->world_size());
   }
+
+  // ---- FSDP (ZeRO-3): shard params + grads + optimizer state across ranks ----
+  // shard_params() must run BEFORE the optimizer is built so the optimizer (and
+  // its moment state) are sized to the local 1/world_size shard. The full param
+  // is reconstructed (unshard) each step for fwd/bwd, then re-sharded.
+  std::optional<FSDPContext> fsdp;
+#if defined(OLMO_HAS_NCCL) || defined(OLMO_HAS_DDP)
+  if (cfg.use_fsdp && ddp && ddp->is_distributed()) {
+    fsdp = FSDPContext::create(ddp->backend(), ShardingStrategy::FULL_SHARD);
+    if (rank == 0 && fsdp) {
+      std::cout << "FSDP: sharding params across " << ddp->world_size()
+                << " ranks (each rank holds 1/" << ddp->world_size() << ")\n";
+    }
+  }
+#else
+  if (cfg.use_fsdp) std::cerr << "WARNING: fsdp=1 but binary built without "
+                                 "NCCL/DDP — ignoring (build with --nccl).\n";
+#endif
+
   auto all_params = model->parameters();
-  auto opt_params = zero1 ? zero1->partition(all_params) : all_params;
+  if (fsdp) fsdp->shard_params(all_params);  // each param.data() -> local shard
+  auto opt_params = (zero1 && !fsdp) ? zero1->partition(all_params) : all_params;
 
   // ---- Create optimizer ----
   std::unique_ptr<torch::optim::Optimizer> optimizer;
@@ -447,7 +468,8 @@ void train(
     // and never again. With graphs we skip hooks and allreduce end-of-step
     // (outside the captured fwd+bwd) via the no-hook path in allreduce_gradients.
     const bool will_graph = cfg.use_cuda_graph && device.is_cuda();
-    if (!will_graph) {
+    // FSDP does its own reduce-scatter (not allreduce), so skip DDP hooks there.
+    if (!will_graph && !cfg.use_fsdp) {
       ddp->register_grad_hooks(ddp_params);
     }
   }
@@ -517,7 +539,7 @@ void train(
   // gradient allreduce OUTSIDE the captured region (end-of-step), since NCCL
   // collectives / autograd hooks can't be naively graph-captured. Grad hooks
   // are skipped above when graphing so allreduce_gradients() reduces end-of-step.
-  bool want_graph = cfg.use_cuda_graph && device.is_cuda();
+  bool want_graph = cfg.use_cuda_graph && device.is_cuda() && !cfg.use_fsdp;
 
   if (device.is_cuda()) {
     auto int_opts = torch::TensorOptions().dtype(torch::kLong).device(device);
@@ -678,6 +700,8 @@ void train(
 #endif
     {
       // ---- Standard path (non-graph or CPU) ----
+      // FSDP: reconstruct full params (allgather) for fwd/bwd; resharded below.
+      if (fsdp) fsdp->unshard_params(all_params);
       optimizer->zero_grad(true);
       accum_loss_tensor.zero_();
 
@@ -749,7 +773,20 @@ void train(
     cb_mgr.on_after_loss(state);
 
     // Gradient sync in distributed
-    if (ddp && ddp->is_distributed()) {
+    if (fsdp) {
+      // FSDP: grads are currently FULL (backward ran on unsharded params).
+      // Collect them, re-shard the params (free the full-param memory), then
+      // reduce-scatter the grads so each rank keeps only its 1/world_size grad
+      // shard — matching its param shard for the optimizer step.
+      std::vector<torch::Tensor> fgrads;
+      fgrads.reserve(all_params.size());
+      for (auto& p : all_params) fgrads.push_back(p.grad());
+      fsdp->reshard_params(all_params);
+      fsdp->reduce_scatter_grads(fgrads);
+      for (size_t i = 0; i < all_params.size(); ++i) {
+        if (fgrads[i].defined()) all_params[i].mutable_grad() = fgrads[i];
+      }
+    } else if (ddp && ddp->is_distributed()) {
       ddp->allreduce_gradients(ddp_params);
     }
 
@@ -879,12 +916,32 @@ void train(
 
   // ZeRO-1 (FusedTransformer overload).
   std::unique_ptr<OptimizerStateSharder> zero1;
-  if (cfg.use_zero1 && ddp && ddp->is_distributed()) {
+  if (cfg.use_zero1 && ddp && ddp->is_distributed() && !cfg.use_fsdp) {
     zero1 = std::make_unique<OptimizerStateSharder>(
         ddp->backend(), ddp->rank(), ddp->world_size());
   }
+
+  // ---- FSDP (ZeRO-3): shard params + grads + optimizer state across ranks ----
+  // shard_params() must run BEFORE the optimizer is built so the optimizer (and
+  // its moment state) are sized to the local 1/world_size shard. The full param
+  // is reconstructed (unshard) each step for fwd/bwd, then re-sharded.
+  std::optional<FSDPContext> fsdp;
+#if defined(OLMO_HAS_NCCL) || defined(OLMO_HAS_DDP)
+  if (cfg.use_fsdp && ddp && ddp->is_distributed()) {
+    fsdp = FSDPContext::create(ddp->backend(), ShardingStrategy::FULL_SHARD);
+    if (rank == 0 && fsdp) {
+      std::cout << "FSDP: sharding params across " << ddp->world_size()
+                << " ranks (each rank holds 1/" << ddp->world_size() << ")\n";
+    }
+  }
+#else
+  if (cfg.use_fsdp) std::cerr << "WARNING: fsdp=1 but binary built without "
+                                 "NCCL/DDP — ignoring (build with --nccl).\n";
+#endif
+
   auto all_params = model->parameters();
-  auto opt_params = zero1 ? zero1->partition(all_params) : all_params;
+  if (fsdp) fsdp->shard_params(all_params);  // each param.data() -> local shard
+  auto opt_params = (zero1 && !fsdp) ? zero1->partition(all_params) : all_params;
 
   std::unique_ptr<torch::optim::Optimizer> optimizer;
   if (cfg.optimizer == "lion") {
@@ -947,7 +1004,8 @@ void train(
     // and never again. With graphs we skip hooks and allreduce end-of-step
     // (outside the captured fwd+bwd) via the no-hook path in allreduce_gradients.
     const bool will_graph = cfg.use_cuda_graph && device.is_cuda();
-    if (!will_graph) {
+    // FSDP does its own reduce-scatter (not allreduce), so skip DDP hooks there.
+    if (!will_graph && !cfg.use_fsdp) {
       ddp->register_grad_hooks(ddp_params);
     }
   }
@@ -1038,7 +1096,7 @@ void train(
   // gradient allreduce OUTSIDE the captured region (end-of-step), since NCCL
   // collectives / autograd hooks can't be naively graph-captured. Grad hooks
   // are skipped above when graphing so allreduce_gradients() reduces end-of-step.
-  bool want_graph = cfg.use_cuda_graph && device.is_cuda();
+  bool want_graph = cfg.use_cuda_graph && device.is_cuda() && !cfg.use_fsdp;
   if (want_graph) {
     auto int_opts = torch::TensorOptions().dtype(torch::kLong).device(device);
     graph_input  = torch::empty({cfg.batch_size, cfg.seq_len}, int_opts);

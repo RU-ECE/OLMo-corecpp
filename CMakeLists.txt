@@ -421,6 +421,14 @@ if(CMAKE_CUDA_COMPILER)
         message(STATUS "NCCL: ${NCCL_LIBRARY} (headers: ${NCCL_INCLUDE_DIR})")
         list(APPEND ZWT_CUDA_SOURCES zwt/src/dist/nccl_backend.cu)
         set(ZWT_HAVE_NCCL TRUE)
+        # olmo_cpp's ddp.cpp (OLMO_USE_NCCL) pulls in ProcessGroupNCCL.hpp ->
+        # NCCLUtils.hpp -> <nccl.h>; pip torch doesn't expose that header on the
+        # default include path, so give the target the pip NCCL header + lib.
+        if(OLMO_USE_NCCL)
+            target_include_directories(olmo_cpp PRIVATE ${NCCL_INCLUDE_DIR})
+            target_link_libraries(olmo_cpp PUBLIC ${NCCL_LIBRARY})
+            message(STATUS "  -> wired NCCL headers/lib into olmo_cpp (multi-GPU DDP)")
+        endif()
     else()
         message(STATUS "NCCL: not found — multi-GPU DDP will be disabled at runtime.")
         message(STATUS "  hints tried: pip=${_PIP_NCCL_DIR}, torch=${TORCH_INSTALL_PREFIX}, /usr/local/cuda, /usr/{include,lib}")

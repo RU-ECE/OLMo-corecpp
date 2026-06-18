@@ -45,6 +45,7 @@ if(OLMO_AUTO_GPU_ARCH)
   set(_OLMO_GPU_ARCH_FILE "${CMAKE_SOURCE_DIR}/scripts/race/results/.gpu_arch")
   if(EXISTS "${_OLMO_GPU_ARCH_FILE}")
     file(READ "${_OLMO_GPU_ARCH_FILE}" _OLMO_CC)
+    string(REGEX REPLACE "[\r\n].*" "" _OLMO_CC "${_OLMO_CC}")  # first line (heal stale multi-GPU cache)
     string(STRIP "${_OLMO_CC}" _OLMO_CC)
   endif()
   if(NOT _OLMO_CC AND OLMO_NVIDIA_SMI)
@@ -55,6 +56,10 @@ if(OLMO_AUTO_GPU_ARCH)
       ERROR_QUIET
       RESULT_VARIABLE _OLMO_CC_RC)
     if(_OLMO_CC_RC EQUAL 0 AND _OLMO_CC_DOTTED)
+      # Multi-GPU boxes print one compute_cap line PER GPU ("9.0\n9.0"); keep
+      # only the first (all GPUs share an arch), else CMAKE_CUDA_ARCHITECTURES
+      # gets a newline and breaks the math/arch parsing below.
+      string(REGEX REPLACE "[\r\n].*" "" _OLMO_CC_DOTTED "${_OLMO_CC_DOTTED}")
       string(REPLACE "." "" _OLMO_CC "${_OLMO_CC_DOTTED}")
       string(STRIP "${_OLMO_CC}" _OLMO_CC)
     endif()

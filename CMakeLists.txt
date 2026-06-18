@@ -310,9 +310,13 @@ else()
 endif()
 add_library(olmo_cpp STATIC ${OLMO_SOURCES})
 if(OLMO_USE_NCCL)
-    target_compile_definitions(olmo_cpp PRIVATE OLMO_HAS_NCCL=1)
+    # PUBLIC so the macro propagates to targets that link olmo_cpp — notably
+    # olmo_train, which compiles src/train.cpp (the FSDP/DDP call sites) into
+    # its OWN object, not olmo_cpp. PRIVATE here left train.cpp's FSDP wiring
+    # compiled out -> "fsdp=1 but built without NCCL" at runtime.
+    target_compile_definitions(olmo_cpp PUBLIC OLMO_HAS_NCCL=1)
 elseif(OLMO_USE_DDP AND GLOO_INCLUDE_DIR)
-    target_compile_definitions(olmo_cpp PRIVATE OLMO_HAS_DDP=1)
+    target_compile_definitions(olmo_cpp PUBLIC OLMO_HAS_DDP=1)
 endif()
 target_include_directories(olmo_cpp PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include

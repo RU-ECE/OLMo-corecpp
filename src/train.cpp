@@ -673,27 +673,34 @@ void train(
 
       for (int64_t accum = 0; accum < cfg.grad_accum_steps; ++accum) {
         torch::Tensor input, labels;
-        if (dataset) {
-          auto [in, lab] = dataset->get_batch(cur_batch_size, device);
-          input = in; labels = lab;
-          dataset->prefetch_next(cur_batch_size, device);
-        } else {
-          input = torch::randint(0, model_cfg.vocab_size, {cur_batch_size, cur_seq_len},
-                                 torch::TensorOptions().dtype(torch::kLong).device(device));
-          labels = torch::randint(0, model_cfg.vocab_size, {cur_batch_size, cur_seq_len},
-                                  torch::TensorOptions().dtype(torch::kLong).device(device));
+        {
+          ProfileScope data_scope("data_loading");
+          if (dataset) {
+            auto [in, lab] = dataset->get_batch(cur_batch_size, device);
+            input = in; labels = lab;
+            dataset->prefetch_next(cur_batch_size, device);
+          } else {
+            input = torch::randint(0, model_cfg.vocab_size, {cur_batch_size, cur_seq_len},
+                                   torch::TensorOptions().dtype(torch::kLong).device(device));
+            labels = torch::randint(0, model_cfg.vocab_size, {cur_batch_size, cur_seq_len},
+                                    torch::TensorOptions().dtype(torch::kLong).device(device));
+          }
         }
 
         torch::Tensor loss;
         {
+          ProfileScope fwd_scope("forward");
           AutocastGuard ac(cfg.use_amp, device);
           loss = model->forward(input, labels, -100) / static_cast<float>(cfg.grad_accum_steps);
         }
 
-        if (grad_scaler) {
-          grad_scaler->scale(loss).backward();
-        } else {
-          loss.backward();
+        {
+          ProfileScope bwd_scope("backward");
+          if (grad_scaler) {
+            grad_scaler->scale(loss).backward();
+          } else {
+            loss.backward();
+          }
         }
         accum_loss_tensor.add_(loss.detach());
       }
@@ -739,16 +746,19 @@ void train(
     cb_mgr.on_after_backward(state);
 
     // Unscale + check for inf/nan if using grad scaler
-    if (grad_scaler) {
-      bool finite = grad_scaler->unscale_and_check(*optimizer);
-      if (finite) {
+    {
+      ProfileScope optim_scope("optimizer_step");  // grad-clip + optimizer update
+      if (grad_scaler) {
+        bool finite = grad_scaler->unscale_and_check(*optimizer);
+        if (finite) {
+          clip_grad_norm_gpu(model_params, cfg.max_grad_norm);
+          grad_scaler->step(*optimizer);
+        }
+        grad_scaler->update();
+      } else {
         clip_grad_norm_gpu(model_params, cfg.max_grad_norm);
-        grad_scaler->step(*optimizer);
+        optimizer->step();
       }
-      grad_scaler->update();
-    } else {
-      clip_grad_norm_gpu(model_params, cfg.max_grad_norm);
-      optimizer->step();
     }
     // ZeRO-1: broadcast each updated parameter from its owning rank.
     if (zero1) zero1->allgather_params(all_params);

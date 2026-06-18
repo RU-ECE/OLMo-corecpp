@@ -118,10 +118,17 @@ void run(Model& model, const olmo_cpp::TransformerConfig& cfg,
     callbacks.push_back(grad_stats_cb);
   }
 
+  // When profiling on CUDA, switch the ProfileScope timers to CUDA events so
+  // the per-stage report reflects true GPU execution time (forward/backward/
+  // optimizer), not just kernel-launch wall time. Adds a per-stage sync.
+  if (enable_profile && device.is_cuda()) {
+    olmo_cpp::profiler().set_cuda_timing(true);
+  }
+
   olmo_cpp::train(model, cfg, train_cfg, device, std::move(callbacks));
 
   if (enable_profile) {
-    olmo_cpp::profiler().report("Training Profile");
+    olmo_cpp::profiler().report("Training Profile (GPU time)");
     olmo_cpp::print_memory_summary(device);
     olmo_cpp::print_rng_state_summary();
   }

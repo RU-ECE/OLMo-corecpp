@@ -43,7 +43,14 @@
 #include <algorithm>
 #include <mutex>
 #include <cmath>
+#include <atomic>
 #include <torch/torch.h>
+
+#if defined(USE_CUDA)
+#  include <cuda_runtime.h>
+#  include <c10/cuda/CUDAStream.h>
+#  define OLMO_PROFILER_CUDA 1
+#endif
 
 namespace olmo_cpp {
 
@@ -227,6 +234,13 @@ class Profiler {
     return stats_;
   }
 
+  /// Enable CUDA-event timing: ProfileScope then measures true GPU execution
+  /// time of each region (via cudaEvent + a sync at scope exit) instead of
+  /// CPU wall time. Set once from main when [training] profile=1 and the
+  /// device is CUDA. Adds a per-stage sync, so only use it for profiling runs.
+  void set_cuda_timing(bool enabled) { cuda_timing_.store(enabled); }
+  bool cuda_timing_enabled() const { return cuda_timing_.load(); }
+
  private:
   /// Mutex protecting both `stats_` and `active_`. Marked `mutable` so
   /// const methods (`get`, `report`, `all_stats`) can lock it.
@@ -235,6 +249,8 @@ class Profiler {
   std::unordered_map<std::string, TimingStats> stats_;
   /// Currently-open regions: name -> start timestamp.
   std::unordered_map<std::string, TimePoint> active_;
+  /// When true, ProfileScope uses CUDA events (GPU time) instead of wall clock.
+  std::atomic<bool> cuda_timing_{false};
 };
 
 /// Global profiler instance. Returns a reference to a function-local
@@ -249,11 +265,34 @@ class ProfileScope {
   /// pass a custom one for unit tests.
   explicit ProfileScope(const std::string& name, Profiler& p = profiler())
       : name_(name), profiler_(p) {
-    // Records the start timestamp immediately on construction.
+#if OLMO_PROFILER_CUDA
+    if (profiler_.cuda_timing_enabled()) {
+      // Record a CUDA event on the current stream at region entry. The matching
+      // event at exit, plus a sync, gives true GPU execution time for the stage.
+      cuda_stream_ = c10::cuda::getCurrentCUDAStream().stream();
+      cudaEventCreate(&start_ev_);
+      cudaEventCreate(&stop_ev_);
+      cudaEventRecord(start_ev_, cuda_stream_);
+      cuda_active_ = true;
+      return;
+    }
+#endif
     profiler_.start(name_);
   }
   /// Stop timing and fold elapsed time into the profiler.
   ~ProfileScope() {
+#if OLMO_PROFILER_CUDA
+    if (cuda_active_) {
+      cudaEventRecord(stop_ev_, cuda_stream_);
+      cudaEventSynchronize(stop_ev_);   // wait for this stage's GPU work to finish
+      float ms = 0.0f;
+      cudaEventElapsedTime(&ms, start_ev_, stop_ev_);
+      profiler_.record(name_, static_cast<double>(ms) * 1000.0);  // record() takes µs
+      cudaEventDestroy(start_ev_);
+      cudaEventDestroy(stop_ev_);
+      return;
+    }
+#endif
     profiler_.stop(name_);
   }
   /// Non-copyable — copying would double-stop the same region.
@@ -265,6 +304,12 @@ class ProfileScope {
   std::string name_;
   /// Reference to the profiler that holds the running counts.
   Profiler& profiler_;
+#if OLMO_PROFILER_CUDA
+  bool cuda_active_ = false;
+  cudaStream_t cuda_stream_ = nullptr;
+  cudaEvent_t start_ev_ = nullptr;
+  cudaEvent_t stop_ev_ = nullptr;
+#endif
 };
 
 /// Memory tracking utilities. Snapshot of GPU memory at a point in time.

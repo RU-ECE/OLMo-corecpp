@@ -183,10 +183,14 @@ void DDPContext::register_grad_hooks(std::vector<torch::Tensor>& parameters,
       b.grads.push_back(grad);
       b.ready_count++;
       if (b.ready_count == b.total_count) {
-        // Bucket complete — dispatch the collective. backend_->allreduce
-        // returns a c10::Work; we store it and wait at finalize time.
-        auto work = this->backend_->allreduce(b.grads);
-        this->hook_state_.pending_works.push_back(std::move(work));
+        // Bucket complete — dispatch the collective. ProcessGroupNCCL.allreduce
+        // takes ONE tensor per call (the multi-tensor form is deprecated and
+        // throws "Expecting one tensor only"), so reduce each grad individually;
+        // each returns a c10::Work we store and wait on at finalize time.
+        for (auto& g : b.grads) {
+          std::vector<at::Tensor> single{g};
+          this->hook_state_.pending_works.push_back(this->backend_->allreduce(single));
+        }
       }
       return grad;
     });
@@ -273,7 +277,12 @@ void DDPContext::allreduce_gradients(const std::vector<torch::Tensor>& parameter
   int64_t bucket_bytes = 0;
   auto flush = [&]() {
     if (bucket.empty()) return;
-    works.push_back(backend_->allreduce(bucket));
+    // ProcessGroupNCCL.allreduce is one-tensor-per-call (multi-tensor
+    // deprecated); reduce each grad in the bucket individually.
+    for (auto& g : bucket) {
+      std::vector<at::Tensor> single{g};
+      works.push_back(backend_->allreduce(single));
+    }
     bucket.clear();
     bucket_bytes = 0;
   };

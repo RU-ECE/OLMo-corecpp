@@ -151,6 +151,9 @@ endif()
 # DDP requires Gloo (not in pip LibTorch). Check for gloo.
 find_path(GLOO_INCLUDE_DIR gloo/algorithm.h HINTS /usr/local/include /opt/homebrew/include)
 option(OLMO_USE_DDP "Build with DDP (requires Gloo)" OFF)
+# NCCL DDP: GPU collectives via c10d::ProcessGroupNCCL (ships in pip torch as
+# nvidia-nccl-cu12 — no Gloo headers needed). Preferred for H100 multi-GPU.
+option(OLMO_USE_NCCL "Build with NCCL DDP (no Gloo needed)" OFF)
 
 # Main library: model components + data + training infrastructure
 set(OLMO_SOURCES
@@ -280,7 +283,12 @@ option(OLMO_USE_ADVANCED_PARALLEL
 # mode without conditional compilation.
 list(APPEND OLMO_SOURCES src/distributed/zero1.cpp)
 
-if(OLMO_USE_DDP AND GLOO_INCLUDE_DIR)
+if(OLMO_USE_NCCL)
+    # NCCL DDP path: ddp.cpp compiled with the ProcessGroupNCCL backend.
+    # No Gloo needed. FSDP (Rung 2) will be added here under ADVANCED_PARALLEL.
+    list(APPEND OLMO_SOURCES src/distributed/ddp.cpp)
+    message(STATUS "Distributed: NCCL DDP ENABLED (olmo_train multi-GPU)")
+elseif(OLMO_USE_DDP AND GLOO_INCLUDE_DIR)
     list(APPEND OLMO_SOURCES
         src/distributed/ddp.cpp
         src/distributed/tensor_parallel.cpp
@@ -301,7 +309,9 @@ else()
     list(APPEND OLMO_SOURCES src/distributed/ddp_stub.cpp)
 endif()
 add_library(olmo_cpp STATIC ${OLMO_SOURCES})
-if(OLMO_USE_DDP AND GLOO_INCLUDE_DIR)
+if(OLMO_USE_NCCL)
+    target_compile_definitions(olmo_cpp PRIVATE OLMO_HAS_NCCL=1)
+elseif(OLMO_USE_DDP AND GLOO_INCLUDE_DIR)
     target_compile_definitions(olmo_cpp PRIVATE OLMO_HAS_DDP=1)
 endif()
 target_include_directories(olmo_cpp PUBLIC

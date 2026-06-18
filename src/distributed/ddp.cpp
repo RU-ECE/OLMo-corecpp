@@ -50,11 +50,22 @@
  */
 #include "olmo_cpp/distributed/ddp.hpp"
 #include <torch/csrc/distributed/c10d/Backend.hpp>
-#include <torch/csrc/distributed/c10d/ProcessGroupGloo.hpp>
 #include <torch/csrc/distributed/c10d/TCPStore.hpp>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+
+// Backend selection. NCCL (GPU collectives, ships in pip torch via
+// nvidia-nccl-cu12) is preferred for H100; Gloo (CPU, needs separate headers)
+// is the portability fallback. The build picks exactly one via -DOLMO_USE_NCCL
+// or -DOLMO_USE_DDP; this file is only compiled when one of them is set
+// (otherwise ddp_stub.cpp is used).
+#if defined(OLMO_HAS_NCCL)
+#  include <torch/csrc/distributed/c10d/ProcessGroupNCCL.hpp>
+#  include <c10/cuda/CUDAFunctions.h>
+#elif defined(OLMO_HAS_DDP)
+#  include <torch/csrc/distributed/c10d/ProcessGroupGloo.hpp>
+#endif
 
 namespace olmo_cpp {
 
@@ -80,8 +91,22 @@ std::optional<DDPContext> DDPContext::init_from_env() {
 
   auto store = c10::make_intrusive<c10d::TCPStore>(std::string(master_addr), store_opts);
 
-  auto options = c10d::ProcessGroupGloo::Options::create();
-  auto backend = c10::make_intrusive<c10d::ProcessGroupGloo>(store, rank, world_size, options);
+  c10::intrusive_ptr<c10d::Backend> backend;
+#if defined(OLMO_HAS_NCCL)
+  // Pin this rank to its GPU BEFORE creating the NCCL process group — NCCL
+  // binds the communicator to the current device. LOCAL_RANK is the per-node
+  // GPU index (set by the launcher); fall back to global rank for 1 node.
+  const char* local_rank_str = std::getenv("LOCAL_RANK");
+  int local_rank = local_rank_str ? std::stoi(local_rank_str) : rank;
+  c10::cuda::set_device(static_cast<c10::DeviceIndex>(local_rank));
+  auto nccl_opts = c10d::ProcessGroupNCCL::Options::create();
+  backend = c10::make_intrusive<c10d::ProcessGroupNCCL>(store, rank, world_size, nccl_opts);
+#elif defined(OLMO_HAS_DDP)
+  auto gloo_opts = c10d::ProcessGroupGloo::Options::create();
+  backend = c10::make_intrusive<c10d::ProcessGroupGloo>(store, rank, world_size, gloo_opts);
+#else
+  return std::nullopt;  // no backend compiled — stub should have been used
+#endif
 
   return DDPContext(backend, rank, world_size);
 }

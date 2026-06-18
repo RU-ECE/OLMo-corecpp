@@ -35,15 +35,17 @@ for arg in "$@"; do
     --clean)  CLEAN=1 ;;
     --debug)  BUILD_TYPE="Debug" ;;
     --ddp)    EXTRA_CMAKE_ARGS="$EXTRA_CMAKE_ARGS -DOLMO_USE_DDP=ON" ;;
+    --nccl)   EXTRA_CMAKE_ARGS="$EXTRA_CMAKE_ARGS -DOLMO_USE_NCCL=ON" ;;
     --wgmma)  EXTRA_CMAKE_ARGS="$EXTRA_CMAKE_ARGS -DZWT_USE_WGMMA=ON" ;;
     --help|-h)
-      echo "Usage: $0 [--cuda|--cpu|--clean|--debug|--ddp|--wgmma]"
+      echo "Usage: $0 [--cuda|--cpu|--clean|--debug|--ddp|--nccl|--wgmma]"
       echo ""
       echo "  --cuda    Force CUDA build (H100 etc.)"
       echo "  --cpu     CPU-only build"
       echo "  --clean   Wipe build/ before configuring"
       echo "  --debug   -DCMAKE_BUILD_TYPE=Debug"
       echo "  --ddp     Build legacy olmo_cpp DDP path (Gloo)"
+      echo "  --nccl    Build multi-GPU olmo_cpp DDP path (NCCL, no Gloo) [WIP]"
       echo "  --wgmma   Enable Hopper WGMMA GEMM in zwt (sm_90a, requires CUDA 12+)"
       exit 0
       ;;

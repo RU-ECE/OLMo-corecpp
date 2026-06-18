@@ -48,6 +48,17 @@ from olmo_core.utils import gc_cuda, get_element_size, wait_for
 from ..utils import barrier, get_fs_local_rank, is_distributed
 from .filesystem import RemoteFileSystemReader, RemoteFileSystemWriter
 
+import inspect as _inspect
+
+
+def _plan_cache_kw(_enabled: bool) -> dict:
+    """`enable_plan_caching` was added to torch's Default{Save,Load}Planner in
+    torch 2.7. On older torch (e.g. 2.6) the planners reject it, so omit the
+    kwarg there — checkpointing still works, just without plan caching."""
+    if "enable_plan_caching" in _inspect.signature(DefaultSavePlanner.__init__).parameters:
+        return {"enable_plan_caching": _enabled}
+    return {}
+
 __all__ = [
     "save_state_dict",
     "async_save_state_dict",
@@ -102,7 +113,7 @@ def save_state_dict(
     if not _skip_prepare:
         dir = _prepare_env_for_save(dir, process_group=process_group, save_overwrite=save_overwrite)
     planner = DefaultSavePlanner(
-        dedup_save_to_lowest_rank=True, enable_plan_caching=enable_plan_caching
+        dedup_save_to_lowest_rank=True, **_plan_cache_kw(enable_plan_caching)
     )
     dist_cp.state_dict_saver.save(
         state_dict,
@@ -139,7 +150,7 @@ def async_save_state_dict(
     if not _skip_prepare:
         dir = _prepare_env_for_save(dir, process_group=process_group, save_overwrite=save_overwrite)
     planner = DefaultSavePlanner(
-        dedup_save_to_lowest_rank=True, enable_plan_caching=enable_plan_caching
+        dedup_save_to_lowest_rank=True, **_plan_cache_kw(enable_plan_caching)
     )
     return dist_cp.state_dict_saver.async_save(
         state_dict,
@@ -239,7 +250,7 @@ def save_model_and_optim_state(
         flatten_optimizer_state=flatten_optimizer_state,
     )
     planner = DefaultSavePlanner(
-        dedup_save_to_lowest_rank=True, enable_plan_caching=enable_plan_caching
+        dedup_save_to_lowest_rank=True, **_plan_cache_kw(enable_plan_caching)
     )
     dist_cp.state_dict_saver.save(
         state_dict,
@@ -282,7 +293,7 @@ def async_save_model_and_optim_state(
         flatten_optimizer_state=flatten_optimizer_state,
     )
     planner = DefaultSavePlanner(
-        dedup_save_to_lowest_rank=True, enable_plan_caching=enable_plan_caching
+        dedup_save_to_lowest_rank=True, **_plan_cache_kw(enable_plan_caching)
     )
     return dist_cp.state_dict_saver.async_save(
         state_dict,

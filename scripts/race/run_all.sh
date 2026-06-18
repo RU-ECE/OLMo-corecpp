@@ -45,10 +45,20 @@ banner() {
 }
 
 phase() {
-  local num="$1"; local name="$2"; local script="$3"
+  local num="$1"; local name="$2"; local script="$3"; local soft="${4:-}"
   if should_run "$num"; then
     banner "$num" "$name"
-    bash "$HERE/$script"
+    if [[ "$soft" == "soft" ]]; then
+      # Comparison/baseline phases (Python OLMo, Python infer) depend on an
+      # external env we don't control. Don't let them abort the whole run —
+      # the C++ results and the final report must still be produced.
+      if ! bash "$HERE/$script"; then
+        printf "\n\033[1;33mWARNING: phase %s (%s) FAILED — continuing without it.\033[0m\n" "$num" "$name"
+        printf "  (the C++ side and RESULT.md still complete; the comparison column will be blank)\n"
+      fi
+    else
+      bash "$HERE/$script"
+    fi
   else
     printf "\n\033[1;33mSKIPPED phase %s (%s)\033[0m\n" "$num" "$name"
   fi
@@ -63,9 +73,9 @@ phase 01 "build C++"           01_build_cpp.sh           2>&1 | tee -a "$log"
 phase 02 "verify correctness"  02_verify_correctness.sh  2>&1 | tee -a "$log"
 phase 03 "prepare data"        03_prepare_data.sh        2>&1 | tee -a "$log"
 phase 04 "train C++"           04_train_cpp.sh           2>&1 | tee -a "$log"
-phase 05 "train Python"        05_train_python.sh        2>&1 | tee -a "$log"
+phase 05 "train Python"        05_train_python.sh   soft 2>&1 | tee -a "$log"
 phase 06 "infer C++"           06_infer_cpp.sh           2>&1 | tee -a "$log"
-phase 07 "infer Python"        07_infer_python.sh        2>&1 | tee -a "$log"
+phase 07 "infer Python"        07_infer_python.sh   soft 2>&1 | tee -a "$log"
 
 banner 08 "analyze"
 python3 "$HERE/08_analyze.py" 2>&1 | tee -a "$log"

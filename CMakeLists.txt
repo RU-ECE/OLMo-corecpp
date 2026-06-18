@@ -52,8 +52,12 @@ endif()
 # CMake's CUDA compiler probe defaults to sm_52. CUDA 13+ ptxas rejects sm_52; CUDA 12+
 # also needs real archs for BF16 kernels. Set before check_language / enable_language.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES "80;86;89;90" CACHE STRING
-    "CUDA arch list (e.g. 86 for RTX 3060, 90 for H100). Must be set before first CUDA probe.")
+  # 120 = Blackwell (RTX 50-series, e.g. 5060 Ti). REQUIRES CUDA Toolkit >= 12.8;
+  # older nvcc rejects sm_120. If the build fails on "compute_120" with an older
+  # toolkit, set -DCMAKE_CUDA_ARCHITECTURES=89 (Ada PTX is forward-compatible and
+  # JITs onto Blackwell on first launch — slower first step, but it runs).
+  set(CMAKE_CUDA_ARCHITECTURES "80;86;89;90;120" CACHE STRING
+    "CUDA arch list (86=RTX 3060, 89=RTX 40xx, 90=H100, 120=RTX 50xx/Blackwell). Must be set before first CUDA probe.")
 endif()
 
 check_language(CUDA)

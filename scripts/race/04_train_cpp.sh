@@ -13,7 +13,23 @@ mkdir -p "$results_dir"
 say() { printf "\033[1;36m[cpp]\033[0m %s\n" "$*"; }
 
 BUILD_DIR="${BUILD_DIR:-build}"
-CONF=scripts/race/configs/race_250m_cpp.conf
+
+# Pick the config by available VRAM unless the user pins one with RACE_CONF.
+# The default race conf is H100-sized (batch 32, seq 1024, gpu_data=1,
+# cuda_graph=1) and OOMs below ~40 GB; the 5060ti conf is sized for 16 GB
+# (batch 4 x grad_accum 8, gpu_data=0, cuda_graph=0, act-ckpt full).
+if [[ -n "${RACE_CONF:-}" ]]; then
+  CONF="$RACE_CONF"
+else
+  vram_mb=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+  if [[ -n "$vram_mb" && "$vram_mb" -lt 40000 ]]; then
+    CONF=scripts/race/configs/race_250m_5060ti.conf
+    say "detected ${vram_mb} MB VRAM (< 40 GB) → using 16 GB-safe config"
+  else
+    CONF=scripts/race/configs/race_250m_cpp.conf
+    say "detected ${vram_mb:-unknown} MB VRAM → using H100 config"
+  fi
+fi
 LOG="$results_dir/train.log"
 METRICS="$results_dir/metrics.csv"
 

@@ -24,8 +24,18 @@ mkdir -p data/gpt2
 # Fetch the GPT-2 tokenizer once. Both sides use GPT-2 BPE.
 if [[ ! -f "$VOCAB" || ! -f "$MERGES" ]]; then
   say "downloading GPT-2 tokenizer"
-  curl -sSL https://huggingface.co/gpt2/raw/main/vocab.json -o "$VOCAB"
-  curl -sSL https://huggingface.co/gpt2/raw/main/merges.txt -o "$MERGES"
+  # -f makes curl FAIL on HTTP errors instead of silently writing the error
+  # page into the file (which prepare_data would then tokenize as garbage).
+  curl -fsSL https://huggingface.co/gpt2/raw/main/vocab.json -o "$VOCAB" \
+    || { say "ERROR: failed to download vocab.json"; rm -f "$VOCAB"; exit 1; }
+  curl -fsSL https://huggingface.co/gpt2/raw/main/merges.txt -o "$MERGES" \
+    || { say "ERROR: failed to download merges.txt"; rm -f "$MERGES"; exit 1; }
+  python3 -c "import json; json.load(open('$VOCAB'))" \
+    || { say "ERROR: vocab.json not valid JSON (corrupt download)"; rm -f "$VOCAB"; exit 1; }
+  if [[ "$(wc -l < "$MERGES")" -lt 100 ]]; then
+    say "ERROR: merges.txt too small — corrupt download"; rm -f "$MERGES"; exit 1
+  fi
+  say "tokenizer OK"
 fi
 
 if [[ -f "$OUT" ]]; then

@@ -546,9 +546,15 @@ void train(
     graph_input  = torch::empty({cfg.batch_size, cfg.seq_len}, int_opts);
     graph_labels = torch::empty({cfg.batch_size, cfg.seq_len}, int_opts);
 
-    // ---- Warmup (always) ----
-    if (rank == 0) std::cout << "CUDA warmup (3 steps)...\n";
-    {
+    // ---- Warmup ----
+    // FSDP: params are sharded (1-D) at this point; a warmup forward would see
+    // a 1-D embedding weight ('weight must be 2-D'), and a warmup step() would
+    // size optimizer state to the FULL param. Skip warmup under FSDP — the
+    // first real step unshards, JITs kernels, and creates shard-sized state.
+    if (rank == 0) std::cout << (cfg.use_fsdp
+        ? "CUDA warmup: SKIPPED under FSDP (first step JITs kernels)\n"
+        : "CUDA warmup (3 steps)...\n");
+    if (!cfg.use_fsdp) {
       c10::cuda::CUDAStreamGuard stream_guard(capture_stream);
       for (int w = 0; w < 3; ++w) {
         if (dataset) {
@@ -572,7 +578,7 @@ void train(
         optimizer->step();
       }
     }
-    if (rank == 0) std::cout << "CUDA warmup done.\n";
+    if (rank == 0 && !cfg.use_fsdp) std::cout << "CUDA warmup done.\n";
 
     // ---- Graph capture (only when requested and OOM-safe) ----
     if (want_graph) {

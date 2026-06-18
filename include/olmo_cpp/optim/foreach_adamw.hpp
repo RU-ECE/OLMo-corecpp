@@ -87,8 +87,11 @@ class ForeachAdamW : public torch::optim::Optimizer {
   std::vector<torch::Tensor> exp_avg_sq_scratch_;
   // Master-weights mode only: parallel to params_scratch_. bf16_param_scratch_
   // holds the bf16 model params (write-back targets); params_scratch_/grads_scratch_
-  // then hold the fp32 master + fp32 upcast grads fed to the fused update.
+  // then hold the fp32 master + persistent fp32 grad buffers fed to the fused
+  // update. bf16_grad_scratch_ holds the raw bf16 grads, batch-cast into the
+  // fp32 grad buffers with a single _foreach_copy_ (instead of N per-param .to()).
   std::vector<torch::Tensor> bf16_param_scratch_;
+  std::vector<torch::Tensor> bf16_grad_scratch_;
 };
 
 }  // namespace olmo_cpp

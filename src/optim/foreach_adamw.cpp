@@ -56,6 +56,7 @@ struct ForeachAdamWParamState
   TORCH_ARG(torch::Tensor, exp_avg);     ///< First moment m, same shape as param.
   TORCH_ARG(torch::Tensor, exp_avg_sq);  ///< Second moment v, same shape as param.
   TORCH_ARG(torch::Tensor, master);      ///< fp32 master copy (master-weights mode only).
+  TORCH_ARG(torch::Tensor, fp32_grad);   ///< persistent fp32 grad buffer (master mode); scratch, not serialized.
 
   /// Save state to a checkpoint archive.
   void serialize(torch::serialize::OutputArchive& archive) const override {
@@ -122,17 +123,20 @@ torch::Tensor ForeachAdamW::step(LossClosure closure) {
     auto& exp_avg_vec = exp_avg_scratch_;
     auto& exp_avg_sq_vec = exp_avg_sq_scratch_;
     auto& bf16_param_vec = bf16_param_scratch_;  // write-back targets (master mode only)
+    auto& bf16_grad_vec = bf16_grad_scratch_;    // raw bf16 grads (master mode only)
     params_vec.clear();
     grads_vec.clear();
     exp_avg_vec.clear();
     exp_avg_sq_vec.clear();
     bf16_param_vec.clear();
+    bf16_grad_vec.clear();
     const size_t n_params = group.params().size();
     params_vec.reserve(n_params);
     grads_vec.reserve(n_params);
     exp_avg_vec.reserve(n_params);
     exp_avg_sq_vec.reserve(n_params);
     bf16_param_vec.reserve(n_params);
+    bf16_grad_vec.reserve(n_params);
 
     for (auto& p : group.params()) {
       if (!p.grad().defined()) continue;
@@ -146,11 +150,13 @@ torch::Tensor ForeachAdamW::step(LossClosure closure) {
       if (it == state_.end()) {
         auto s = std::make_unique<ForeachAdamWParamState>();
         if (master) {
-          // fp32 moments + fp32 master seeded from the current (bf16) param.
+          // fp32 moments + fp32 master seeded from the current (bf16) param,
+          // plus a persistent fp32 grad buffer reused every step.
           auto fp32_opts = p.data().options().dtype(torch::kFloat32);
           s->exp_avg(torch::zeros(p.data().sizes(), fp32_opts));
           s->exp_avg_sq(torch::zeros(p.data().sizes(), fp32_opts));
           s->master(p.data().to(torch::kFloat32));
+          s->fp32_grad(torch::empty(p.data().sizes(), fp32_opts));
         } else {
           s->exp_avg(torch::zeros_like(p.data()));
           s->exp_avg_sq(torch::zeros_like(p.data()));
@@ -160,9 +166,10 @@ torch::Tensor ForeachAdamW::step(LossClosure closure) {
 
       auto& state = static_cast<ForeachAdamWParamState&>(*it->second);
       if (master) {
-        params_vec.push_back(state.master());                  // fp32 master = optimizer's param
-        grads_vec.push_back(p.grad().to(torch::kFloat32));     // upcast grad to fp32
-        bf16_param_vec.push_back(p.data());                    // write-back target
+        params_vec.push_back(state.master());        // fp32 master = optimizer's param
+        grads_vec.push_back(state.fp32_grad());      // persistent fp32 grad buffer (filled below)
+        bf16_grad_vec.push_back(p.grad());           // raw bf16 grad (cast source)
+        bf16_param_vec.push_back(p.data());          // write-back target
       } else {
         params_vec.push_back(p.data());
         grads_vec.push_back(p.grad());
@@ -172,6 +179,12 @@ torch::Tensor ForeachAdamW::step(LossClosure closure) {
     }
 
     if (params_vec.empty()) continue;
+
+    // Master mode: batch-cast all bf16 grads -> the persistent fp32 grad buffers
+    // in ONE fused launch, instead of N per-param p.grad().to(fp32) calls (each
+    // a separate kernel launch + allocation). This is the bulk of the master-
+    // weights per-step overhead. After this, grads_vec holds the fp32 grads.
+    if (master) at::_foreach_copy_(grads_vec, bf16_grad_vec, /*non_blocking=*/false);
 
     // Item P: when available, dispatch the whole AdamW step (param decay,
     // moment updates, denom, parameter update) as a single fused CUDA

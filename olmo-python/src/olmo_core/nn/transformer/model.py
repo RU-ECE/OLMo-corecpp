@@ -780,7 +780,13 @@ class Transformer(nn.Module):
         if self.lm_head is not None:
             self.lm_head.compile(fullgraph=False)
 
-        torch.compiler.config.dynamic_sources += "L['kwargs']['max_doc_len'],"
+        # `torch.compiler.config.dynamic_sources` was added in torch 2.7. Guard
+        # it so OLMo-core's compile path still runs on torch 2.6 — the dynamic-
+        # shape source hint is simply skipped while torch.compile itself stays
+        # enabled (so the Python baseline is NOT handicapped vs the C++ side).
+        # Without this guard apply_compile() raises AttributeError on torch <2.7.
+        if hasattr(torch.compiler.config, "dynamic_sources"):
+            torch.compiler.config.dynamic_sources += "L['kwargs']['max_doc_len'],"
         self._compile_enabled = True
 
     def apply_fsdp(

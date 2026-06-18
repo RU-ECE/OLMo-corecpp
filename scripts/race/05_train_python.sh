@@ -24,10 +24,20 @@ METRICS="$results_dir/metrics.csv"
 # ── Ensure OLMo-core is importable ──
 if ! python3 -c "import olmo_core" 2>/dev/null; then
   if [[ -d olmo-python && -f olmo-python/pyproject.toml ]]; then
-    say "installing in-repo OLMo-core (olmo-python/) — editable, no deps churn"
-    pip3 install -e olmo-python 2>&1 | tail -5 || \
-      fail "pip install -e olmo-python failed. Inspect the error above.
-       You can also: cd olmo-python && pip install -e . && cd .."
+    say "installing in-repo OLMo-core (olmo-python/) — editable"
+    # Modern Debian/Ubuntu/Pop OS mark the system Python "externally managed"
+    # (PEP 668) and block `pip install` without a venv. Try the clean install
+    # first; if PEP 668 blocks it, retry with --break-system-packages (this is
+    # the in-repo OLMo-core, installed editable, so it only adds a .pth entry).
+    if ! pip3 install -e olmo-python; then
+      say "pip blocked (likely PEP 668 externally-managed env) — retrying with --break-system-packages"
+      pip3 install --break-system-packages -e olmo-python || \
+        fail "pip install -e olmo-python failed even with --break-system-packages.
+       Best fix is a venv:
+         python3 -m venv .race_venv && source .race_venv/bin/activate
+         pip install -e olmo-python
+       then re-run the race inside that venv."
+    fi
   else
     fail "olmo-python/ not found and olmo_core not importable.
        Expected the Python OLMo-core at $(pwd)/olmo-python"

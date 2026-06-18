@@ -109,6 +109,10 @@ struct TrainConfig {
   int64_t checkpoint_interval = 1000;
   /// Keep at most this many recent checkpoints (older are pruned).
   int keep_checkpoints = 3;
+  /// Resume from the latest checkpoint in checkpoint_dir if one exists
+  /// (restores model + optimizer + step). Lets a multi-day run survive a
+  /// crash: just relaunch. No-op when checkpoint_dir is empty or has none.
+  bool resume = false;
 
   // Sequence/batch scheduling
   /// Target seq_len at end of curriculum ramp; -1 disables (constant seq_len).

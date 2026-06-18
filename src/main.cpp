@@ -292,6 +292,7 @@ int main(int argc, char** argv) {
     train_cfg.checkpoint_dir      = train_ini.get_or<std::string>("checkpoint_dir", "");
     train_cfg.checkpoint_interval = train_ini.get_or<int64_t>("checkpoint_interval", 1000);
     train_cfg.keep_checkpoints    = train_ini.get_or<int>("keep_checkpoints", 3);
+    train_cfg.resume              = train_ini.get_or<bool>("resume", false);
 
     // Sequence/batch curriculum scheduling
     train_cfg.target_seq_len       = train_ini.get_or<int64_t>("target_seq_len", -1);

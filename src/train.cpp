@@ -614,8 +614,27 @@ void train(
   }
 #endif  // USE_CUDA
 
+  // ---- Resume from latest checkpoint (multi-day runs survive crashes) ----
+  // Restores model + optimizer state + step from the newest checkpoint in
+  // checkpoint_dir. Relaunch after a crash and it picks up where it stopped.
+  int64_t start_step = 0;
+  if (ckpt_mgr && cfg.resume) {
+    auto tag = ckpt_mgr->latest();
+    if (tag) {
+      auto meta = ckpt_mgr->load(*tag, *model, *optimizer,
+                                 rank, ddp ? ddp->world_size() : 1);
+      start_step = meta.step;
+      if (rank == 0)
+        std::cout << "RESUME: loaded '" << *tag << "' at step " << start_step
+                  << " (loss " << meta.loss << ") — continuing.\n";
+    } else if (rank == 0) {
+      std::cout << "RESUME: no checkpoint in " << cfg.checkpoint_dir
+                << " — starting fresh.\n";
+    }
+  }
+
   // ---- Training loop ----
-  for (int64_t step = 0; step < cfg.num_steps; ++step) {
+  for (int64_t step = start_step; step < cfg.num_steps; ++step) {
     state.step_start = std::chrono::steady_clock::now();
     state.global_step = step;
 
@@ -876,6 +895,17 @@ void train(
       _last_ckpt = ckpt_mgr->save_async(tag, *model, *optimizer, meta, rank,
                                          ddp ? ddp->world_size() : 1);
       ckpt_mgr->prune(cfg.keep_checkpoints);
+      // Also drop a single-file <checkpoint_dir>/latest.pt (rank 0, full model)
+      // so `chat`/inference can load the in-progress model WITHOUT stopping the
+      // run. The sharded save above is for resume; this one is for using it.
+      // (DDP: rank 0 holds the full model. Skip under FSDP — rank 0 has shards.)
+      if (rank == 0 && !cfg.use_fsdp) {
+        try {
+          torch::save(*model, cfg.checkpoint_dir + "/latest.pt");
+        } catch (const std::exception& e) {
+          std::cerr << "WARN: latest.pt export failed: " << e.what() << "\n";
+        }
+      }
       cb_mgr.on_checkpoint_save(state, cfg.checkpoint_dir + "/" + tag);
     }
   }

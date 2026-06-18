@@ -901,7 +901,7 @@ void train(
       // (DDP: rank 0 holds the full model. Skip under FSDP — rank 0 has shards.)
       if (rank == 0 && !cfg.use_fsdp) {
         try {
-          torch::save(*model, cfg.checkpoint_dir + "/latest.pt");
+          torch::save(model, cfg.checkpoint_dir + "/latest.pt");  // holder, not *model
         } catch (const std::exception& e) {
           std::cerr << "WARN: latest.pt export failed: " << e.what() << "\n";
         }

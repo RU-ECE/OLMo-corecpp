@@ -82,7 +82,7 @@ void cnpy::parse_npy_header(unsigned char* buffer,size_t& word_size, std::vector
 
     std::string str_shape = header.substr(loc1+1,loc2-loc1-1);
     while(std::regex_search(str_shape, sm, num_regex)) {
-        shape.push_back(std::stoi(sm[0].str()));
+        shape.push_back(std::stoll(sm[0].str()));  // stoll not stoi: a >2.1B-token shape overflows 32-bit int ("Error: stoi")
         str_shape = sm.suffix().str();
     }
 
@@ -130,7 +130,7 @@ void cnpy::parse_npy_header(FILE* fp, size_t& word_size, std::vector<size_t>& sh
 
     std::string str_shape = header.substr(loc1+1,loc2-loc1-1);
     while(std::regex_search(str_shape, sm, num_regex)) {
-        shape.push_back(std::stoi(sm[0].str()));
+        shape.push_back(std::stoll(sm[0].str()));  // stoll not stoi: a >2.1B-token shape overflows 32-bit int ("Error: stoi")
         str_shape = sm.suffix().str();
     }
 

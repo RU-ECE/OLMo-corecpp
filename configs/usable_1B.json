@@ -15,6 +15,6 @@
   "attention_backend": "sdpa",
   "hidden_size_multiple_of": 256,
   "hidden_size_multiplier": 1.0,
-  "num_mtp_heads": 3,
+  "num_mtp_heads": 0,
   "mtp_loss_weight": 0.1
 }

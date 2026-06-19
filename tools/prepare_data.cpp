@@ -362,11 +362,24 @@ int main(int argc, char* argv[]) {
     auto tok_start = std::chrono::steady_clock::now();
 
     auto process_file = [&](const std::string& path) {
-      std::string text = read_file(path);
-      if (text.empty()) return;
+      std::string content = read_file(path);
+      if (content.empty()) return;
       std::vector<uint32_t> ids;
-      tokenizer.encode_append(text, ids);
-      ids.push_back(tokenizer.eos_id());
+      // For .jsonl (e.g. C4, FineWeb), tokenize only the document text field —
+      // NOT the raw JSON ({"text":...,"url":...,"timestamp":...}), so the model
+      // doesn't waste capacity learning JSON syntax/URLs. One EOS per document.
+      bool is_jsonl = path.size() >= 6 && path.compare(path.size() - 6, 6, ".jsonl") == 0;
+      if (is_jsonl) {
+        for (auto& doc : extract_text_from_jsonl(content)) {
+          if (doc.empty()) continue;
+          tokenizer.encode_append(doc, ids);
+          ids.push_back(tokenizer.eos_id());
+        }
+      } else {
+        tokenizer.encode_append(content, ids);
+        ids.push_back(tokenizer.eos_id());
+      }
+      if (ids.empty()) return;
       {
         std::lock_guard<std::mutex> lock(out_mutex);
         if (all_tokens.size() + ids.size() <= max_tokens) {

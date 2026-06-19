@@ -121,7 +121,11 @@ namespace cnpy {
         }
 
         std::vector<char> header = create_npy_header<T>(true_data_shape);
-        size_t nels = std::accumulate(shape.begin(),shape.end(),1,std::multiplies<size_t>());
+        // NOTE: init value MUST be size_t(1), not 1. A literal 1 makes
+        // std::accumulate sum into a 32-bit int, overflowing at 2^31 elements;
+        // a >2.1B-element array (e.g. a 7.7B-token corpus) then writes ~0 bytes
+        // of data -> an 80-byte header-only .npy. size_t(1) keeps it 64-bit.
+        size_t nels = std::accumulate(shape.begin(),shape.end(),size_t(1),std::multiplies<size_t>());
 
         fseek(fp,0,SEEK_SET);
         fwrite(&header[0],sizeof(char),header.size(),fp);
@@ -164,7 +168,7 @@ namespace cnpy {
 
         std::vector<char> npy_header = create_npy_header<T>(shape);
 
-        size_t nels = std::accumulate(shape.begin(),shape.end(),1,std::multiplies<size_t>());
+        size_t nels = std::accumulate(shape.begin(),shape.end(),size_t(1),std::multiplies<size_t>());  // size_t(1): avoid 32-bit overflow >2^31 elems
         size_t nbytes = nels*sizeof(T) + npy_header.size();
 
         //get the CRC of the data to be added

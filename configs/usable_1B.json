@@ -8,7 +8,7 @@
   "rope_theta": 500000,
   "layer_norm_eps": 1e-5,
   "init_std": 0.02,
-  "use_qk_norm": false,
+  "use_qk_norm": true,
   "use_head_qk_norm": false,
   "block_type": "reordered_norm",
   "layer_norm_type": "rms_norm",

@@ -895,7 +895,16 @@ int main(int argc, char** argv) {
     olmo_cpp::Transformer model(cfg);
     // Remap serialized tensors to CPU — checkpoints may embed MPS/CUDA
     // device tags from the training host; we move to `device` next.
-    torch::load(model, checkpoint_path, torch::kCPU);
+    // bf16-trained checkpoints store BF16 weights; an fp32 model mismatches
+    // storage size on load, so try fp32 then fall back to a BF16 model.
+    try {
+      torch::load(model, checkpoint_path, torch::kCPU);
+    } catch (const c10::Error&) {
+      model = olmo_cpp::Transformer(cfg);
+      model->to(torch::kBFloat16);
+      torch::load(model, checkpoint_path, torch::kCPU);
+      if (device.type() != torch::kCUDA) model->to(torch::kFloat32);
+    }
 
     // (fast-inference [17]) Optional draft model for two-model speculative.
     std::unique_ptr<olmo_cpp::Transformer> draft_model;

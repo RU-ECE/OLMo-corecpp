@@ -144,7 +144,17 @@ int main(int argc, char** argv) {
 #endif
 
   olmo_cpp::Transformer model(cfg);
-  torch::load(model, checkpoint_path, torch::kCPU);
+  // bf16-trained checkpoints store BF16 weights; an fp32 model mismatches storage
+  // size on load. Try fp32, fall back to casting the model to BF16 first.
+  try {
+    torch::load(model, checkpoint_path, torch::kCPU);
+  } catch (const c10::Error&) {
+    model = olmo_cpp::Transformer(cfg);
+    model->to(torch::kBFloat16);
+    torch::load(model, checkpoint_path, torch::kCPU);
+    // Upcast to fp32 unless the device is CUDA (where bf16 inference is fast).
+    if (device.type() != torch::kCUDA) model->to(torch::kFloat32);
+  }
   model->to(device);
   model->eval();
   torch::NoGradGuard no_grad;

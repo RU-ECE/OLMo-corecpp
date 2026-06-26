@@ -341,6 +341,10 @@ static void load_base_nonstrict(Transformer& model, const TransformerConfig& mod
                                 const std::string& path, int rank) {
   auto base_cfg = model_cfg;
   base_cfg.num_mtp_heads = 0;
+  base_cfg.use_dora = false;   // the base .pt is a plain model (no dora_* submodules);
+                               // building the base-shaped model with DoRA made the strict
+                               // load fail ('No such serialized submodule: dora_q'). The
+                               // finetune model's host Linears (w_q ...) still match by name.
   Transformer base(base_cfg);
   try {
     torch::load(base, path, torch::kCPU);

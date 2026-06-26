@@ -84,6 +84,7 @@ TransformerConfig load_config_from_json(const std::string& path) {
   cfg.init_std = j.value("init_std", cfg.init_std);
   cfg.use_qk_norm = j.value("use_qk_norm", cfg.use_qk_norm);
   cfg.use_head_qk_norm = j.value("use_head_qk_norm", cfg.use_head_qk_norm);
+  cfg.use_embedding_norm = j.value("use_embedding_norm", cfg.use_embedding_norm);
   cfg.hidden_size_multiple_of = j.value("hidden_size_multiple_of", cfg.hidden_size_multiple_of);
   cfg.hidden_size_multiplier = j.value("hidden_size_multiplier", cfg.hidden_size_multiplier);
   if (j.contains("embed_scale")) cfg.embed_scale = j["embed_scale"].get<double>();

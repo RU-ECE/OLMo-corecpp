@@ -180,7 +180,7 @@ torch::Tensor TransformerImpl::forward_backbone(
     // Scale only applies to plain embeddings; multi-res has its own projections
     h = h * *embed_scale_;
   }
-  h = (*embedding_norm_)(h);
+  if (config_.use_embedding_norm) h = (*embedding_norm_)(h);  // OLMo-2 feeds raw embeddings (flag off)
 
   auto new_seq_len = input_ids.size(1);
   auto device = input_ids.device();
@@ -232,7 +232,7 @@ torch::Tensor TransformerImpl::forward_backbone_paged(
   if (embed_scale_ && !use_multi_res_) {
     h = h * *embed_scale_;
   }
-  h = (*embedding_norm_)(h);
+  if (config_.use_embedding_norm) h = (*embedding_norm_)(h);  // OLMo-2 feeds raw embeddings (flag off)
 
   const auto new_seq_len = input_ids.size(1);
   const auto device      = input_ids.device();
@@ -269,7 +269,7 @@ torch::Tensor TransformerImpl::forward_tree(torch::Tensor input_ids,
       ? multi_res_embed_->forward(input_ids)
       : embeddings_(input_ids);
   if (embed_scale_ && !use_multi_res_) h = h * *embed_scale_;
-  h = (*embedding_norm_)(h);
+  if (config_.use_embedding_norm) h = (*embedding_norm_)(h);  // OLMo-2 feeds raw embeddings (flag off)
 
   const int64_t N = input_ids.size(1);
   auto device = input_ids.device();

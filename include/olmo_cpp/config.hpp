@@ -87,6 +87,11 @@ struct TransformerConfig {
   /// Apply per-head QK norm (one scale parameter per head) instead of one
   /// shared scale. Off by default.
   bool use_head_qk_norm = false;
+  /// Apply an RMSNorm to the token embeddings before the first block. TRUE for
+  /// our own pretrained models. OLMo-2 (and most HF Llama-style models) feed the
+  /// RAW embedding into block 0 — set FALSE when loading those, or the extra
+  /// normalization corrupts every forward (real-but-incoherent output).
+  bool use_embedding_norm = true;
   /// FFN hidden size is rounded up to a multiple of this (matches the GPU
   /// matmul tile size for tensor cores). 256 keeps cuBLAS happy.
   int64_t hidden_size_multiple_of = 256;

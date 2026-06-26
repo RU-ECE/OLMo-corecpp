@@ -16,5 +16,6 @@
   "layer_norm_type": "rms_norm",
   "hidden_size_multiple_of": 256,
   "hidden_size_multiplier": 1.0,
+  "use_embedding_norm": false,
   "num_mtp_heads": 0
 }

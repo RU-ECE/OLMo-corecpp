@@ -99,9 +99,17 @@ std::string hf_to_olmo_name(const std::string& hf_name) {
     if (suffix == "mlp.up_proj.weight") return prefix + ".feed_forward.w3.weight";
     if (suffix == "mlp.down_proj.weight") return prefix + ".feed_forward.w2.weight";
 
-    // Layer norms
-    if (suffix == "input_layernorm.weight") return prefix + ".attention_norm.weight";
-    if (suffix == "post_attention_layernorm.weight") return prefix + ".feed_forward_norm.weight";
+    // Layer norms — OLMo-2 uses POST-norm (reordered_norm), confirmed against
+    // block.cpp: attention_norm normalizes the attention OUTPUT, feed_forward_norm
+    // the FFN OUTPUT. So:
+    //   post_attention_layernorm   -> attention_norm
+    //   post_feedforward_layernorm -> feed_forward_norm
+    // (The previous mapping assumed Llama pre-norm names: it left attention_norm
+    //  random and dropped post_feedforward_layernorm -> the 32 skipped tensors ->
+    //  garbage generation.)
+    if (suffix == "post_attention_layernorm.weight")   return prefix + ".attention_norm.weight";
+    if (suffix == "post_feedforward_layernorm.weight") return prefix + ".feed_forward_norm.weight";
+    if (suffix == "input_layernorm.weight")            return prefix + ".attention_norm.weight";  // Llama pre-norm fallback
 
     return hf_name;  // unmapped
   }

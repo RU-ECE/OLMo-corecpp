@@ -168,6 +168,13 @@ TransformerConfig load_config_from_json(const std::string& path) {
   cfg.num_mtp_heads = j.value("num_mtp_heads", cfg.num_mtp_heads);
   cfg.mtp_loss_weight = j.value("mtp_loss_weight", cfg.mtp_loss_weight);
 
+  // DoRA (so chat/inference can rebuild + load a DoRA-finetuned checkpoint:
+  // the .pt has the base Linears + adapter params; the model must be built with
+  // use_dora to match, then the adapters apply in the forward).
+  cfg.use_dora = j.value("use_dora", cfg.use_dora);
+  cfg.dora_rank = j.value("dora_rank", cfg.dora_rank);
+  cfg.dora_alpha = j.value("dora_alpha", cfg.dora_alpha);
+
   // Float8
   cfg.use_float8 = j.value("use_float8", cfg.use_float8);
 

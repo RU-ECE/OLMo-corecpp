@@ -180,7 +180,12 @@ int main(int argc, char** argv) {
     // mutate the underlying tensor in-place.
     // -----------------------------------------------------------------
     std::unordered_map<std::string, torch::Tensor*> our_params;
-    for (auto& item : model->named_parameters()) {
+    // named_parameters() returns an OrderedDict BY VALUE — bind it to a named
+    // variable so it outlives the loop below AND the copy loop in Phase 6.
+    // Iterating the temporary directly and storing &item.value() left dangling
+    // pointers (the dict was destroyed at the loop's end) -> segfault at .sizes().
+    auto named_params = model->named_parameters();
+    for (auto& item : named_params) {
       our_params[item.key()] = &item.value();
     }
 

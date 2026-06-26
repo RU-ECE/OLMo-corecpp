@@ -90,6 +90,15 @@ class TokenDataset {
   /// Check if the dataset is GPU-resident
   bool is_gpu_resident() const { return gpu_resident_; }
 
+  /// SFT loss masking. Load a parallel .npy (same length as the token array;
+  /// uint8/int) where 1 = train on this position, 0 = ignore. When set,
+  /// prepare_batch_cpu() sets labels to -100 (ignore_index) wherever the mask at
+  /// the LABEL position is 0 — the trainer's CE then trains ONLY on unmasked
+  /// (assistant) tokens. Use the CPU/streaming path (gpu_data=0) for SFT; the
+  /// GPU-resident fast path does NOT apply the mask.
+  void set_loss_mask(const std::string& mask_npy_path);
+  bool has_loss_mask() const { return mask_tensor_.defined(); }
+
  private:
   /// Prepare a batch on CPU (no device transfer yet)
   std::tuple<torch::Tensor, torch::Tensor> prepare_batch_cpu(int64_t batch_size);
@@ -102,6 +111,7 @@ class TokenDataset {
 
   std::vector<int64_t> tokens_;
   torch::Tensor tokens_tensor_;  // Pre-built CPU tensor for fast gather (pinned after to_device streaming)
+  torch::Tensor mask_tensor_;    // SFT loss mask [N] int64 (1=train, 0=ignore); empty = no masking
   int64_t seq_len_;
   int64_t num_chunks_;
   bool shuffle_;

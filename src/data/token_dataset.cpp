@@ -191,7 +191,37 @@ std::tuple<torch::Tensor, torch::Tensor> TokenDataset::prepare_batch_cpu(int64_t
   auto input = tokens_tensor_.index_select(0, input_indices.reshape(-1)).reshape({batch_size, seq_len_});
   auto labels = tokens_tensor_.index_select(0, label_indices.reshape(-1)).reshape({batch_size, seq_len_});
 
+  // SFT loss masking: ignore (-100) every label position whose mask bit is 0, so
+  // the CE loss counts only assistant tokens. Indexed at the LABEL positions to
+  // match how labels are gathered.
+  if (mask_tensor_.defined()) {
+    auto lab_mask = mask_tensor_.index_select(0, label_indices.reshape(-1)).reshape({batch_size, seq_len_});
+    labels = labels.masked_fill(lab_mask == 0, -100);
+  }
+
   return {input, labels};
+}
+
+void TokenDataset::set_loss_mask(const std::string& mask_npy_path) {
+  cnpy::NpyArray arr = cnpy::npy_load(mask_npy_path);
+  size_t n = arr.num_vals;
+  if (n != tokens_.size()) {
+    throw std::runtime_error("TokenDataset::set_loss_mask: mask length " +
+        std::to_string(n) + " != token length " + std::to_string(tokens_.size()));
+  }
+  std::vector<int64_t> mv;
+  mv.reserve(n);
+  if (arr.word_size == 1) { const uint8_t* d = arr.data<uint8_t>();
+    for (size_t i = 0; i < n; ++i) mv.push_back(static_cast<int64_t>(d[i])); }
+  else if (arr.word_size == 2) { const uint16_t* d = arr.data<uint16_t>();
+    for (size_t i = 0; i < n; ++i) mv.push_back(static_cast<int64_t>(d[i])); }
+  else if (arr.word_size == 4) { const uint32_t* d = arr.data<uint32_t>();
+    for (size_t i = 0; i < n; ++i) mv.push_back(static_cast<int64_t>(d[i])); }
+  else if (arr.word_size == 8) { const int64_t* d = arr.data<int64_t>();
+    for (size_t i = 0; i < n; ++i) mv.push_back(d[i]); }
+  else throw std::runtime_error("TokenDataset::set_loss_mask: unsupported mask dtype");
+  mask_tensor_ = torch::from_blob(mv.data(), {static_cast<int64_t>(n)},
+                                  torch::TensorOptions().dtype(torch::kInt64)).clone();
 }
 
 std::tuple<torch::Tensor, torch::Tensor> TokenDataset::get_batch(

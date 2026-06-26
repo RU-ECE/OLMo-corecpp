@@ -749,6 +749,7 @@ int main(int argc, char** argv) {
   // automatically uses make_paged_kv_cache_graph_safe so K/V writes go
   // through the dyn write kernel and replays land in the right slot.
   bool use_cuda_graph = false;
+  bool instruct_mode = false;  // wrap turns in the OLMo-2 <|user|>/<|assistant|> template
   int64_t cuda_graph_warmup_steps = 2;
 
   for (int i = 1; i < argc; ++i) {
@@ -789,6 +790,7 @@ int main(int argc, char** argv) {
     else if (arg == "--cuda-graph") use_cuda_graph = true;
     else if (arg == "--cuda-graph-warmup" && i + 1 < argc)
       cuda_graph_warmup_steps = std::stoll(argv[++i]);
+    else if (arg == "--instruct") instruct_mode = true;
   }
 
   if (checkpoint_path.empty() || config_path.empty() || vocab_path.empty() || merges_path.empty()) {
@@ -1002,6 +1004,16 @@ int main(int argc, char** argv) {
         continue;
       }
       if (prompt.empty()) continue;
+
+      if (instruct_mode) {
+        // OLMo-2-Instruct template: <|endoftext|> (bos) once at the start, then
+        // <|user|>\n{q}\n<|assistant|>\n each turn. The model ends its turn with
+        // <|endoftext|> (eos), which also stops generation. <|user|>/<|assistant|>
+        // are plain text (not special tokens) — BPE-encoded as OLMo-2 trained them.
+        if (all_tokens.empty())
+          all_tokens.push_back(static_cast<int64_t>(tokenizer.eos_id()));
+        prompt = "<|user|>\n" + prompt + "\n<|assistant|>\n";
+      }
 
       prompt_ids.clear();
       encode_text_into(prompt, prompt_ids);

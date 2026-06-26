@@ -93,6 +93,7 @@ int main(int argc, char** argv) {
   int64_t batch = 1;
   int64_t warmup = 3;
   int64_t iters = 5;
+  bool force_bf16 = false;  // cast model to BF16 for inference (tensor cores)
 
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -108,6 +109,7 @@ int main(int argc, char** argv) {
     else if (a == "--warmup" && i + 1 < argc) warmup = std::stoll(next());
     else if (a == "--iters" && i + 1 < argc) iters = std::stoll(next());
     else if (a == "--output" && i + 1 < argc) output_path = next();
+    else if (a == "--bf16") force_bf16 = true;
     else if (a == "--help" || a == "-h") {
       std::cerr << "Usage: bench_chat --checkpoint <path> --config <path> "
                    "--vocab-file <path> --merges-file <path> "
@@ -155,6 +157,7 @@ int main(int argc, char** argv) {
     // Upcast to fp32 unless the device is CUDA (where bf16 inference is fast).
     if (device.type() != torch::kCUDA) model->to(torch::kFloat32);
   }
+  if (force_bf16) model->to(torch::kBFloat16);  // tensor-core inference for an fp32 .pt
   model->to(device);
   model->eval();
   torch::NoGradGuard no_grad;

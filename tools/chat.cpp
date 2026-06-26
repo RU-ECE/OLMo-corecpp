@@ -750,6 +750,7 @@ int main(int argc, char** argv) {
   // through the dyn write kernel and replays land in the right slot.
   bool use_cuda_graph = false;
   bool instruct_mode = false;  // wrap turns in the OLMo-2 <|user|>/<|assistant|> template
+  bool force_bf16 = false;     // cast model to BF16 for inference (tensor cores)
   int64_t cuda_graph_warmup_steps = 2;
 
   for (int i = 1; i < argc; ++i) {
@@ -791,6 +792,7 @@ int main(int argc, char** argv) {
     else if (arg == "--cuda-graph-warmup" && i + 1 < argc)
       cuda_graph_warmup_steps = std::stoll(argv[++i]);
     else if (arg == "--instruct") instruct_mode = true;
+    else if (arg == "--bf16") force_bf16 = true;
   }
 
   if (checkpoint_path.empty() || config_path.empty() || vocab_path.empty() || merges_path.empty()) {
@@ -923,6 +925,7 @@ int main(int argc, char** argv) {
       std::cout << "Note: --draft-checkpoint and --draft-config must both be set"
                    " for two-model speculative; ignoring partial spec.\n";
     }
+    if (force_bf16) model->to(torch::kBFloat16);  // tensor-core inference for an fp32 .pt
     model->to(device);
     model->eval();
 

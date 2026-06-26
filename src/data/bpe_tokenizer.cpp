@@ -359,6 +359,19 @@ bool BPETokenizer::load(const std::string& vocab_path,
   for (const auto& [tok, id] : vocab_) {
     if (id < id_to_token_.size()) id_to_token_[id] = tok;
   }
+
+  // Detect special tokens (<|...|>) so encode_append emits them atomically
+  // instead of BPE-splitting them. Sort longest-first for greedy matching.
+  special_tokens_.clear();
+  for (const auto& [tok, id] : vocab_) {
+    if (tok.size() >= 4 && tok.compare(0, 2, "<|") == 0 &&
+        tok.compare(tok.size() - 2, 2, "|>") == 0) {
+      special_tokens_.emplace_back(tok, id);
+    }
+  }
+  std::sort(special_tokens_.begin(), special_tokens_.end(),
+            [](const auto& a, const auto& b) { return a.first.size() > b.first.size(); });
+
   std::ifstream mf(merges_path);
   if (!mf) return false;
   std::string line;
@@ -390,14 +403,39 @@ std::vector<uint32_t> BPETokenizer::encode(const std::string& text) {
 
 void BPETokenizer::encode_append(const std::string& text,
                                 std::vector<uint32_t>& out) {
-  // Pre-tokenize: split text into chunks respecting word boundaries
-  auto chunks = pre_tokenize(text);
+  auto bpe_segment = [&](const std::string& seg) {
+    for (const auto& chunk : pre_tokenize(seg)) {
+      auto ids = bpe_encode_chunk(chunk);
+      out.insert(out.end(), ids.begin(), ids.end());
+    }
+  };
 
-  // BPE-encode each chunk independently
-  for (const auto& chunk : chunks) {
-    auto ids = bpe_encode_chunk(chunk);
-    out.insert(out.end(), ids.begin(), ids.end());
+  if (special_tokens_.empty()) {  // plain corpora: original fast path
+    bpe_segment(text);
+    return;
   }
+
+  // ChatML / instruct text: emit special tokens (<|im_start|> etc.) atomically,
+  // BPE-encoding only the spans between them.
+  const size_t n = text.size();
+  size_t seg_start = 0, i = 0;
+  while (i < n) {
+    bool matched = false;
+    if (text[i] == '<' && i + 1 < n && text[i + 1] == '|') {
+      for (const auto& [tok, id] : special_tokens_) {  // longest-first
+        if (i + tok.size() <= n && text.compare(i, tok.size(), tok) == 0) {
+          if (i > seg_start) bpe_segment(text.substr(seg_start, i - seg_start));
+          out.push_back(id);
+          i += tok.size();
+          seg_start = i;
+          matched = true;
+          break;
+        }
+      }
+    }
+    if (!matched) ++i;
+  }
+  if (n > seg_start) bpe_segment(text.substr(seg_start));
 }
 
 std::string BPETokenizer::decode(const std::vector<uint32_t>& ids) {

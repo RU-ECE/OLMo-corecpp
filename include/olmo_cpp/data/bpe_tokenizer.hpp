@@ -110,6 +110,20 @@ class BPETokenizer {
   std::unordered_map<uint32_t, uint8_t> unicode_to_byte_; // reverse mapping for decode
   uint32_t eos_id_ = 50256;                               // default GPT-2 EOS, overwritten by load()
   bool legacy_decode_ = false;                            // decode token 33 as space (for old-trained checkpoints)
+
+  // Special tokens (e.g. <|im_start|>, <|im_end|>, <|endoftext|>) are matched
+  // ATOMICALLY in encode_append — emitted as their single id, never BPE-split —
+  // so ChatML templates round-trip. Detected from the vocab during load() (keys
+  // of the form <|...|>), sorted longest-first for greedy matching.
+  std::vector<std::pair<std::string, uint32_t>> special_tokens_;
+
+ public:
+  /// Look up a special token's id by its literal string (e.g. "<|im_start|>").
+  /// Returns -1 if absent. Used by chat to set stop tokens / build templates.
+  int64_t special_id(const std::string& tok) const {
+    auto it = vocab_.find(tok);
+    return it == vocab_.end() ? -1 : static_cast<int64_t>(it->second);
+  }
 };
 
 }  // namespace olmo_cpp

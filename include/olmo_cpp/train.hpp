@@ -99,6 +99,21 @@ struct TrainConfig {
   std::optional<std::string> data_path;
   /// Optional held-out eval corpus path.
   std::optional<std::string> eval_data_path;
+
+  // ── Finetuning (SFT / DoRA / MTP retrofit) ──────────────────────────────
+  /// SFT loss mask .npy (same length as data_path tokens; 1=train, 0=ignore).
+  /// When set, only assistant tokens contribute to the loss. Requires gpu_data=0.
+  std::optional<std::string> sft_mask_path;
+  /// Base checkpoint to NON-STRICTLY load before training (e.g. the converted
+  /// OLMo-2 .pt). Matching params load; params absent from the base (e.g. fresh
+  /// MTP heads) keep their init. Enables MTP-head retrofit on a borrowed base.
+  std::optional<std::string> finetune_from;
+  /// DoRA (weight-decomposed LoRA): freeze the base weights, train only low-rank
+  /// adapters + a magnitude vector on the attention/FFN Linears. Fits a 7B
+  /// finetune on one GPU. See olmo_cpp/model/dora.hpp.
+  bool use_dora = false;
+  int dora_rank = 16;
+  double dora_alpha = 32.0;
   /// Steps between eval passes when an evaluator is wired up.
   int64_t eval_interval = 500;  // steps between evals
 

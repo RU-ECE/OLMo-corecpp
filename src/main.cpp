@@ -173,6 +173,7 @@ int main(int argc, char** argv) {
     cfg.init_std            = model_ini.get_or<double>("init_std", 0.02);
     cfg.use_qk_norm         = model_ini.get_or<bool>("use_qk_norm", true);
     cfg.use_head_qk_norm    = model_ini.get_or<bool>("use_head_qk_norm", false);
+    cfg.use_embedding_norm  = model_ini.get_or<bool>("use_embedding_norm", true);  // OLMo-2: set 0
     cfg.hidden_size_multiple_of = model_ini.get_or<int64_t>("hidden_size_multiple_of", 256);
     cfg.hidden_size_multiplier  = model_ini.get_or<double>("hidden_size_multiplier", 1.5);
     cfg.num_mtp_heads       = model_ini.get_or<int64_t>("num_mtp_heads", 0);
@@ -287,6 +288,17 @@ int main(int argc, char** argv) {
     if (train_cfg.eval_data_path && train_cfg.eval_data_path->empty())
       train_cfg.eval_data_path = std::nullopt;
     train_cfg.eval_interval    = train_ini.get_or<int64_t>("eval_interval", 500);
+
+    // Finetuning (SFT loss mask / non-strict base load / DoRA)
+    {
+      auto m = train_ini.get_or<std::string>("sft_mask_path", "");
+      if (!m.empty()) train_cfg.sft_mask_path = m;
+      auto f = train_ini.get_or<std::string>("finetune_from", "");
+      if (!f.empty()) train_cfg.finetune_from = f;
+    }
+    train_cfg.use_dora   = train_ini.get_or<bool>("dora", false);
+    train_cfg.dora_rank  = train_ini.get_or<int>("dora_rank", 16);
+    train_cfg.dora_alpha = train_ini.get_or<double>("dora_alpha", 32.0);
 
     // Checkpointing
     train_cfg.checkpoint_dir      = train_ini.get_or<std::string>("checkpoint_dir", "");

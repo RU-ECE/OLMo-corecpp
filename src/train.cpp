@@ -332,6 +332,41 @@ void train_epoch(
 // Full-featured train() with all infrastructure
 // ---------------------------------------------------------------------------
 
+// Non-strict base load for finetuning + MTP retrofit. The base .pt was saved
+// with num_mtp_heads=0; the finetune model is built with MTP heads. Build a
+// base-shaped model (mtp=0) matching the checkpoint, strict-load it, then copy
+// matching params into the finetune model by name. Params absent from the base
+// (the fresh MTP heads) keep their init. Avoids torch::load's strict key match.
+static void load_base_nonstrict(Transformer& model, const TransformerConfig& model_cfg,
+                                const std::string& path, int rank) {
+  auto base_cfg = model_cfg;
+  base_cfg.num_mtp_heads = 0;
+  Transformer base(base_cfg);
+  try {
+    torch::load(base, path, torch::kCPU);
+  } catch (const c10::Error&) {              // bf16-saved base: match dtype then load
+    base = Transformer(base_cfg);
+    base->to(torch::kBFloat16);
+    torch::load(base, path, torch::kCPU);
+    base->to(torch::kFloat32);
+  }
+  auto ft = model->named_parameters();        // hold OrderedDict alive (find returns into it)
+  auto ft_bufs = model->named_buffers();
+  int loaded = 0, skipped = 0;
+  for (auto& it : base->named_parameters()) {
+    if (auto* dst = ft.find(it.key())) {
+      torch::NoGradGuard ng; dst->copy_(it.value()); ++loaded;   // copy_ converts dtype
+    } else ++skipped;
+  }
+  for (auto& it : base->named_buffers()) {
+    if (auto* dst = ft_bufs.find(it.key())) { torch::NoGradGuard ng; dst->copy_(it.value()); }
+  }
+  if (rank == 0)
+    std::cout << "Finetune: non-strict base load '" << path << "' — " << loaded
+              << " params copied, " << skipped
+              << " base unmatched; fresh MTP heads kept at init.\n";
+}
+
 void train(
     Transformer& model,
     const TransformerConfig& model_cfg,
@@ -341,6 +376,12 @@ void train(
     std::shared_ptr<Evaluator> evaluator) {
 
   model->train();
+
+  // ---- Finetune: non-strict load of the base checkpoint (before DDP broadcast
+  // so the loaded weights propagate; MTP heads stay fresh to train this run) ----
+  if (cfg.finetune_from && !cfg.finetune_from->empty()) {
+    load_base_nonstrict(model, model_cfg, *cfg.finetune_from, /*rank=*/0);
+  }
 
   // ---- Initialize DDP ----
   auto ddp = DDPContext::init_from_env();
@@ -437,6 +478,12 @@ void train(
   bool gpu_data_active = false;
   if (cfg.data_path && !cfg.data_path->empty()) {
     dataset.emplace(*cfg.data_path, cfg.seq_len, true);
+    // SFT: load the assistant-only loss mask BEFORE batching. Forces the CPU/
+    // streaming path (the GPU-resident fast path doesn't apply the mask).
+    if (cfg.sft_mask_path && !cfg.sft_mask_path->empty()) {
+      dataset->set_loss_mask(*cfg.sft_mask_path);
+      if (rank == 0) std::cout << "SFT: loss mask loaded (assistant-only CE)\n";
+    }
     // Data-parallel sharding: each DDP rank trains on a disjoint 1/world_size
     // stride of the corpus (no-op single-GPU). Must precede reset_epoch().
     if (ddp && ddp->is_distributed()) dataset->set_shard(ddp->rank(), ddp->world_size());
@@ -1009,6 +1056,12 @@ void train(
   bool gpu_data_active = false;
   if (cfg.data_path && !cfg.data_path->empty()) {
     dataset.emplace(*cfg.data_path, cfg.seq_len, true);
+    // SFT: load the assistant-only loss mask BEFORE batching. Forces the CPU/
+    // streaming path (the GPU-resident fast path doesn't apply the mask).
+    if (cfg.sft_mask_path && !cfg.sft_mask_path->empty()) {
+      dataset->set_loss_mask(*cfg.sft_mask_path);
+      if (rank == 0) std::cout << "SFT: loss mask loaded (assistant-only CE)\n";
+    }
     // Data-parallel sharding: each DDP rank trains on a disjoint 1/world_size
     // stride of the corpus (no-op single-GPU). Must precede reset_epoch().
     if (ddp && ddp->is_distributed()) dataset->set_shard(ddp->rank(), ddp->world_size());

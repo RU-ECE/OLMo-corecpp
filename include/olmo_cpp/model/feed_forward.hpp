@@ -32,8 +32,10 @@
  */
 
 #include "olmo_cpp/float8/float8.hpp"
+#include "olmo_cpp/model/dora.hpp"
 #include <torch/torch.h>
 #include <memory>
+#include <optional>
 
 namespace olmo_cpp {
 
@@ -53,7 +55,16 @@ class FeedForwardImpl : public torch::nn::Module {
   /// + weight) per Linear; the disabled path pays zero extra memory.
   void enable_float8(bool on);
 
+  /// DoRA finetune: freeze w1/w2/w3 (or w_gate_up/w2), train low-rank adapters.
+  /// Called by the block when cfg.use_dora. forward() then routes through the
+  /// adapters (frozen base weight + trainable delta) and skips the fused kernel.
+  void enable_dora(int rank, double alpha);
+
  private:
+  int64_t d_model_ = 0, hidden_size_ = 0;
+  bool use_dora_ = false;
+  std::optional<DoRAAdapter> dora_w1_, dora_w3_, dora_w2_, dora_gate_up_;
+
   // Standard path: separate gate (w1) and up (w3)
   torch::nn::Linear w1_{nullptr};
   torch::nn::Linear w3_{nullptr};

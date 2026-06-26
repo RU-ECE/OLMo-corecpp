@@ -67,4 +67,44 @@ class DoRALinearImpl : public torch::nn::Module {
 };
 TORCH_MODULE(DoRALinear);
 
+/// DoRAAdapter — the practical wiring form. Holds ONLY the trainable adapter
+/// params (lora_A, lora_B, magnitude); the frozen base weight stays in the host
+/// module's existing nn::Linear and is passed into forward(). This avoids the
+/// construct-before-load ordering problem (the base .pt loads into the nn::Linear
+/// normally; the adapter never owns a base copy). magnitude lazy-inits from the
+/// base weight on the first forward (which runs after the base is loaded), so at
+/// step 0 W' == base exactly. Params init fp32; main.cpp's bf16 pass casts them.
+class DoRAAdapterImpl : public torch::nn::Module {
+ public:
+  DoRAAdapterImpl(int64_t out, int64_t in, int rank, double alpha) {
+    scaling_ = alpha / static_cast<double>(rank);
+    lora_A_ = register_parameter(
+        "lora_A", torch::randn({rank, in}) * (1.0 / std::sqrt(static_cast<double>(in))));
+    lora_B_ = register_parameter("lora_B", torch::zeros({out, rank}));
+    magnitude_ = register_parameter("magnitude", torch::ones({out}));  // lazy-init in forward
+  }
+
+  /// x [..., in], base_weight [out, in] (frozen). Returns [..., out].
+  torch::Tensor forward(const torch::Tensor& x, const torch::Tensor& base_weight) {
+    if (!mag_init_) {
+      torch::NoGradGuard ng;
+      magnitude_.set_data(
+          base_weight.detach().to(torch::kFloat32).norm(2, 1).to(base_weight.dtype()));
+      mag_init_ = true;
+    }
+    auto delta = torch::matmul(lora_B_, lora_A_) * scaling_;            // [out, in]
+    auto adapted = base_weight + delta;                                // [out, in]
+    auto rn = adapted.to(torch::kFloat32).norm(2, 1, /*keepdim=*/true)
+                  .clamp_min(1e-6).to(base_weight.dtype());            // [out,1] (fp32 reduce)
+    auto W = (magnitude_.unsqueeze(1) / rn) * adapted;                 // [out, in]
+    return torch::matmul(x, W.transpose(0, 1));
+  }
+
+ private:
+  torch::Tensor lora_A_, lora_B_, magnitude_;
+  double scaling_ = 1.0;
+  bool mag_init_ = false;
+};
+TORCH_MODULE(DoRAAdapter);
+
 }  // namespace olmo_cpp

@@ -63,6 +63,8 @@ ReorderedNormTransformerBlockImpl::ReorderedNormTransformerBlockImpl(
   // I-5 / T-6: AttentionImpl reads cfg.use_float8 itself; FeedForwardImpl
   // doesn't take cfg, so we wire its FP8 toggle from here.
   if (cfg.use_float8) feed_forward_->enable_float8(true);
+  // DoRA: attention reads cfg.use_dora itself; the FFN needs it wired from here.
+  if (cfg.use_dora) feed_forward_->enable_dora(cfg.dora_rank, cfg.dora_alpha);
 }
 
 torch::Tensor ReorderedNormTransformerBlockImpl::forward(

@@ -49,6 +49,8 @@ namespace olmo_cpp {
 FeedForwardImpl::FeedForwardImpl(int64_t d_model, int64_t hidden_size, bool bias,
                                   bool use_fused_gate_up)
     : fused_(use_fused_gate_up) {
+  d_model_ = d_model;
+  hidden_size_ = hidden_size;
   if (fused_) {
     // Fused path: one Linear of out_features = 2 * hidden_size. We will slice
     // its output along the last dim into the gate and up tensors at runtime.
@@ -73,6 +75,20 @@ FeedForwardImpl::FeedForwardImpl(int64_t d_model, int64_t hidden_size, bool bias
 /// Output    : [B, S, D] (same leading shape) — the FFN contribution.
 /// Math: y = w2( silu(gate) * up ).
 torch::Tensor FeedForwardImpl::forward(torch::Tensor x) {
+  // DoRA finetune: frozen base weights + trainable low-rank adapters. Bypasses
+  // the fused kernel (which uses the raw packed weight, not the adapted one).
+  if (use_dora_) {
+    if (fused_) {
+      auto gate_up = (*dora_gate_up_)->forward(x, w_gate_up_->weight);
+      int64_t h = gate_up.size(-1) / 2;
+      auto act = get_backend().silu_mul(gate_up.narrow(-1, 0, h), gate_up.narrow(-1, h, h));
+      return (*dora_w2_)->forward(act, w2_->weight);
+    }
+    auto act = get_backend().silu_mul((*dora_w1_)->forward(x, w1_->weight),
+                                      (*dora_w3_)->forward(x, w3_->weight));
+    return (*dora_w2_)->forward(act, w2_->weight);
+  }
+
   // Hot path: when fused_gate_up is on, no FP8 STE, and the inputs are CUDA,
   // call the fused FFN macro kernel (item I). One launch instead of three.
   // CPU and FP8-active paths fall through to the explicit-op variants below.
@@ -107,6 +123,18 @@ torch::Tensor FeedForwardImpl::forward(torch::Tensor x) {
       lin(w1_, fp8_w1x_.get(), fp8_w1w_.get(), x),
       lin(w3_, fp8_w3x_.get(), fp8_w3w_.get(), x));
   return lin(w2_, fp8_w2x_.get(), fp8_w2w_.get(), act);
+}
+
+void FeedForwardImpl::enable_dora(int rank, double alpha) {
+  use_dora_ = true;
+  if (fused_) {
+    dora_gate_up_ = register_module("dora_gate_up",
+        DoRAAdapter(2 * hidden_size_, d_model_, rank, alpha));
+  } else {
+    dora_w1_ = register_module("dora_w1", DoRAAdapter(hidden_size_, d_model_, rank, alpha));
+    dora_w3_ = register_module("dora_w3", DoRAAdapter(hidden_size_, d_model_, rank, alpha));
+  }
+  dora_w2_ = register_module("dora_w2", DoRAAdapter(d_model_, hidden_size_, rank, alpha));
 }
 
 void FeedForwardImpl::enable_float8(bool on) {

@@ -92,6 +92,12 @@ struct TransformerConfig {
   /// RAW embedding into block 0 — set FALSE when loading those, or the extra
   /// normalization corrupts every forward (real-but-incoherent output).
   bool use_embedding_norm = true;
+  /// DoRA finetune (model side): when true, attention/FFN Linears keep a frozen
+  /// base weight + a trainable low-rank adapter (see model/dora.hpp); the
+  /// packed-QKV fast path is bypassed. Set from the conf alongside TrainConfig.
+  bool use_dora = false;
+  int dora_rank = 16;
+  double dora_alpha = 32.0;
   /// FFN hidden size is rounded up to a multiple of this (matches the GPU
   /// matmul tile size for tensor cores). 256 keeps cuBLAS happy.
   int64_t hidden_size_multiple_of = 256;

@@ -391,6 +391,24 @@ void train(
   }
   int rank = ddp ? ddp->rank() : 0;
 
+  // ---- DoRA: freeze the base, train only the low-rank adapters (dora_*) and
+  // the fresh MTP heads. This is what lets a 7B finetune fit one GPU. ----
+  if (cfg.use_dora) {
+    int64_t n_train = 0, n_total = 0;
+    for (auto& it : model->named_parameters()) {
+      const bool trainable = it.key().find("dora_") != std::string::npos ||
+                             it.key().find("mtp_heads") != std::string::npos;
+      it.value().set_requires_grad(trainable);
+      n_total += it.value().numel();
+      if (trainable) n_train += it.value().numel();
+    }
+    if (rank == 0)
+      std::cout << "DoRA: training " << (n_train / 1.0e6) << "M / "
+                << (n_total / 1.0e6) << "M params ("
+                << (100.0 * static_cast<double>(n_train) / static_cast<double>(n_total))
+                << "%) — base frozen\n";
+  }
+
   // ---- ZeRO-1: partition optimizer state across DP ranks ----
   // Each rank only constructs its optimizer over its share of the
   // parameters (1/world_size). After every step() we allgather the
@@ -422,7 +440,14 @@ void train(
 
   auto all_params = model->parameters();
   if (fsdp) fsdp->shard_params(all_params);  // each param.data() -> local shard
-  auto opt_params = (zero1 && !fsdp) ? zero1->partition(all_params) : all_params;
+  // DoRA: the optimizer must only see trainable params (adapters + MTP heads),
+  // so optimizer state stays tiny and the frozen base costs nothing.
+  std::vector<torch::Tensor> opt_params;
+  if (cfg.use_dora) {
+    for (auto& p : all_params) if (p.requires_grad()) opt_params.push_back(p);
+  } else {
+    opt_params = (zero1 && !fsdp) ? zero1->partition(all_params) : all_params;
+  }
 
   // ---- Create optimizer ----
   std::unique_ptr<torch::optim::Optimizer> optimizer;
@@ -1024,7 +1049,14 @@ void train(
 
   auto all_params = model->parameters();
   if (fsdp) fsdp->shard_params(all_params);  // each param.data() -> local shard
-  auto opt_params = (zero1 && !fsdp) ? zero1->partition(all_params) : all_params;
+  // DoRA: the optimizer must only see trainable params (adapters + MTP heads),
+  // so optimizer state stays tiny and the frozen base costs nothing.
+  std::vector<torch::Tensor> opt_params;
+  if (cfg.use_dora) {
+    for (auto& p : all_params) if (p.requires_grad()) opt_params.push_back(p);
+  } else {
+    opt_params = (zero1 && !fsdp) ? zero1->partition(all_params) : all_params;
+  }
 
   std::unique_ptr<torch::optim::Optimizer> optimizer;
   if (cfg.optimizer == "lion") {

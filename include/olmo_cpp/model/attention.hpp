@@ -36,6 +36,7 @@
 #include "olmo_cpp/model/layer_norm.hpp"
 #include "olmo_cpp/model/paged_kv_cache.hpp"
 #include "olmo_cpp/model/rope.hpp"
+#include "olmo_cpp/model/dora.hpp"
 #include "olmo_cpp/float8/float8.hpp"
 #include <torch/torch.h>
 #include <optional>
@@ -147,6 +148,11 @@ class AttentionImpl : public torch::nn::Module {
   uint32_t cached_w_packed_v_v_ = 0;
   bool     cached_w_packed_valid_ = false;
   torch::Tensor packed_qkv_weight();
+
+  /// DoRA finetune: when true, route q/k/v/out through these adapters (frozen
+  /// w_*_->weight + trainable low-rank delta), skipping the packed-QKV fast path.
+  bool use_dora_ = false;
+  std::optional<DoRAAdapter> dora_q_, dora_k_, dora_v_, dora_out_;
 };
 
 /// Holder type macro from LibTorch — defines `Attention` as a shared-ptr

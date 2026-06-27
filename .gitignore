@@ -66,4 +66,4 @@ plan.md
 *.sqlite
 *.nsys-rep.md
 *.qdstrm.md
-*.sqlite.md
+*.sqlite.md.claude/worktrees/

@@ -222,6 +222,11 @@ void train_epoch(
   // Cache model params once (avoids per-step vector allocation)
   auto model_params = model->parameters();
 
+  // Async-checkpoint future at function scope so the FINAL save can be waited on
+  // after the loop (otherwise the last save_async is abandoned at exit, leaving
+  // an empty checkpoint dir — which is how step_2000 was lost).
+  std::future<void> last_ckpt_future;
+
   for (int64_t step = 0; step < num_steps; ++step) {
     auto step_start = std::chrono::steady_clock::now();
     double step_lr = cosine_warmup_lr(step, warmup_steps, lr, num_steps);
@@ -966,25 +971,35 @@ void train(
       CheckpointMetadata meta;
       meta.step = step + 1;
       meta.loss = accum_loss;
-      static std::future<void> _last_ckpt;
-      if (_last_ckpt.valid()) _last_ckpt.wait();  // ensure previous save finished
-      _last_ckpt = ckpt_mgr->save_async(tag, *model, *optimizer, meta, rank,
+      if (last_ckpt_future.valid()) last_ckpt_future.wait();  // ensure previous save finished
+      last_ckpt_future = ckpt_mgr->save_async(tag, *model, *optimizer, meta, rank,
                                          ddp ? ddp->world_size() : 1);
       ckpt_mgr->prune(cfg.keep_checkpoints);
       // Also drop a single-file <checkpoint_dir>/latest.pt (rank 0, full model)
       // so `chat`/inference can load the in-progress model WITHOUT stopping the
       // run. The sharded save above is for resume; this one is for using it.
       // (DDP: rank 0 holds the full model. Skip under FSDP — rank 0 has shards.)
+      // Serialize on CPU: torch::save() of a CUDA module writes tensor storage
+      // that deserializes with a dead data pointer (segfault on first read at
+      // inference). Move to CPU, save, move back to keep training on-device.
       if (rank == 0 && !cfg.use_fsdp) {
         try {
-          torch::save(model, cfg.checkpoint_dir + "/latest.pt");  // holder, not *model
+          model->to(torch::kCPU);
+          torch::save(model, cfg.checkpoint_dir + "/latest.pt");
+          model->to(device);
         } catch (const std::exception& e) {
           std::cerr << "WARN: latest.pt export failed: " << e.what() << "\n";
+          model->to(device);
         }
       }
       cb_mgr.on_checkpoint_save(state, cfg.checkpoint_dir + "/" + tag);
     }
   }
+
+  // Ensure the FINAL async checkpoint finished writing before returning/exiting.
+  // Without this the last save_async() is abandoned at process exit, leaving an
+  // empty checkpoint dir (this is exactly how the step_2000 shard was lost).
+  if (last_ckpt_future.valid()) last_ckpt_future.wait();
 
   cb_mgr.on_train_end(state);
 

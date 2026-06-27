@@ -1016,13 +1016,13 @@ int main(int argc, char** argv) {
       if (prompt.empty()) continue;
 
       if (instruct_mode) {
-        // OLMo-2-Instruct template: <|endoftext|> (bos) once at the start, then
-        // <|user|>\n{q}\n<|assistant|>\n each turn. The model ends its turn with
-        // <|endoftext|> (eos), which also stops generation. <|user|>/<|assistant|>
-        // are plain text (not special tokens) — BPE-encoded as OLMo-2 trained them.
+        // ChatML template — MUST match scripts/prep_sft_data.py (what the model was
+        // SFT'd on): <|im_start|>user\n{q}<|im_end|>\n<|im_start|>assistant\n . The
+        // model ends its turn with the <|im_end|> special token. <|endoftext|> (bos)
+        // is prepended once at the very start of the conversation.
         if (all_tokens.empty())
           all_tokens.push_back(static_cast<int64_t>(tokenizer.eos_id()));
-        prompt = "<|user|>\n" + prompt + "\n<|assistant|>\n";
+        prompt = "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
       }
 
       prompt_ids.clear();

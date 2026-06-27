@@ -123,6 +123,20 @@ class CheckpointFunction : public torch::autograd::Function<CheckpointFunction> 
 torch::Tensor ActivationCheckpoint::checkpoint(
     std::function<torch::Tensor(torch::Tensor)> fn,
     torch::Tensor input) {
+  // A torch::autograd::Function's output requires grad ONLY if one of its
+  // tensor *inputs* requires grad. The block's trainable params (e.g. DoRA
+  // adapters, or any unfrozen weight) live INSIDE `fn`, not as inputs — so
+  // when the input doesn't require grad (the classic case: frozen embeddings
+  // feeding block 0 during an adapter/DoRA finetune) the checkpoint's output
+  // wouldn't require grad, and its backward — which recomputes the block and
+  // is the ONLY place the internal params' grads get produced — would never
+  // run. Result: every in-block trainable param silently gets zero gradient.
+  // Force a grad-requiring leaf so the recompute-backward fires. No-op for
+  // pretraining (trainable embeddings already make the input require grad)
+  // and for blocks 1..N (the previous block's output already requires grad).
+  if (!input.requires_grad()) {
+    input = input.detach().requires_grad_(true);
+  }
   // Store function in thread-local so forward() can access it
   // without passing a non-tensor through apply()
   tl_ckpt_fn = &fn;

@@ -87,6 +87,15 @@ class DoRAAdapterImpl : public torch::nn::Module {
 
   /// x [..., in], base_weight [out, in] (frozen). Returns [..., out].
   torch::Tensor forward(const torch::Tensor& x, const torch::Tensor& base_weight) {
+    static bool dbg_once = false;
+    if (!dbg_once) {
+      dbg_once = true;
+      std::cerr << "[df] reading bw.sum()..." << std::flush;
+      double s = base_weight.detach().to(torch::kFloat32).sum().item<double>();
+      std::cerr << " bw.sum=" << s << " | row-norm..." << std::flush;
+      auto rn = base_weight.detach().to(torch::kFloat32).norm(2, 1);
+      std::cerr << " rn.sum=" << rn.sum().item<double>() << " DORA-FWD-OK" << std::endl;
+    }
     if (!mag_init_) {
       // Initialise the magnitude to the base weight's per-row norm ONLY during
       // training (so W' == base at step 0). At inference the magnitude has

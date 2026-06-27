@@ -222,11 +222,6 @@ void train_epoch(
   // Cache model params once (avoids per-step vector allocation)
   auto model_params = model->parameters();
 
-  // Async-checkpoint future at function scope so the FINAL save can be waited on
-  // after the loop (otherwise the last save_async is abandoned at exit, leaving
-  // an empty checkpoint dir — which is how step_2000 was lost).
-  std::future<void> last_ckpt_future;
-
   for (int64_t step = 0; step < num_steps; ++step) {
     auto step_start = std::chrono::steady_clock::now();
     double step_lr = cosine_warmup_lr(step, warmup_steps, lr, num_steps);
@@ -713,6 +708,11 @@ void train(
                 << " — starting fresh.\n";
     }
   }
+
+  // Async-checkpoint future at function scope so the FINAL save can be waited on
+  // after the loop (otherwise the last save_async is abandoned at exit, leaving
+  // an empty checkpoint dir — which is how the step_2000 shard was lost).
+  std::future<void> last_ckpt_future;
 
   // ---- Training loop ----
   for (int64_t step = start_step; step < cfg.num_steps; ++step) {

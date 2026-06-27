@@ -87,6 +87,18 @@ class DoRAAdapterImpl : public torch::nn::Module {
 
   /// x [..., in], base_weight [out, in] (frozen). Returns [..., out].
   torch::Tensor forward(const torch::Tensor& x, const torch::Tensor& base_weight) {
+    static bool dbg_once = false;
+    if (!dbg_once) {
+      dbg_once = true;
+      std::cerr << "[doraf] bw sizes=" << base_weight.sizes()
+                << " dev=" << base_weight.device()
+                << " dtype=" << base_weight.dtype()
+                << " | reading bw.sum()..." << std::flush;
+      std::cerr << " bw.sum=" << base_weight.detach().to(torch::kFloat32).sum().item<double>()
+                << " loraA.sum=" << lora_A_.detach().to(torch::kFloat32).sum().item<double>()
+                << " mag.sum=" << magnitude_.detach().to(torch::kFloat32).sum().item<double>()
+                << std::endl;
+    }
     if (!mag_init_) {
       // Initialise the magnitude to the base weight's per-row norm ONLY during
       // training (so W' == base at step 0). At inference the magnitude has

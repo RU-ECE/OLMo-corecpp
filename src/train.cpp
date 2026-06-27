@@ -396,6 +396,18 @@ static void merge_dora_export(Transformer& model, const TransformerConfig& model
     auto adapted = Wf + delta;
     auto rn = adapted.norm(2, /*dim=*/1, /*keepdim=*/true).clamp_min(1e-6);
     auto merged = (M->to(torch::kFloat32).unsqueeze(1) / rn) * adapted;
+    static bool dbg = false;
+    if (!dbg) {
+      dbg = true;
+      std::cerr << "[merge dbg] " << base << " scaling=" << scaling
+                << " mag.mean=" << M->to(torch::kFloat32).mean().item<double>()
+                << " W.rownorm.mean=" << Wf.norm(2, 1).mean().item<double>()
+                << " delta.norm=" << delta.norm().item<double>()
+                << " W.norm=" << Wf.norm().item<double>()
+                << " merged.norm=" << merged.norm().item<double>()
+                << " reldiff=" << ((merged - Wf).norm() / Wf.norm()).item<double>()
+                << std::endl;
+    }
     W->copy_(merged.to(W->dtype()));
     return true;
   };

@@ -1,0 +1,23 @@
+{
+  "_comment": "Chat config for the DoRA-MERGED OLMo-2-7B (a PLAIN model: adapters folded into base weights via MERGE_EXPORT). use_dora=false so chat loads it like any standard model (round-trips through torch::save cleanly, unlike the DoRA-structured model). num_mtp_heads=2 retained for self-speculative decoding. Use with chat --instruct.",
+  "d_model": 4096,
+  "vocab_size": 100352,
+  "n_layers": 32,
+  "n_heads": 32,
+  "n_kv_heads": 32,
+  "head_dim": 128,
+  "rope_theta": 500000,
+  "layer_norm_eps": 1e-6,
+  "init_std": 0.02,
+  "use_qk_norm": true,
+  "use_head_qk_norm": false,
+  "use_embedding_norm": false,
+  "block_type": "reordered_norm",
+  "attention_backend": "sdpa",
+  "layer_norm_type": "rms_norm",
+  "hidden_size_multiple_of": 256,
+  "hidden_size_multiplier": 1.0,
+  "use_dora": false,
+  "num_mtp_heads": 2,
+  "mtp_loss_weight": 0.1
+}

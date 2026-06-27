@@ -371,6 +371,66 @@ static void load_base_nonstrict(Transformer& model, const TransformerConfig& mod
               << " base unmatched; fresh MTP heads kept at init.\n";
 }
 
+// Fold trained DoRA adapters into their base Linear weights and export a PLAIN
+// (no dora_* submodules) model. Standard models round-trip through torch::save
+// cleanly, whereas saving the DoRA-structured model corrupts the frozen base
+// weight storage on reload. Must run on a model whose weights are valid in
+// memory (i.e. right after a CheckpointManager resume-load). Output loads in
+// `chat` with a use_dora=false config (+ the same num_mtp_heads).
+//   W_merged = magnitude · (W + (alpha/rank)·B·A) / ||W + (alpha/rank)·B·A||_row
+static void merge_dora_export(Transformer& model, const TransformerConfig& model_cfg,
+                              const std::string& out_path) {
+  torch::NoGradGuard ng;
+  model->eval();
+  model->to(torch::kCPU);
+  const double scaling = model_cfg.dora_alpha / static_cast<double>(model_cfg.dora_rank);
+  auto P = model->named_parameters();  // hold alive (find() returns into it)
+  auto merge_one = [&](const std::string& base, const std::string& dora) {
+    auto* W = P.find(base);
+    auto* A = P.find(dora + ".lora_A");
+    auto* B = P.find(dora + ".lora_B");
+    auto* M = P.find(dora + ".magnitude");
+    if (!W || !A || !B || !M) return false;
+    auto Wf = W->to(torch::kFloat32);
+    auto delta = torch::matmul(B->to(torch::kFloat32), A->to(torch::kFloat32)) * scaling;
+    auto adapted = Wf + delta;
+    auto rn = adapted.norm(2, /*dim=*/1, /*keepdim=*/true).clamp_min(1e-6);
+    auto merged = (M->to(torch::kFloat32).unsqueeze(1) / rn) * adapted;
+    W->copy_(merged.to(W->dtype()));
+    return true;
+  };
+  int merged = 0;
+  for (int i = 0; i < model_cfg.n_layers; ++i) {
+    const std::string a = "blocks." + std::to_string(i) + ".attention.";
+    merged += merge_one(a + "w_q.weight",   a + "dora_q");
+    merged += merge_one(a + "w_k.weight",   a + "dora_k");
+    merged += merge_one(a + "w_v.weight",   a + "dora_v");
+    merged += merge_one(a + "w_out.weight", a + "dora_out");
+    const std::string f = "blocks." + std::to_string(i) + ".feed_forward.";
+    merged += merge_one(f + "w1.weight", f + "dora_w1");
+    merged += merge_one(f + "w3.weight", f + "dora_w3");
+    merged += merge_one(f + "w2.weight", f + "dora_w2");
+  }
+  // Copy every non-dora param/buffer into a freshly-built plain model and save.
+  auto std_cfg = model_cfg;
+  std_cfg.use_dora = false;
+  Transformer plain(std_cfg);
+  plain->to(torch::kCPU);
+  auto SP = plain->named_parameters();
+  auto SB = plain->named_buffers();
+  int copied = 0;
+  for (auto& kv : P) {
+    if (kv.key().find("dora_") != std::string::npos) continue;  // adapters now folded in
+    if (auto* dst = SP.find(kv.key())) { dst->copy_(kv.value()); ++copied; }
+  }
+  auto PB = model->named_buffers();
+  for (auto& kv : PB)
+    if (auto* dst = SB.find(kv.key())) dst->copy_(kv.value());
+  torch::save(plain, out_path);
+  std::cout << "DoRA merge-export: folded " << merged << " adapters, copied "
+            << copied << " params -> plain model at " << out_path << "\n";
+}
+
 void train(
     Transformer& model,
     const TransformerConfig& model_cfg,
@@ -706,6 +766,17 @@ void train(
     } else if (rank == 0) {
       std::cout << "RESUME: no checkpoint in " << cfg.checkpoint_dir
                 << " — starting fresh.\n";
+    }
+  }
+
+  // Offline DoRA merge-export: with MERGE_EXPORT=<out.pt> set, fold the (just
+  // resume-loaded, in-memory-valid) adapters into the base weights, save a plain
+  // model, and exit without training. Lets us produce an inference-loadable
+  // checkpoint from any valid sharded checkpoint.
+  if (cfg.use_dora) {
+    if (const char* mp = std::getenv("MERGE_EXPORT")) {
+      merge_dora_export(model, model_cfg, std::string(mp));
+      return;
     }
   }
 

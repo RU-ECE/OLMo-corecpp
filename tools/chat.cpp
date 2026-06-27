@@ -897,20 +897,23 @@ int main(int argc, char** argv) {
     align_mtp_config_with_checkpoint(cfg, checkpoint_path);
 
     olmo_cpp::Transformer model(cfg);
-    // Remap serialized tensors to CPU — checkpoints may embed MPS/CUDA
-    // device tags from the training host; we move to `device` next.
-    // bf16-trained checkpoints store BF16 weights; an fp32 model mismatches
-    // storage size on load, so try fp32 then fall back to a BF16 model.
+    // Load the checkpoint DIRECTLY onto the target device. Loading to CPU and
+    // then Module::to(device) corrupts base-weight storage for checkpoints that
+    // were saved from a CUDA model (the loaded tensor has valid metadata but a
+    // bad data pointer, segfaulting the first read / host->device copy). Moving
+    // the freshly-built (uncorrupted) model to the device first, then loading
+    // onto it, avoids that path. bf16-trained checkpoints store BF16 weights; an
+    // fp32 model mismatches storage size on load, so try fp32 then fall back to
+    // a BF16 model. Inference runs fp32 (bf16+CUDA is unstable on this box;
+    // pass --bf16 to force bf16 tensor-core inference where supported).
+    model->to(device);
     try {
-      torch::load(model, checkpoint_path, torch::kCPU);
+      torch::load(model, checkpoint_path, device);
     } catch (const c10::Error&) {
       model = olmo_cpp::Transformer(cfg);
       model->to(torch::kBFloat16);
-      torch::load(model, checkpoint_path, torch::kCPU);
-      // Run inference in fp32 on BOTH CPU and CUDA. bf16 weights moved to CUDA
-      // (and bf16 + CUDA graphs) are unstable on this box's driver/runtime and
-      // segfault in the host->device copy; fp32 is correct and stable. Pass
-      // --bf16 to force bf16 tensor-core inference if the platform supports it.
+      model->to(device);
+      torch::load(model, checkpoint_path, device);
       model->to(torch::kFloat32);
     }
 
@@ -930,21 +933,7 @@ int main(int argc, char** argv) {
                    " for two-model speculative; ignoring partial spec.\n";
     }
     if (force_bf16) model->to(torch::kBFloat16);  // tensor-core inference for an fp32 .pt
-    if (std::getenv("MV_DEBUG")) {
-      for (auto& p : model->named_parameters()) {
-        std::cerr << "[mv] " << p.key() << " " << p.value().sizes()
-                  << " " << p.value().dtype() << " contig=" << p.value().is_contiguous()
-                  << std::flush;
-        p.value().set_data(p.value().to(device));
-        std::cerr << " OK" << std::endl;
-      }
-      for (auto& b : model->named_buffers()) {
-        std::cerr << "[mv] buf " << b.key() << " " << b.value().sizes() << std::flush;
-        b.value().set_data(b.value().to(device));
-        std::cerr << " OK" << std::endl;
-      }
-    }
-    model->to(device);
+    model->to(device);  // no-op: already loaded onto `device` above
     model->eval();
 
     // Check if model has MTP heads

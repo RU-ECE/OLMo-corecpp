@@ -19,6 +19,7 @@
  */
 #include <torch/torch.h>
 #include <cmath>
+#include <iostream>
 
 namespace olmo_cpp {
 
@@ -87,6 +88,19 @@ class DoRAAdapterImpl : public torch::nn::Module {
   /// x [..., in], base_weight [out, in] (frozen). Returns [..., out].
   torch::Tensor forward(const torch::Tensor& x, const torch::Tensor& base_weight) {
     if (!mag_init_) {
+      static bool dbg_once = false;
+      if (!dbg_once) {
+        dbg_once = true;
+        std::cerr << "[DORA dbg] base_weight defined=" << base_weight.defined()
+                  << " sizes=" << base_weight.sizes()
+                  << " numel=" << base_weight.numel()
+                  << " dtype=" << base_weight.dtype()
+                  << " dev=" << base_weight.device()
+                  << " contig=" << base_weight.is_contiguous()
+                  << " | mag sizes=" << magnitude_.sizes()
+                  << " loraB sizes=" << lora_B_.sizes()
+                  << " loraA sizes=" << lora_A_.sizes() << std::endl;
+      }
       torch::NoGradGuard ng;
       magnitude_.set_data(
           base_weight.detach().to(torch::kFloat32).norm(2, 1).to(base_weight.dtype()));

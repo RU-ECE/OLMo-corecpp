@@ -136,8 +136,13 @@ void run(Model& model, const olmo_cpp::TransformerConfig& cfg,
   if (!save_path.empty()) {
     std::filesystem::create_directories(
         std::filesystem::path(save_path).parent_path());
+    // Serialize on CPU. torch::save() of a CUDA module can write tensor storage
+    // that deserializes with a dead data pointer (valid metadata, bad data) ->
+    // segfault / "illegal memory access" on the first read at inference time.
+    // Moving to CPU first produces a clean, portable single-file checkpoint.
+    model->to(torch::kCPU);
     torch::save(model, save_path);
-    std::cout << "Checkpoint saved: " << save_path << "\n";
+    std::cout << "Checkpoint saved (CPU): " << save_path << "\n";
   }
 }
 

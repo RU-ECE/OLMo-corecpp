@@ -930,6 +930,20 @@ int main(int argc, char** argv) {
                    " for two-model speculative; ignoring partial spec.\n";
     }
     if (force_bf16) model->to(torch::kBFloat16);  // tensor-core inference for an fp32 .pt
+    if (std::getenv("MV_DEBUG")) {
+      for (auto& p : model->named_parameters()) {
+        std::cerr << "[mv] " << p.key() << " " << p.value().sizes()
+                  << " " << p.value().dtype() << " contig=" << p.value().is_contiguous()
+                  << std::flush;
+        p.value().set_data(p.value().to(device));
+        std::cerr << " OK" << std::endl;
+      }
+      for (auto& b : model->named_buffers()) {
+        std::cerr << "[mv] buf " << b.key() << " " << b.value().sizes() << std::flush;
+        b.value().set_data(b.value().to(device));
+        std::cerr << " OK" << std::endl;
+      }
+    }
     model->to(device);
     model->eval();
 

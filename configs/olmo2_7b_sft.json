@@ -1,5 +1,5 @@
 {
-  "_comment": "Chat config for the DoRA-finetuned OLMo-2-7B (runs/sft_olmo2_v2/model.pt). Matches conf/finetune_olmo2.conf: use_dora=true so chat rebuilds the adapter structure and loads the finetuned checkpoint; num_mtp_heads=2 (retrofit). Use with chat --instruct.",
+  "_comment": "Chat config for the DoRA-finetuned OLMo-2-7B (runs/sft_olmo2_v4/model.pt). Matches conf/finetune_olmo2.conf: use_dora=true so chat rebuilds the adapter structure and loads the finetuned checkpoint; num_mtp_heads=2 (retrofit). Use with chat --instruct.",
   "d_model": 4096,
   "vocab_size": 100352,
   "n_layers": 32,
@@ -18,8 +18,8 @@
   "hidden_size_multiple_of": 256,
   "hidden_size_multiplier": 1.0,
   "use_dora": true,
-  "dora_rank": 16,
-  "dora_alpha": 32.0,
+  "dora_rank": 32,
+  "dora_alpha": 64.0,
   "num_mtp_heads": 2,
   "mtp_loss_weight": 0.1
 }

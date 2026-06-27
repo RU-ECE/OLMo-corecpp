@@ -907,7 +907,11 @@ int main(int argc, char** argv) {
       model = olmo_cpp::Transformer(cfg);
       model->to(torch::kBFloat16);
       torch::load(model, checkpoint_path, torch::kCPU);
-      if (device.type() != torch::kCUDA) model->to(torch::kFloat32);
+      // Run inference in fp32 on BOTH CPU and CUDA. bf16 weights moved to CUDA
+      // (and bf16 + CUDA graphs) are unstable on this box's driver/runtime and
+      // segfault in the host->device copy; fp32 is correct and stable. Pass
+      // --bf16 to force bf16 tensor-core inference if the platform supports it.
+      model->to(torch::kFloat32);
     }
 
     // (fast-inference [17]) Optional draft model for two-model speculative.

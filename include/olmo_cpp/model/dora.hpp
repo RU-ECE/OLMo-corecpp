@@ -88,22 +88,16 @@ class DoRAAdapterImpl : public torch::nn::Module {
   /// x [..., in], base_weight [out, in] (frozen). Returns [..., out].
   torch::Tensor forward(const torch::Tensor& x, const torch::Tensor& base_weight) {
     if (!mag_init_) {
-      static bool dbg_once = false;
-      if (!dbg_once) {
-        dbg_once = true;
-        std::cerr << "[DORA dbg] base_weight defined=" << base_weight.defined()
-                  << " sizes=" << base_weight.sizes()
-                  << " numel=" << base_weight.numel()
-                  << " dtype=" << base_weight.dtype()
-                  << " dev=" << base_weight.device()
-                  << " contig=" << base_weight.is_contiguous()
-                  << " | mag sizes=" << magnitude_.sizes()
-                  << " loraB sizes=" << lora_B_.sizes()
-                  << " loraA sizes=" << lora_A_.sizes() << std::endl;
+      // Initialise the magnitude to the base weight's per-row norm ONLY during
+      // training (so W' == base at step 0). At inference the magnitude has
+      // already been loaded from the finetuned checkpoint with its TRAINED
+      // value — recomputing it here would silently discard the magnitude
+      // training. is_training() is false after model->eval() in chat.
+      if (this->is_training()) {
+        torch::NoGradGuard ng;
+        magnitude_.set_data(
+            base_weight.detach().to(torch::kFloat32).norm(2, 1).to(base_weight.dtype()));
       }
-      torch::NoGradGuard ng;
-      magnitude_.set_data(
-          base_weight.detach().to(torch::kFloat32).norm(2, 1).to(base_weight.dtype()));
       mag_init_ = true;
     }
     auto delta = torch::matmul(lora_B_, lora_A_) * scaling_;            // [out, in]

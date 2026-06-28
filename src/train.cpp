@@ -438,6 +438,9 @@ static void merge_dora_export(Transformer& model, const TransformerConfig& model
   auto PB = model->named_buffers();
   for (auto& kv : PB)
     if (auto* dst = SB.find(kv.key())) dst->copy_(kv.value());
+  // Optional bf16 export (MERGE_BF16=1): halves the on-disk size (~29GB->~14GB).
+  // chat loads it and casts to fp32 at load time, so inference is unaffected.
+  if (std::getenv("MERGE_BF16")) plain->to(torch::kBFloat16);
   torch::save(plain, out_path);
   std::cout << "DoRA merge-export: folded " << merged << " adapters, copied "
             << copied << " params -> plain model at " << out_path << "\n";

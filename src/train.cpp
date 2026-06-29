@@ -438,9 +438,22 @@ static void merge_dora_export(Transformer& model, const TransformerConfig& model
   auto PB = model->named_buffers();
   for (auto& kv : PB)
     if (auto* dst = SB.find(kv.key())) dst->copy_(kv.value());
-  // Optional bf16 export (MERGE_BF16=1): halves the on-disk size (~29GB->~14GB).
-  // chat loads it and casts to fp32 at load time, so inference is unaffected.
-  if (std::getenv("MERGE_BF16")) plain->to(torch::kBFloat16);
+  // Optional bf16 export (MERGE_BF16=1): halves the on-disk size (~29GB->~14GB)
+  // so a 7B fits a 24GB GPU (e.g. RTX 4090). chat casts back to fp32 at load.
+  // NOTE: a plain `plain->to(kBFloat16)` mutates param .data() in place via
+  // set_data, which can leave the tensor as a non-contiguous view onto the old
+  // fp32 storage; torch::save then serializes wrong strides/storage and the
+  // file deserializes with garbage (segfault on first read). Rebuild every
+  // float param/buffer as a fresh CONTIGUOUS, CLONED bf16 tensor so the archive
+  // is clean. Integer buffers (e.g. position ids) are left untouched.
+  if (std::getenv("MERGE_BF16")) {
+    torch::NoGradGuard ng2;
+    for (auto& p : plain->named_parameters())
+      p.value().set_data(p.value().detach().to(torch::kBFloat16).contiguous().clone());
+    for (auto& b : plain->named_buffers())
+      if (b.value().is_floating_point())
+        b.value().set_data(b.value().detach().to(torch::kBFloat16).contiguous().clone());
+  }
   torch::save(plain, out_path);
   std::cout << "DoRA merge-export: folded " << merged << " adapters, copied "
             << copied << " params -> plain model at " << out_path << "\n";

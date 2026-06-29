@@ -1,0 +1,85 @@
+# OLMo-corecpp — Compiled Results (for paper)
+
+*C++17/LibTorch reimplementation of AI2 OLMo-core. All numbers pulled from on-box logs; source path given per row. Single-stream/standard settings unless noted.*
+
+> Status: living doc. Sections 1–5 compiled from the kuiper box. The **2× H100 partial run** (§6) and the **ollama / llama.cpp head-to-head on H100** (§7) are being filled in from the other servers.
+
+## Hardware
+| Box | GPU | Used for |
+|---|---|---|
+| kuiper (1-GPU) | 1× H100 80GB | OLMo-2-7B finetune, inference, 190M bench |
+| kuiper (2-GPU) | 2× H100 80GB (DDP/NCCL) | 1B pretrain |
+| 149.165.174.207 | 2× H100 80GB | partial run + ollama/llama.cpp head-to-head |
+
+---
+
+## 1. Training throughput
+
+| Run | Params | Config | Steps | Tokens | Wall time | Avg step | Throughput | Source |
+|---|---|---|---|---|---|---|---|---|
+| **OLMo-2-7B finetune** (DoRA+MTP) | 7.41B (1.55% trainable) | bs1×ga16, seq2048, act-ckpt | 2,500 (5 ep) | 81.9M | **27,319 s (7.6 h)** | **10,928 ms** | **2,998 tok/s** | `runs/sft_olmo2_v6/train.log` |
+| **1B pretrain** | 973M (d2048/16L/16H, 3 MTP) | seq2048, bs32, DDP 2×H100 | 50,000 (2 ep) | 3.28B | **127,664 s (35.5 h)** | **2,553 ms** | **25,667 tok/s** | `runs/1B/train.log` |
+
+---
+
+## 2. C++ vs Python training (apples-to-apples, identical arch)
+190M model (d768/12L/12H), batch 8 × seq 512, 100 steps, same H100, same data. Source: `llm_benchmark_results/{cpp,python}_benchmark.log`.
+
+| Engine | Steady-state step | Steady-state tok/s | Cumulative avg (100 steps) | Notes |
+|---|---|---|---|---|
+| **C++ (FUSED)** | **~67–71 ms** | **~57–58k** | 85.9 ms / 47,661 tok/s | step-0 = 1357 ms (one-time CUDA-graph capture) drags the cumulative avg |
+| Python (torch) | ~76–79 ms | ~52–54k | 76.6 ms / 53,466 tok/s | warmup excluded separately |
+
+**Honest read:** at 190M the C++ engine is **~10% faster per step at steady state**, but its cumulative average looks slower because the one-time CUDA-graph capture costs a 1.36 s first step. The headline "5–20×" is **not** demonstrated by this training micro-bench — the large demonstrated speedup is in **inference** (§3). *(Recommend re-running this at larger model size, excluding the capture step, before citing a training speedup.)*
+
+---
+
+## 3. Inference throughput — **the real win (6.6×)**
+OLMo-2-7B, single-stream decode, batch 1, H100 (measured while another job held ~94% of the GPU — idle would be higher). Source: `docs/INFERENCE_SPEED_OLMO2.md`.
+
+| Config | tok/s | vs eager |
+|---|---|---|
+| fp32, eager | 7.2 | 1.0× |
+| fp32, eager, `--bf16` | 4.4 | 0.6× (bf16 *slower* — conversion overhead) |
+| **fp32, `--cuda-graph --paged-kv`** | **47.9** | **6.6×** |
+| `--cuda-graph --paged-kv --bf16` | crashes | — |
+
+**Key insight (paper-worthy):** decode is **overhead-bound, not memory-bound** at batch 1 → CUDA graphs (eliminating per-kernel launch overhead) are the lever, not quantization. After graphs, decode sits ~2.5× the fp32 memory roofline.
+
+"All optimizations" = `--cuda-graph --paged-kv --instruct` + MTP self-speculative decoding.
+
+---
+
+## 4. Finetune (DoRA + MTP) results — OLMo-2-7B
+Source: `runs/sft_olmo2_v6/train.log`.
+
+| Metric | Value |
+|---|---|
+| Method | QDoRA adapters (base frozen) + 2 retrofit MTP heads, masked SFT on Tülu-3 (ChatML) |
+| Trainable params | **114.9M / 7.41B = 1.55%** |
+| Recipe | lr 1e-4 cosine, dora_rank 32 / alpha 32 (scale 1), wd 0.01, 2500 steps |
+| Loss | **7.40 → ~2.0–2.6** (step 10 → 2500) |
+| MTP self-speculative accept rate | **28–31%** (vs 2% on the over-fit run) |
+| Deployment | merge-export → plain model; follows instructions, correct answers |
+
+Loss curve (step → loss): 10→7.40, 100→4.59, 600→3.73, 1000→2.95, 1600→2.67, 2100→2.61, 2490→2.60.
+
+---
+
+## 5. Notable engineering results
+- **CUDA-graph decode**: 6.6× over eager (the headline inference number).
+- **MTP self-speculative decoding** wired + working: 28–31% draft acceptance.
+- **DoRA+MTP finetune** of a 7B on a *single* 80GB H100 (1.55% trainable; full base frozen).
+- INT4 weight-inference: sidecar format + `quantize_int4` + GEMV kernels exist; chat wiring in progress.
+
+*Caveats to keep honest in the paper: (a) the C++>Python training speedup is ~10% at 190M here, not 5–20× — needs a larger-scale rerun; (b) inference numbers were taken under GPU contention; (c) the 6.6× inference speedup is solid and reproducible.*
+
+---
+
+## 6. 2× H100 server (149.165.174.207) — partial run
+*(pending — being compiled from the server logs)*
+
+---
+
+## 7. Head-to-head: OLMo-corecpp vs llama.cpp vs ollama (H100)
+*(pending — ollama + llama.cpp being installed + benchmarked on the H100)*

@@ -797,8 +797,8 @@ int main(int argc, char** argv) {
     else if (arg == "--int4" && i + 1 < argc) int4_path = argv[++i];
   }
 
-  if (checkpoint_path.empty() || config_path.empty() || vocab_path.empty() || merges_path.empty()) {
-    std::cerr << "Usage: chat --checkpoint <path> --config <path> "
+  if ((checkpoint_path.empty() && int4_path.empty()) || config_path.empty() || vocab_path.empty() || merges_path.empty()) {
+    std::cerr << "Usage: chat (--checkpoint <path> | --int4 <sidecar>) --config <path> "
                  "--vocab-file <path> --merges-file <path>\n"
               << "\nOptions:\n"
               << "  --device <mps|cuda|cpu>     (default: auto)\n"
@@ -896,7 +896,8 @@ int main(int argc, char** argv) {
     // -----------------------------------------------------------------
     auto cfg = olmo_cpp::load_config_from_json(config_path);
     cfg.validate();
-    align_mtp_config_with_checkpoint(cfg, checkpoint_path);
+    if (!checkpoint_path.empty())
+      align_mtp_config_with_checkpoint(cfg, checkpoint_path);
 
     olmo_cpp::Transformer model(cfg);
     if (!int4_path.empty()) {

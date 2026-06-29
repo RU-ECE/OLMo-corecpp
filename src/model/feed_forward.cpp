@@ -75,6 +75,12 @@ FeedForwardImpl::FeedForwardImpl(int64_t d_model, int64_t hidden_size, bool bias
 /// Output    : [B, S, D] (same leading shape) — the FFN contribution.
 /// Math: y = w2( silu(gate) * up ).
 torch::Tensor FeedForwardImpl::forward(torch::Tensor x) {
+  // INT4 weight-only inference (non-fused): y = w2( silu(w1·x) * w3·x ), each
+  // matmul through the fused int4 GEMV (decode) / transient dequant (prefill).
+  if (use_int4_) {
+    auto act = get_backend().silu_mul(int4_linear(int4_w1_, x), int4_linear(int4_w3_, x));
+    return int4_linear(int4_w2_, act);
+  }
   // DoRA finetune: frozen base weights + trainable low-rank adapters. Bypasses
   // the fused kernel (which uses the raw packed weight, not the adapted one).
   if (use_dora_) {
@@ -135,6 +141,18 @@ void FeedForwardImpl::enable_dora(int rank, double alpha) {
     dora_w3_ = register_module("dora_w3", DoRAAdapter(hidden_size_, d_model_, rank, alpha));
   }
   dora_w2_ = register_module("dora_w2", DoRAAdapter(d_model_, hidden_size_, rank, alpha));
+}
+
+void FeedForwardImpl::set_int4(Int4Quantized w1, Int4Quantized w3, Int4Quantized w2) {
+  int4_w1_ = std::move(w1);
+  int4_w3_ = std::move(w3);
+  int4_w2_ = std::move(w2);
+  use_int4_ = true;
+  // Free the dense FFN weights (unused under INT4) to reclaim (V)RAM.
+  torch::NoGradGuard ng;
+  for (auto* l : {&w1_, &w3_, &w2_})
+    if (*l && (*l)->weight.defined())
+      (*l)->weight.set_data(torch::empty({0}, (*l)->weight.options()));
 }
 
 void FeedForwardImpl::enable_float8(bool on) {

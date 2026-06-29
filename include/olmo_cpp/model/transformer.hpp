@@ -122,6 +122,14 @@ class TransformerImpl : public torch::nn::Module {
   /// Convenience predicate.
   bool has_mtp() const { return config_.num_mtp_heads > 0; }
 
+  /// Load an INT4 weight-only sidecar (produced by `quantize_int4`) and switch
+  /// every attention/FFN projection to int4_linear(): the kept-fp tensors
+  /// (norms, embeddings, lm_head) are loaded into the model's params, and the
+  /// dense projection weights are freed. Call BEFORE moving the model to the
+  /// device (so the dense fp32 weights never hit VRAM). int4 weights land on
+  /// `device` immediately; the remaining (kept-fp) params follow on ->to(device).
+  void enable_int4(const std::string& sidecar_path, torch::Device device);
+
   /// Apply LM head to hidden states → logits
   torch::Tensor apply_lm_head(torch::Tensor hidden_states) { return lm_head_(hidden_states); }
 

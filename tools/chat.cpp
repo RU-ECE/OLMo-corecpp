@@ -697,6 +697,7 @@ int main(int argc, char** argv) {
   // Phase 1: parse CLI flags. Defaults below match the docblock above.
   // -----------------------------------------------------------------
   std::string checkpoint_path, config_path, vocab_path, merges_path;
+  std::string int4_path;  // --int4 <sidecar.int4.pt>: INT4 weight-only inference
   std::string device_pref = "auto";
   int64_t max_tokens = 128;
   double temperature = 0.8;
@@ -793,6 +794,7 @@ int main(int argc, char** argv) {
       cuda_graph_warmup_steps = std::stoll(argv[++i]);
     else if (arg == "--instruct") instruct_mode = true;
     else if (arg == "--bf16") force_bf16 = true;
+    else if (arg == "--int4" && i + 1 < argc) int4_path = argv[++i];
   }
 
   if (checkpoint_path.empty() || config_path.empty() || vocab_path.empty() || merges_path.empty()) {
@@ -897,6 +899,15 @@ int main(int argc, char** argv) {
     align_mtp_config_with_checkpoint(cfg, checkpoint_path);
 
     olmo_cpp::Transformer model(cfg);
+    if (!int4_path.empty()) {
+      // INT4 weight-only: load the sidecar (kept-fp params + packed int4 weights),
+      // free the dense projections, then move the kept-fp params to the device
+      // (the int4 weights are placed on the device by enable_int4 directly). This
+      // keeps a 7B at ~6-7GB on the GPU so it fits a 24GB card.
+      std::cout << "Loading INT4 sidecar: " << int4_path << "\n";
+      model->enable_int4(int4_path, device);
+      model->to(device);
+    } else {
     // Load the checkpoint DIRECTLY onto the target device. Loading to CPU and
     // then Module::to(device) corrupts base-weight storage for checkpoints that
     // were saved from a CUDA model (the loaded tensor has valid metadata but a
@@ -920,6 +931,7 @@ int main(int argc, char** argv) {
       model->to(torch::kFloat32);
       model->to(device);
     }
+    }  // end !int4_path else
 
     // (fast-inference [17]) Optional draft model for two-model speculative.
     std::unique_ptr<olmo_cpp::Transformer> draft_model;

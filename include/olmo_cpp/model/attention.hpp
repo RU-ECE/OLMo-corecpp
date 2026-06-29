@@ -38,6 +38,7 @@
 #include "olmo_cpp/model/rope.hpp"
 #include "olmo_cpp/model/dora.hpp"
 #include "olmo_cpp/float8/float8.hpp"
+#include "olmo_cpp/nn/quant.hpp"
 #include <torch/torch.h>
 #include <optional>
 #include <memory>
@@ -88,6 +89,13 @@ class AttentionImpl : public torch::nn::Module {
       torch::Tensor x,
       const RoPEBuffers* rope_bufs,
       torch::Tensor attn_mask);
+
+  /// Enable INT4 weight-only inference: the four projections route through
+  /// int4_linear() instead of the dense Linears. The dense w_q_/.../w_out_
+  /// weights are then unused (and should be freed by the caller). Used by
+  /// Transformer::enable_int4() after loading an .int4.pt sidecar.
+  void set_int4(Int4Quantized q, Int4Quantized k, Int4Quantized v,
+                Int4Quantized out);
 
  private:
   /// Q projection: [d_model] -> [n_heads * head_dim].
@@ -153,6 +161,11 @@ class AttentionImpl : public torch::nn::Module {
   /// w_*_->weight + trainable low-rank delta), skipping the packed-QKV fast path.
   bool use_dora_ = false;
   std::optional<DoRAAdapter> dora_q_, dora_k_, dora_v_, dora_out_;
+
+  /// INT4 weight-only inference: when true, q/k/v/out route through
+  /// int4_linear() with these packed weights (the dense Linears are bypassed).
+  bool use_int4_ = false;
+  Int4Quantized int4_q_, int4_k_, int4_v_, int4_out_;
 };
 
 /// Holder type macro from LibTorch — defines `Attention` as a shared-ptr

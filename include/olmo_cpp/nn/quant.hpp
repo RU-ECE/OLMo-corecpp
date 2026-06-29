@@ -61,6 +61,12 @@ torch::Tensor fp8_gemv(const Fp8Quantized& w, torch::Tensor x);
 /// GEMV against an INT4-quantized weight.
 torch::Tensor int4_gemv(const Int4Quantized& w, torch::Tensor x);
 
+/// Linear layer (y = x · Wᵀ) against an INT4-quantized weight, for any leading
+/// dims of x [..., in] -> [..., out]. Decode (a single token) uses the fused
+/// int4 GEMV (no dense weight ever materialized -> low VRAM, fast); prefill
+/// (multiple tokens) dequantizes the weight transiently for one dense matmul.
+torch::Tensor int4_linear(const Int4Quantized& w, torch::Tensor x);
+
 #ifdef OLMO_HAS_CUDA_KERNELS
 /// CUDA dequant kernels — used internally by dequantize_fp8 /
 /// dequantize_int4_awq when the input is on a CUDA device. Replace the

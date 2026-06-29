@@ -33,6 +33,7 @@
 
 #include "olmo_cpp/float8/float8.hpp"
 #include "olmo_cpp/model/dora.hpp"
+#include "olmo_cpp/nn/quant.hpp"
 #include <torch/torch.h>
 #include <memory>
 #include <optional>
@@ -60,10 +61,17 @@ class FeedForwardImpl : public torch::nn::Module {
   /// adapters (frozen base weight + trainable delta) and skips the fused kernel.
   void enable_dora(int rank, double alpha);
 
+  /// Enable INT4 weight-only inference: w1/w3/w2 route through int4_linear().
+  /// (Non-fused FFN; the merged inference model is non-fused.)
+  void set_int4(Int4Quantized w1, Int4Quantized w3, Int4Quantized w2);
+
  private:
   int64_t d_model_ = 0, hidden_size_ = 0;
   bool use_dora_ = false;
   std::optional<DoRAAdapter> dora_w1_, dora_w3_, dora_w2_, dora_gate_up_;
+
+  bool use_int4_ = false;
+  Int4Quantized int4_w1_, int4_w3_, int4_w2_;
 
   // Standard path: separate gate (w1) and up (w3)
   torch::nn::Linear w1_{nullptr};

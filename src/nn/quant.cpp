@@ -181,4 +181,23 @@ torch::Tensor int4_gemv(const Int4Quantized& w, torch::Tensor x) {
   return torch::matmul(W, x.contiguous().to(torch::kFloat32));
 }
 
+torch::Tensor int4_linear(const Int4Quantized& w, torch::Tensor x) {
+  auto orig = x.sizes().vec();          // [..., in]
+  const int64_t in  = x.size(-1);
+  const int64_t out = w.weight.size(0);
+  auto x2 = x.reshape({-1, in}).contiguous();   // [N, in]
+  const int64_t N = x2.size(0);
+  torch::Tensor y2;
+  if (N == 1) {
+    // Decode: fused int4 GEMV (W·x), no dense weight materialized.
+    y2 = int4_gemv(w, x2.select(0, 0)).unsqueeze(0);     // [1, out]
+  } else {
+    // Prefill: transient dense dequant + one matmul (x · Wᵀ).
+    auto W = dequantize_int4_awq(w).to(x2.options().dtype(torch::kFloat32));  // [out, in]
+    y2 = torch::matmul(x2.to(torch::kFloat32), W.transpose(0, 1));            // [N, out]
+  }
+  orig.back() = out;
+  return y2.to(x.dtype()).reshape(orig);
+}
+
 }  // namespace olmo_cpp

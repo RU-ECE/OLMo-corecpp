@@ -288,6 +288,52 @@ torch::Tensor TransformerImpl::forward_tree(torch::Tensor input_ids,
   return lm_head_(h);
 }
 
+void TransformerImpl::enable_int4(const std::string& sidecar_path, torch::Device device) {
+  torch::serialize::InputArchive arch;
+  arch.load_from(sidecar_path);
+  torch::NoGradGuard ng;
+
+  // 1) Kept-fp tensors (norms, embeddings, lm_head) are stored under their
+  //    plain param name; quantized Linears are stored as <name>.int4.* and so
+  //    are skipped here (try_read returns false), then filled in by set_int4.
+  for (auto& p : named_parameters()) {
+    torch::Tensor t;
+    if (arch.try_read(p.key(), t))
+      p.value().set_data(t.to(p.value().dtype()).contiguous());
+  }
+
+  // 2) Build an Int4Quantized from the sidecar for the Linear weight <base>.
+  auto read_int4 = [&](const std::string& base) {
+    Int4Quantized q;
+    torch::Tensor gs;
+    arch.read(base + ".int4.weight", q.weight);
+    arch.read(base + ".int4.scales", q.scales);
+    arch.read(base + ".int4.group_size", gs);
+    q.group_size = gs.item<int64_t>();
+    q.weight = q.weight.to(device).contiguous();
+    q.scales = q.scales.to(device).contiguous();
+    return q;
+  };
+
+  // 3) Install int4 on every attention / FFN submodule (frees their dense wts).
+  int n_attn = 0, n_ffn = 0;
+  for (auto& nm : named_modules()) {
+    const std::string& b = nm.key();
+    if (b.empty()) continue;
+    if (auto* a = nm.value()->as<AttentionImpl>()) {
+      a->set_int4(read_int4(b + ".w_q.weight"), read_int4(b + ".w_k.weight"),
+                  read_int4(b + ".w_v.weight"), read_int4(b + ".w_out.weight"));
+      ++n_attn;
+    } else if (auto* f = nm.value()->as<FeedForwardImpl>()) {
+      f->set_int4(read_int4(b + ".w1.weight"), read_int4(b + ".w3.weight"),
+                  read_int4(b + ".w2.weight"));
+      ++n_ffn;
+    }
+  }
+  std::cout << "INT4: enabled on " << n_attn << " attention + " << n_ffn
+            << " FFN blocks from " << sidecar_path << std::endl;
+}
+
 torch::Tensor TransformerImpl::forward(
     torch::Tensor input_ids,
     c10::optional<torch::Tensor> labels,

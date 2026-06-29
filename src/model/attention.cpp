@@ -121,6 +121,21 @@ AttentionImpl::AttentionImpl(const TransformerConfig& cfg, int64_t /*layer_idx*/
   }
 }
 
+void AttentionImpl::set_int4(Int4Quantized q, Int4Quantized k, Int4Quantized v,
+                             Int4Quantized out) {
+  int4_q_ = std::move(q);
+  int4_k_ = std::move(k);
+  int4_v_ = std::move(v);
+  int4_out_ = std::move(out);
+  use_int4_ = true;
+  // Free the dense projection weights — unused under INT4 — so they don't
+  // occupy (V)RAM. The forward never touches w_*_->weight when use_int4_.
+  torch::NoGradGuard ng;
+  for (auto* l : {&w_q_, &w_k_, &w_v_, &w_out_})
+    if ((*l)->weight.defined())
+      (*l)->weight.set_data(torch::empty({0}, (*l)->weight.options()));
+}
+
 torch::Tensor AttentionImpl::forward(
     torch::Tensor x,
     const RoPEBuffers* rope_bufs,
@@ -135,7 +150,7 @@ torch::Tensor AttentionImpl::forward(
   // 3 Linears + 3 reshapes + 1 RoPE = 7 ATen calls.
   torch::Tensor q, k, v;
   const bool can_use_fused_qkv =
-      x.is_cuda() && !use_float8_ && !use_dora_ && !q_norm_ && !k_norm_ && rope_bufs != nullptr;
+      x.is_cuda() && !use_float8_ && !use_dora_ && !use_int4_ && !q_norm_ && !k_norm_ && rope_bufs != nullptr;
   if (can_use_fused_qkv) {
     auto w_packed = packed_qkv_weight();
     // RoPEBuffers stores pos_cos/pos_sin as [seq_len, head_dim] full-dim
@@ -173,7 +188,12 @@ torch::Tensor AttentionImpl::forward(
   // Packed-QKV path (CPU or QK-norm active): still concat weights and do
   // one Linear, just don't use the fused-with-RoPE kernel. Saves 2 of
   // the 3 Linear launches without changing numerics.
-  if (use_dora_) {
+  if (use_int4_) {
+    // INT4 weight-only: fused dequant-GEMV at decode, transient dequant at prefill.
+    q = int4_linear(int4_q_, x);
+    k = int4_linear(int4_k_, x);
+    v = int4_linear(int4_v_, x);
+  } else if (use_dora_) {
     // DoRA: per-projection frozen base + trainable low-rank adapter.
     q = (*dora_q_)->forward(x, w_q_->weight);
     k = (*dora_k_)->forward(x, w_k_->weight);
@@ -273,6 +293,7 @@ torch::Tensor AttentionImpl::forward(
   }
 
   attn_out = attn_out.transpose(1, 2).reshape({B, S, -1});
+  if (use_int4_) return int4_linear(int4_out_, attn_out);
   if (use_dora_) return (*dora_out_)->forward(attn_out, w_out_->weight);
   return use_float8_
       ? float8_linear_emulated(attn_out, w_out_->weight,
@@ -290,9 +311,9 @@ torch::Tensor AttentionImpl::forward_with_mask(
     torch::Tensor attn_mask) {
   auto B = x.size(0);
   auto S = x.size(1);
-  auto q = w_q_(x);
-  auto k = w_k_(x);
-  auto v = w_v_(x);
+  auto q = use_int4_ ? int4_linear(int4_q_, x) : w_q_(x);
+  auto k = use_int4_ ? int4_linear(int4_k_, x) : w_k_(x);
+  auto v = use_int4_ ? int4_linear(int4_v_, x) : w_v_(x);
   if (q_norm_ && !use_head_qk_norm_) q = (*q_norm_)(q);
   if (k_norm_ && !use_head_qk_norm_) k = (*k_norm_)(k);
   q = q.view({B, S, n_heads_,   head_dim_}).transpose(1, 2);
@@ -312,7 +333,7 @@ torch::Tensor AttentionImpl::forward_with_mask(
   }
   auto attn_out = at::scaled_dot_product_attention(q, k, v, attn_mask, 0.0, false);
   attn_out = attn_out.transpose(1, 2).reshape({B, S, -1});
-  return w_out_(attn_out);
+  return use_int4_ ? int4_linear(int4_out_, attn_out) : w_out_(attn_out);
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -338,7 +359,7 @@ torch::Tensor AttentionImpl::forward_paged(
   // training-side `forward` uses, dropped into the inference (paged) path.
   // Replaces 3 Linears + 3 reshapes + 1 RoPE with a single launch.
   const bool can_use_fused_qkv =
-      x.is_cuda() && !use_float8_ && !use_dora_ && !q_norm_ && !k_norm_ && rope_bufs != nullptr;
+      x.is_cuda() && !use_float8_ && !use_dora_ && !use_int4_ && !q_norm_ && !k_norm_ && rope_bufs != nullptr;
   if (can_use_fused_qkv) {
     auto w_packed = packed_qkv_weight();
     auto cos_full = rope_bufs->pos_cos.narrow(0, start_pos, S);
@@ -360,9 +381,15 @@ torch::Tensor AttentionImpl::forward_paged(
                                     lin->bias.defined() ? lin->bias : torch::Tensor(),
                                     *sx, *sw);
     };
-    q = linear_maybe_fp8(w_q_, fp8_qx_.get(), fp8_qw_.get(), x);
-    k = linear_maybe_fp8(w_k_, fp8_kx_.get(), fp8_kw_.get(), x);
-    v = linear_maybe_fp8(w_v_, fp8_vx_.get(), fp8_vw_.get(), x);
+    if (use_int4_) {
+      q = int4_linear(int4_q_, x);
+      k = int4_linear(int4_k_, x);
+      v = int4_linear(int4_v_, x);
+    } else {
+      q = linear_maybe_fp8(w_q_, fp8_qx_.get(), fp8_qw_.get(), x);
+      k = linear_maybe_fp8(w_k_, fp8_kx_.get(), fp8_kw_.get(), x);
+      v = linear_maybe_fp8(w_v_, fp8_vx_.get(), fp8_vw_.get(), x);
+    }
 
     if (q_norm_ && !use_head_qk_norm_) q = (*q_norm_)(q);
     if (k_norm_ && !use_head_qk_norm_) k = (*k_norm_)(k);
@@ -420,6 +447,7 @@ torch::Tensor AttentionImpl::forward_paged(
           sm_scale);
     }
     auto attn_out_one = attn_flat.view({B, S, n_heads_ * head_dim_});
+    if (use_int4_) return int4_linear(int4_out_, attn_out_one);
     return use_float8_
         ? float8_linear_emulated(attn_out_one, w_out_->weight,
                                  w_out_->bias.defined() ? w_out_->bias : torch::Tensor(),
@@ -491,7 +519,7 @@ torch::Tensor AttentionImpl::forward_paged(
   }
 
   attn_out = attn_out.transpose(1, 2).reshape({B, S, -1});
-  return w_out_(attn_out);
+  return use_int4_ ? int4_linear(int4_out_, attn_out) : w_out_(attn_out);
 }
 
 }  // namespace olmo_cpp

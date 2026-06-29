@@ -76,8 +76,24 @@ Loss curve (step → loss): 10→7.40, 100→4.59, 600→3.73, 1000→2.95, 1600
 
 ---
 
-## 6. 2× H100 server (149.165.174.207) — partial run
-*(pending — being compiled from the server logs)*
+## 6. 2× H100 server (149.165.174.207) — runs
+Hardware: 2× H100 80GB HBM3 (NVLink). (A vLLM process held ~10–12 GB/GPU; no OLMo training was active.)
+
+| Run | Params | Setup | Result | Source |
+|---|---|---|---|---|
+| **`bench_1b` (all opts)** | 961M (d2048/16L/16H) | 2× H100, DDP+NCCL, **CUDA graphs**, ForeachAdamW, GPU-resident data+grad-clip, BF16, TF32, 50 steps | **103,034 tok/s** (≈51.5k/GPU), 636 ms/step | bench log |
+| `usable_1B` pretrain | 961M | 2× H100 DDP, eff. batch 64, 6.92B-tok stream | **partial: ~8,000 / 120,000 steps** (ckpts 4k/6k/8k) | `runs/usable_1B` |
+| `usable_3B` (3.6B) | d3072/24L/24H, Muon, cuda_graph=1 | **config staged, never ran** (51-byte heartbeat only) | `runs/mg_3B` |
+| FSDP smoke | — | FULL_SHARD | **validated at 50 steps** (no throughput logged) | `runs/fsdp` |
+
+**Strong, real number: optimized C++ trains 961M at ~103k tok/s on 2× H100 with the full opt stack + CUDA graphs.**
+
+### ⚠️ Critical reconciliation — the C++ vs Python training claim
+The two servers tell different stories **because of CUDA graphs**:
+- **kuiper (graphs ON):** C++ steady-state ~67–71 ms (~57–58k tok/s) vs Python ~76 ms (~53k) → **C++ ~10% faster.**
+- **174.207 (graphs OFF in that C++ log):** C++ 47,661 vs Python 53,466 tok/s → **Python ~12% faster.**
+
+→ The **all-optimizations** answer at this 190M scale is **C++ ~10% faster steady-state** — modest, *not* 5–20×, and only when CUDA graphs are enabled. **Do not cite a large training speedup from these micro-benches.** The defensible wins are: (a) **inference 6.6×** (§3), (b) the **inference head-to-head vs ollama/llama.cpp** (§7), and (c) strong absolute training throughput (103k tok/s on 2× H100). A **matched, larger-scale (1B+), graphs-on** C++-vs-PyTorch rerun is the right way to make the training-speedup case — recommended before publishing.
 
 ---
 

@@ -98,4 +98,21 @@ The two servers tell different stories **because of CUDA graphs**:
 ---
 
 ## 7. Head-to-head: OLMo-corecpp vs llama.cpp vs ollama (H100)
-*(pending — ollama + llama.cpp being installed + benchmarked on the H100)*
+*(harness built; the install+bench agent on 174.207 hit a session limit before producing numbers — rerun the harness in `scripts/bench/` on the H100 to fill this in.)*
+
+## 8. Quantization / deployment of the finetuned 7B (measured on H100)
+Goal: run the 7B on a 24GB GPU (RTX 4090). All artifacts on Box at `llmcpp_preservation/finetune_olmo2_7b/`.
+
+| Format | File size | VRAM | Decode | Fits 4090 (24GB)? | Status |
+|---|---|---|---|---|---|
+| **fp32** (`merged_final.pt`) | 29 GB | ~29 GB | **47.9 tok/s** (CUDA graphs) | ❌ (needs ≥40GB) | ✅ works, fast |
+| **fp32 + `--bf16`** | (same file) | **~14 GB** | 7.2 tok/s | ✅ | ✅ works, but slow (bf16 conversion overhead in this engine) |
+| **bf16 file** (`merged_bf16.pt`) | 14 GB | — | — | — | ❌ **broken** — LibTorch `torch::save(bf16)` corrupts storage (cores on load); use fp32+`--bf16` instead |
+| **INT4** (`merged.int4.pt`) | **6.6 GB** | ~6–7 GB (target) | fast (target) | ✅ | ⚠️ **produced** (AWQ g128, 226/360 layers quantized); chat `--int4` forward-dispatch **not yet wired** |
+
+**Run commands** (from repo root, all opts on):
+- 80GB GPU, fastest: `./build/chat --instruct --cuda-graph --paged-kv --temperature 0.7 --top-p 0.9 --repetition-penalty 1.3 --checkpoint merged_final.pt --config configs/olmo2_7b_merged.json --vocab-file tokenizer/vocab.json --merges-file tokenizer/merges.txt --device cuda`
+- 24GB GPU (4090) today: add `--bf16` (drop `--cuda-graph` if it crashes on the platform). Works, ~7 tok/s.
+- INT4 (6–7GB, fast) — **TODO**: wire `chat --int4 merged.int4.pt` (load sidecar + route Linear matmuls through `int4_gemv`; quantizer + kernels exist).
+
+**Bottom line for the 4090:** fp32+`--bf16` runs *now* (slow); the **fast** 4090 path is INT4, which still needs the chat forward-wiring (the only remaining engine task).

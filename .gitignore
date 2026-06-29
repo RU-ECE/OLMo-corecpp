@@ -68,3 +68,5 @@ plan.md
 *.qdstrm.md
 *.sqlite.md.claude/worktrees/
 .claude/
+scripts/race/results/
+*.ihateai

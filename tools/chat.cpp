@@ -910,11 +910,15 @@ int main(int argc, char** argv) {
     try {
       torch::load(model, checkpoint_path, device);
     } catch (const c10::Error&) {
+      // bf16-saved checkpoint: load on CPU, cast to fp32 on the HOST, THEN move
+      // to device. Moving a bf16 module to CUDA first segfaults in the H2D copy
+      // on some driver/runtime combos (seen on this box's CUDA 13); converting
+      // to fp32 host-side first sidesteps it, so bf16 files load on any CUDA box.
       model = olmo_cpp::Transformer(cfg);
       model->to(torch::kBFloat16);
-      model->to(device);
-      torch::load(model, checkpoint_path, device);
+      torch::load(model, checkpoint_path, torch::kCPU);
       model->to(torch::kFloat32);
+      model->to(device);
     }
 
     // (fast-inference [17]) Optional draft model for two-model speculative.

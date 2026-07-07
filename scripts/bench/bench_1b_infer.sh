@@ -70,7 +70,9 @@ bench_cpp(){ # $1=label $2=model-arg (--checkpoint <p> | --int4 <p>) $3=batch
 
 say "1. OUR C++ engine (bench_chat) — your trained 1B, device=$DEVICE"
 for b in $BATCHES; do
-  echo "-- bf16, batch $b --"; bench_cpp bf16 "--checkpoint $CKPT --bf16" "$b"
+  # fp32 (not bf16): the CUDA-graph fast path needs fp32 KV pools — bf16+graph is
+  # unsupported. fp32 + cuda-graph is the paper's fast full-precision config.
+  echo "-- fp32, batch $b --"; bench_cpp fp32 "--checkpoint $CKPT" "$b"
   [[ -n "$CKPT_INT4" ]] && { echo "-- int4, batch $b --"; bench_cpp int4 "--int4 $CKPT_INT4" "$b"; }
 done
 

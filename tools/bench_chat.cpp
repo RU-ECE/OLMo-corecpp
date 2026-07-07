@@ -271,7 +271,22 @@ int main(int argc, char** argv) {
   // step into one CUDA graph and replay it — eliminating per-step kernel-launch
   // overhead (the reason eager decode is overhead-bound, ~15 tok/s, on CUDA).
   const bool fast = device.is_cuda() && batch == 1 && !force_eager;
-  if (fast) use_cuda_graph = !no_cuda_graph;
+  if (fast) {
+    use_cuda_graph = !no_cuda_graph;
+    // The graph-safe paged-KV write kernel requires FP32 pools; bf16/fp16 + CUDA
+    // graph is unsupported (paged_attention.cu TORCH_CHECK "pools must be
+    // float32"). Upcast a bf16/fp16 model to fp32 so the fast path runs the
+    // documented fp32 + cuda-graph config instead of crashing. (INT4 keeps its
+    // fp32 kept-params, so its pools are already fp32 — left untouched.)
+    if (use_cuda_graph && !model->parameters().empty()) {
+      auto dt = model->parameters()[0].dtype().toScalarType();
+      if (dt == torch::kBFloat16 || dt == torch::kHalf) {
+        std::cerr << "[bench] cuda-graph fast path needs fp32 pools; upcasting "
+                     "model to fp32 (bf16 + cuda-graph is unsupported).\n";
+        model->to(torch::kFloat32);
+      }
+    }
+  }
 
 #if defined(OLMO_HAS_CUDA_KERNELS) || defined(USE_CUDA)
   auto run_once_paged = [&](bool measure) -> void {

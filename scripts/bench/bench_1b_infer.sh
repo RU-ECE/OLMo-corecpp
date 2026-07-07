@@ -51,25 +51,39 @@ if [[ "${MAKE_INT4:-1}" == "1" && -x "$BUILD_DIR/quantize_int4" ]]; then
   fi
 fi
 
-bench_cpp(){ # $1=label $2=ckpt $3=batch
-  "$BUILD_DIR/bench_chat" --checkpoint "$2" --config "$CONFIG" \
-    --vocab-file "$VOCAB" --merges-file "$MERGES" --device "$DEVICE" \
-    --prompt-len "$PROMPT_LEN" --decode-len "$DECODE_LEN" --batch "$3" --warmup 1 --iters 3 2>/dev/null \
-    | grep -iE "Throughput|TPOT|TTFT" | sed "s/^/   [$1 b=$3] /"
+bench_cpp(){ # $1=label $2=model-arg (--checkpoint <p> | --int4 <p>) $3=batch
+  local log; log="$(mktemp)"
+  # $2 is a *word-split* flag+path pair (e.g. "--int4 runs/.../model.int4.pt").
+  # Capture stderr to a log so a crash/failure is SHOWN, not silently empty.
+  if "$BUILD_DIR/bench_chat" $2 --config "$CONFIG" \
+       --vocab-file "$VOCAB" --merges-file "$MERGES" --device "$DEVICE" \
+       --prompt-len "$PROMPT_LEN" --decode-len "$DECODE_LEN" --batch "$3" \
+       --warmup 1 --iters 3 >"$log" 2>&1; then
+    grep -iE "Throughput|TPOT|TTFT" "$log" | sed "s/^/   [$1 b=$3] /"
+    grep -iqE "Throughput|TPOT|TTFT" "$log" || \
+      { echo "   [$1 b=$3] ran but printed no metrics — full output:"; sed "s/^/      | /" "$log"; }
+  else
+    echo "   [$1 b=$3] FAILED (exit $?) — error output:"; sed "s/^/      | /" "$log"
+  fi
+  rm -f "$log"
 }
 
 say "1. OUR C++ engine (bench_chat) — your trained 1B, device=$DEVICE"
 for b in $BATCHES; do
-  echo "-- bf16, batch $b --"; bench_cpp bf16 "$CKPT" "$b"
-  [[ -n "$CKPT_INT4" ]] && { echo "-- int4, batch $b --"; bench_cpp int4 "$CKPT_INT4" "$b"; }
+  echo "-- bf16, batch $b --"; bench_cpp bf16 "--checkpoint $CKPT --bf16" "$b"
+  [[ -n "$CKPT_INT4" ]] && { echo "-- int4, batch $b --"; bench_cpp int4 "--int4 $CKPT_INT4" "$b"; }
 done
 
 say "2. ollama ($OLLAMA_TAG) — single-stream baseline at 1B scale"
 OLLAMA_TPS="n/a"
 if command -v ollama >/dev/null; then
   ollama pull "$OLLAMA_TAG" >/dev/null 2>&1 || echo "   (pull failed; set OLLAMA_TAG to an installed 1B)"
+  # ollama --verbose prints BOTH "prompt eval rate:" (prefill, huge) and
+  # "eval rate:" (generation, the real single-stream decode number). Exclude the
+  # prompt line so we report decode tok/s, not prefill.
   OLLAMA_TPS=$(printf 'Write a short paragraph about the ocean.' \
-    | ollama run "$OLLAMA_TAG" --verbose 2>&1 | grep -iE "eval rate" | grep -oE "[0-9.]+ tokens/s" | head -1)
+    | ollama run "$OLLAMA_TAG" --verbose 2>&1 \
+    | grep -i "eval rate:" | grep -vi "prompt" | grep -oE "[0-9.]+ tokens/s" | head -1)
   echo "   ollama eval rate: ${OLLAMA_TPS:-<not parsed>}"
 else
   echo "   ollama not installed (https://ollama.com) — skipping"

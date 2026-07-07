@@ -86,6 +86,7 @@ double percentile(std::vector<double> xs, double p) {
 
 int main(int argc, char** argv) {
   std::string checkpoint_path, config_path, vocab_path, merges_path;
+  std::string int4_path;  // --int4 <sidecar.int4.pt>: INT4 weight-only inference
   std::string device_pref = "auto";
   std::string output_path = "";
   int64_t prompt_len = 128;
@@ -109,9 +110,10 @@ int main(int argc, char** argv) {
     else if (a == "--warmup" && i + 1 < argc) warmup = std::stoll(next());
     else if (a == "--iters" && i + 1 < argc) iters = std::stoll(next());
     else if (a == "--output" && i + 1 < argc) output_path = next();
+    else if (a == "--int4" && i + 1 < argc) int4_path = next();
     else if (a == "--bf16") force_bf16 = true;
     else if (a == "--help" || a == "-h") {
-      std::cerr << "Usage: bench_chat --checkpoint <path> --config <path> "
+      std::cerr << "Usage: bench_chat (--checkpoint <path> | --int4 <sidecar>) --config <path> "
                    "--vocab-file <path> --merges-file <path> "
                    "[--device cuda|mps|cpu] [--prompt-len N] [--decode-len N] "
                    "[--batch N] [--warmup N] [--iters N] [--output bench.json]\n";
@@ -119,9 +121,10 @@ int main(int argc, char** argv) {
     }
   }
 
-  if (checkpoint_path.empty() || config_path.empty() ||
+  if ((checkpoint_path.empty() && int4_path.empty()) || config_path.empty() ||
       vocab_path.empty() || merges_path.empty()) {
-    std::cerr << "Missing required args. Use --help for usage.\n";
+    std::cerr << "Missing required args (need --checkpoint or --int4, plus "
+                 "--config/--vocab-file/--merges-file). Use --help for usage.\n";
     return 1;
   }
 
@@ -146,18 +149,35 @@ int main(int argc, char** argv) {
 #endif
 
   olmo_cpp::Transformer model(cfg);
-  // bf16-trained checkpoints store BF16 weights; an fp32 model mismatches storage
-  // size on load. Try fp32, fall back to casting the model to BF16 first.
-  try {
-    torch::load(model, checkpoint_path, torch::kCPU);
-  } catch (const c10::Error&) {
-    model = olmo_cpp::Transformer(cfg);
-    model->to(torch::kBFloat16);
-    torch::load(model, checkpoint_path, torch::kCPU);
-    // Upcast to fp32 unless the device is CUDA (where bf16 inference is fast).
-    if (device.type() != torch::kCUDA) model->to(torch::kFloat32);
+  if (!int4_path.empty()) {
+    // INT4 weight-only: load the sidecar (kept-fp params + packed int4 weights),
+    // free the dense projections, then move kept-fp params to the device (the
+    // int4 weights are placed on the device by enable_int4 directly).
+    std::cout << "Loading INT4 sidecar: " << int4_path << "\n";
+    model->enable_int4(int4_path, device);
+    model->to(device);
+  } else {
+    // Load DIRECTLY onto the target device first (moving a CUDA-saved checkpoint
+    // through CPU can corrupt base-weight storage). bf16-trained checkpoints store
+    // BF16 weights: an fp32 model mismatches storage size on load, so try fp32
+    // then fall back to a BF16 model.
+    model->to(device);
+    try {
+      torch::load(model, checkpoint_path, device);
+    } catch (const c10::Error&) {
+      // bf16-saved checkpoint: load on CPU, cast to fp32 on the HOST, THEN move to
+      // device. Moving a bf16 module to CUDA first segfaults in the H2D copy on
+      // this box's CUDA 13; upcasting to fp32 host-side first sidesteps it.
+      model = olmo_cpp::Transformer(cfg);
+      model->to(torch::kBFloat16);
+      torch::load(model, checkpoint_path, torch::kCPU);
+      model->to(torch::kFloat32);
+      model->to(device);
+    }
   }
-  if (force_bf16) model->to(torch::kBFloat16);  // tensor-core inference for an fp32 .pt
+  // --bf16 casts AFTER the model is on the device, so the (unstable) bf16 host->
+  // device copy never happens; the cast runs on-device where it is safe.
+  if (force_bf16) model->to(torch::kBFloat16);
   model->to(device);
   model->eval();
   torch::NoGradGuard no_grad;

@@ -283,10 +283,19 @@ option(OLMO_USE_ADVANCED_PARALLEL
 # mode without conditional compilation.
 list(APPEND OLMO_SOURCES src/distributed/zero1.cpp)
 
+# fsdp.cpp is ALSO always compiled, for the same reason: when neither
+# OLMO_HAS_NCCL nor OLMO_HAS_DDP is defined it compiles its #else branch of
+# no-op stubs (shard/unshard/reshard/reduce_scatter). train.cpp references
+# those FSDPContext methods unconditionally (only the create() call is behind
+# the NCCL/DDP #ifdef), so a single-GPU build with no backend must still have
+# the symbols to link — the fsdp optional stays nullopt at runtime, so the
+# no-ops never actually run. Under NCCL/DDP the real #if branch is compiled.
+list(APPEND OLMO_SOURCES src/distributed/fsdp.cpp)
+
 if(OLMO_USE_NCCL)
-    # NCCL multi-GPU path: ddp.cpp (DDP) + fsdp.cpp (FSDP/ZeRO-3 sharding),
-    # both with the ProcessGroupNCCL backend. No Gloo needed.
-    list(APPEND OLMO_SOURCES src/distributed/ddp.cpp src/distributed/fsdp.cpp)
+    # NCCL multi-GPU path: ddp.cpp (DDP) with the ProcessGroupNCCL backend.
+    # fsdp.cpp is compiled unconditionally above (real impl under OLMO_HAS_NCCL).
+    list(APPEND OLMO_SOURCES src/distributed/ddp.cpp)
     message(STATUS "Distributed: NCCL DDP + FSDP ENABLED (olmo_train multi-GPU)")
 elseif(OLMO_USE_DDP AND GLOO_INCLUDE_DIR)
     list(APPEND OLMO_SOURCES
@@ -296,7 +305,6 @@ elseif(OLMO_USE_DDP AND GLOO_INCLUDE_DIR)
     if(OLMO_USE_ADVANCED_PARALLEL)
         list(APPEND OLMO_SOURCES
             src/distributed/pipeline_parallel.cpp
-            src/distributed/fsdp.cpp
             src/distributed/context_parallel.cpp
             src/distributed/expert_parallel.cpp
         )

@@ -328,15 +328,23 @@ __global__ void int4_awq_gemv_fast_kernel(
   float acc = 0.0f;
   for (int v = lane; v < n_vec; v += 32) {
     uint4 packed = W_row_v[v];
-    const uint8_t* pb = reinterpret_cast<const uint8_t*>(&packed);
     const int base_byte = v << 4;
+    // Extract bytes with REGISTER shifts from the 4 uint32 lanes of the uint4.
+    // Reading via a uint8_t* into &packed forces `packed` into local memory
+    // (byte-addressable) — a spill that kills throughput. Shifting keeps it all
+    // in registers. Little-endian: (word >> (bi*8)) & 0xFF == W_row[base+wi*4+bi].
+    const uint32_t w32[4] = {packed.x, packed.y, packed.z, packed.w};
     #pragma unroll
-    for (int k = 0; k < 16; ++k) {
-      const uint8_t byte = pb[k];
-      const int j = (base_byte + k) << 1;               // even input index
-      const float s = __bfloat162float(S_row[j / group_size]);
-      acc += static_cast<float>(static_cast<int>(byte & 0x0F) - 8) * s * x[j];
-      acc += static_cast<float>(static_cast<int>(byte >> 4)   - 8) * s * x[j + 1];
+    for (int wi = 0; wi < 4; ++wi) {
+      const uint32_t word = w32[wi];
+      #pragma unroll
+      for (int bi = 0; bi < 4; ++bi) {
+        const int byte = static_cast<int>((word >> (bi << 3)) & 0xFFu);
+        const int j = (base_byte + (wi << 2) + bi) << 1;   // even input index
+        const float s = __bfloat162float(S_row[j / group_size]);
+        acc += static_cast<float>((byte & 0x0F) - 8) * s * x[j];
+        acc += static_cast<float>((byte >> 4)   - 8) * s * x[j + 1];
+      }
     }
   }
   // Scalar tail (in_half not a multiple of 16 — not hit for these dims).

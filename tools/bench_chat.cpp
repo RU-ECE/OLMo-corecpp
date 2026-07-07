@@ -35,10 +35,16 @@
 #include "olmo_cpp/config.hpp"
 #include "olmo_cpp/model/transformer.hpp"
 #include "olmo_cpp/model/kv_cache.hpp"
+#include "olmo_cpp/model/paged_kv_cache.hpp"
 #include "olmo_cpp/data/bpe_tokenizer.hpp"
 #include "olmo_cpp/backend/cuda_backend.hpp"
 #include "olmo_cpp/backend/simd_backend.hpp"
 #include <torch/torch.h>
+#if defined(OLMO_HAS_CUDA_KERNELS) || defined(USE_CUDA)
+#include <ATen/cuda/CUDAGraph.h>
+#include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAGuard.h>
+#endif
 #include <chrono>
 #include <iostream>
 #include <fstream>
@@ -95,6 +101,15 @@ int main(int argc, char** argv) {
   int64_t warmup = 3;
   int64_t iters = 5;
   bool force_bf16 = false;  // cast model to BF16 for inference (tensor cores)
+  // Fast decode path (CUDA, batch 1): paged KV cache + whole-step CUDA-graph
+  // capture/replay. Default ON for CUDA batch-1; the eager KVCache loop below is
+  // the unoptimized baseline (kept for the A/B and for MPS/CPU/batched runs).
+  bool force_eager = false;      // --eager: force the eager KVCache baseline
+  bool no_cuda_graph = false;    // --no-cuda-graph: paged KV but skip graph capture
+  bool use_cuda_graph = false;   // resolved below for the fast path
+  int64_t paged_page_size = 16;
+  int64_t paged_max_seq = 2048;
+  int64_t cuda_graph_warmup = 3;
 
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -112,6 +127,12 @@ int main(int argc, char** argv) {
     else if (a == "--output" && i + 1 < argc) output_path = next();
     else if (a == "--int4" && i + 1 < argc) int4_path = next();
     else if (a == "--bf16") force_bf16 = true;
+    else if (a == "--eager") force_eager = true;
+    else if (a == "--no-cuda-graph") no_cuda_graph = true;
+    else if (a == "--paged-page-size" && i + 1 < argc) paged_page_size = std::stoll(next());
+    else if (a == "--paged-max-seq" && i + 1 < argc) paged_max_seq = std::stoll(next());
+    else if (a == "--cuda-graph-warmup" && i + 1 < argc) cuda_graph_warmup = std::stoll(next());
+    else if (a == "--paged-kv" || a == "--cuda-graph") { /* accepted; fast path is default on CUDA batch-1 */ }
     else if (a == "--help" || a == "-h") {
       std::cerr << "Usage: bench_chat (--checkpoint <path> | --int4 <sidecar>) --config <path> "
                    "--vocab-file <path> --merges-file <path> "
@@ -244,8 +265,124 @@ int main(int argc, char** argv) {
     }
   };
 
-  for (int64_t w = 0; w < warmup; ++w) run_once(false);
-  for (int64_t i = 0; i < iters; ++i) run_once(true);
+  // ---- Fast path (CUDA, batch 1): paged KV + CUDA-graph capture/replay ----
+  // Mirrors tools/chat.cpp's optimized decode: prefill through forward_paged,
+  // a few eager warmup steps (allocator settle), then capture the whole decode
+  // step into one CUDA graph and replay it — eliminating per-step kernel-launch
+  // overhead (the reason eager decode is overhead-bound, ~15 tok/s, on CUDA).
+  const bool fast = device.is_cuda() && batch == 1 && !force_eager;
+  if (fast) use_cuda_graph = !no_cuda_graph;
+
+#if defined(OLMO_HAS_CUDA_KERNELS) || defined(USE_CUDA)
+  auto run_once_paged = [&](bool measure) -> void {
+    torch::NoGradGuard no_grad;
+    const int64_t n_kv_heads = cfg.get_n_kv_heads();
+    const int64_t head_dim   = cfg.get_head_dim();
+    const int64_t max_pages  = (paged_max_seq + paged_page_size - 1) / paged_page_size;
+    auto model_dtype = torch::kFloat32;
+    if (!model->parameters().empty())
+      model_dtype = model->parameters()[0].dtype().toScalarType();
+    const bool graph_mode = use_cuda_graph && device.is_cuda();
+    auto paged = graph_mode
+        ? olmo_cpp::make_paged_kv_cache_graph_safe(model->n_layers(), n_kv_heads,
+              head_dim, paged_page_size, max_pages, device, model_dtype)
+        : olmo_cpp::make_paged_kv_cache(model->n_layers(), n_kv_heads,
+              head_dim, paged_page_size, max_pages, device, model_dtype);
+
+    // Prefill [1, prompt_len].
+    auto t_start = std::chrono::steady_clock::now();
+    device_sync(device);
+    auto pin = torch::tensor(prompt, torch::kInt64).unsqueeze(0).to(device);  // [1, T]
+    auto logits = model->forward_paged(pin, paged.get());
+    int64_t next_tok = logits.select(1, logits.size(1) - 1).argmax(-1).item<int64_t>();
+    device_sync(device);
+    auto t_prefill = std::chrono::steady_clock::now();
+
+    std::vector<double> step_ms;
+    step_ms.reserve(static_cast<size_t>(decode_len));
+    int64_t produced = 0;
+
+    // Reused [1,1] input buffer (no per-step host->device alloc).
+    auto step_buf = torch::empty({1, 1},
+        torch::TensorOptions().dtype(torch::kInt64).device(device));
+    auto eager_step = [&](int64_t last) -> int64_t {
+      auto step_start = std::chrono::steady_clock::now();
+      step_buf.fill_(last);
+      auto out = model->forward_paged(step_buf, paged.get());
+      int64_t nt = out.select(1, out.size(1) - 1).squeeze(0).argmax(-1).item<int64_t>();
+      device_sync(device);
+      auto step_end = std::chrono::steady_clock::now();
+      step_ms.push_back(std::chrono::duration<double, std::milli>(step_end - step_start).count());
+      return nt;
+    };
+
+    // Eager warmup steps before capture (only meaningful in graph mode).
+    const int64_t warm = graph_mode ? cuda_graph_warmup : 0;
+    for (int64_t s = 0; s < warm && produced < decode_len; ++s) {
+      next_tok = eager_step(next_tok);
+      ++produced;
+    }
+
+    if (graph_mode && produced < decode_len) {
+      auto static_input = torch::empty({1, 1},
+          torch::TensorOptions().dtype(torch::kInt64).device(device));
+      static_input.fill_(next_tok);
+      paged->set_external_advance(true);   // we bump the cursor, not append()
+      paged->advance_cursor(1);            // slot for the to-be-captured step
+      auto cap_stream = c10::cuda::getStreamFromPool();
+      c10::cuda::CUDAStreamGuard guard(cap_stream);
+      at::cuda::CUDAGraph graph;
+      torch::Tensor captured_logits;
+      {  // capture run == first real decode step under graph mode
+        auto step_start = std::chrono::steady_clock::now();
+        graph.capture_begin();
+        captured_logits = model->forward_paged(static_input, paged.get());
+        graph.capture_end();
+        next_tok = captured_logits.select(1, 0).squeeze(0).argmax(-1).item<int64_t>();
+        device_sync(device);
+        auto step_end = std::chrono::steady_clock::now();
+        step_ms.push_back(std::chrono::duration<double, std::milli>(step_end - step_start).count());
+        ++produced;
+      }
+      while (produced < decode_len) {  // replay loop — one launch per token
+        auto step_start = std::chrono::steady_clock::now();
+        static_input.fill_(next_tok);
+        paged->advance_cursor(1);
+        graph.replay();
+        next_tok = captured_logits.select(1, 0).squeeze(0).argmax(-1).item<int64_t>();
+        device_sync(device);
+        auto step_end = std::chrono::steady_clock::now();
+        step_ms.push_back(std::chrono::duration<double, std::milli>(step_end - step_start).count());
+        ++produced;
+      }
+    } else {
+      while (produced < decode_len) {  // paged eager fallback (--no-cuda-graph)
+        next_tok = eager_step(next_tok);
+        ++produced;
+      }
+    }
+
+    auto t_end = std::chrono::steady_clock::now();
+    if (measure) {
+      double prefill_ms = std::chrono::duration<double, std::milli>(t_prefill - t_start).count();
+      double decode_total_ms = std::chrono::duration<double, std::milli>(t_end - t_prefill).count();
+      ttft_ms.push_back(prefill_ms);
+      tpot_ms.push_back(decode_total_ms / static_cast<double>(decode_len));
+      total_ms.push_back(prefill_ms + decode_total_ms);
+      for (auto v : step_ms) all_step_ms.push_back(v);
+    }
+  };
+#endif
+
+  auto do_run = [&](bool measure) {
+#if defined(OLMO_HAS_CUDA_KERNELS) || defined(USE_CUDA)
+    if (fast) { run_once_paged(measure); return; }
+#endif
+    run_once(measure);
+  };
+
+  for (int64_t w = 0; w < warmup; ++w) do_run(false);
+  for (int64_t i = 0; i < iters; ++i) do_run(true);
 
   auto mean = [](const std::vector<double>& v) {
     if (v.empty()) return 0.0;
@@ -259,7 +396,9 @@ int main(int argc, char** argv) {
   double tpot_p99 = percentile(all_step_ms, 0.99);
   double tok_per_s = 1000.0 * batch / tpot_mean;
 
-  std::cerr << "device=" << device << " batch=" << batch
+  const char* path = fast ? (use_cuda_graph ? "paged-kv+cuda-graph" : "paged-kv-eager")
+                          : "eager-kvcache";
+  std::cerr << "device=" << device << " batch=" << batch << " path=" << path
             << " prompt_len=" << prompt_len << " decode_len=" << decode_len << "\n"
             << "TTFT mean: " << ttft_mean << " ms\n"
             << "TPOT mean: " << tpot_mean << " ms (p50=" << tpot_p50

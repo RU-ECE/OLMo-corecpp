@@ -304,7 +304,6 @@ torch::Tensor fp8_gemv_cuda(const Fp8Quantized& w, torch::Tensor x) {
 // a block. Rows are 16B-aligned (in_features is a multiple of 32 for every
 // projection here), so the uint4 reinterpret is safe; a scalar tail covers any
 // remainder defensively.
-template <int ROWS_PER_BLOCK>
 __global__ void int4_awq_gemv_fast_kernel(
     const uint8_t* __restrict__ W,
     const float*   __restrict__ x,
@@ -313,9 +312,10 @@ __global__ void int4_awq_gemv_fast_kernel(
     int group_size,
     int out_features,
     float*         __restrict__ y) {
+  const int warps_per_block = static_cast<int>(blockDim.x) >> 5;  // runtime-tunable
   const int warp = static_cast<int>(threadIdx.x) >> 5;
   const int lane = static_cast<int>(threadIdx.x) & 31;
-  const int row  = static_cast<int>(blockIdx.x) * ROWS_PER_BLOCK + warp;
+  const int row  = static_cast<int>(blockIdx.x) * warps_per_block + warp;
   if (row >= out_features) return;
 
   const int in_half = in_features >> 1;                 // bytes per row
@@ -327,12 +327,14 @@ __global__ void int4_awq_gemv_fast_kernel(
 
   float acc = 0.0f;
   for (int v = lane; v < n_vec; v += 32) {
-    uint4 packed = W_row_v[v];
-    const int base_byte = v << 4;
-    // Extract bytes with REGISTER shifts from the 4 uint32 lanes of the uint4.
-    // Reading via a uint8_t* into &packed forces `packed` into local memory
-    // (byte-addressable) — a spill that kills throughput. Shifting keeps it all
-    // in registers. Little-endian: (word >> (bi*8)) & 0xFF == W_row[base+wi*4+bi].
+    const uint4 packed = W_row_v[v];
+    const int base_elem = v << 5;   // first input index covered by this uint4
+    // group_size % 32 == 0 (host-guarded) => all 32 nibbles of this uint4 live
+    // in ONE group. Load the bf16 scale ONCE here instead of once per nibble:
+    // 32x fewer scale reads and no per-nibble integer divide on the hot path.
+    const float s = __bfloat162float(S_row[base_elem / group_size]);
+    // Extract bytes with REGISTER shifts (a uint8_t* into &packed would spill it
+    // to local memory and kill throughput). Little-endian byte order.
     const uint32_t w32[4] = {packed.x, packed.y, packed.z, packed.w};
     #pragma unroll
     for (int wi = 0; wi < 4; ++wi) {
@@ -340,8 +342,7 @@ __global__ void int4_awq_gemv_fast_kernel(
       #pragma unroll
       for (int bi = 0; bi < 4; ++bi) {
         const int byte = static_cast<int>((word >> (bi << 3)) & 0xFFu);
-        const int j = (base_byte + (wi << 2) + bi) << 1;   // even input index
-        const float s = __bfloat162float(S_row[j / group_size]);
+        const int j = base_elem + (((wi << 2) + bi) << 1);   // even input index
         acc += static_cast<float>((byte & 0x0F) - 8) * s * x[j];
         acc += static_cast<float>((byte >> 4)   - 8) * s * x[j + 1];
       }
@@ -388,12 +389,17 @@ torch::Tensor int4_gemv_cuda(const Int4Quantized& w, torch::Tensor x) {
       torch::TensorOptions().dtype(torch::kFloat32).device(W.device()));
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const auto* S_ptr = reinterpret_cast<const __nv_bfloat16*>(S.data_ptr<at::BFloat16>());
-  if (int4_fast_enabled()) {
-    // Warp-per-row + vectorized loads. ROWS_PER_BLOCK warps per block.
-    constexpr int RPB = 4;
-    const int threads = RPB * 32;  // 128
-    const int blocks = (static_cast<int>(out_features) + RPB - 1) / RPB;
-    int4_awq_gemv_fast_kernel<RPB><<<blocks, threads, 0, stream>>>(
+  if (int4_fast_enabled() && (w.group_size % 32 == 0)) {
+    // Warp-per-row + vectorized loads. warps/block (rows/block) is tunable at
+    // runtime via OLMO_INT4_RPB so occupancy can be swept without recompiling.
+    static const int rpb = [] {
+      const char* e = std::getenv("OLMO_INT4_RPB");
+      int v = e ? std::atoi(e) : 8;   // default 8 warps = 256 threads/block
+      return (v < 1) ? 1 : (v > 32 ? 32 : v);
+    }();
+    const int threads = rpb * 32;
+    const int blocks = (static_cast<int>(out_features) + rpb - 1) / rpb;
+    int4_awq_gemv_fast_kernel<<<blocks, threads, 0, stream>>>(
         W.data_ptr<uint8_t>(), xc.data_ptr<float>(), S_ptr,
         static_cast<int>(in_features), static_cast<int>(w.group_size),
         static_cast<int>(out_features), y.data_ptr<float>());

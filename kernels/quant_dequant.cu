@@ -29,6 +29,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_bf16.h>
 #include <cstdint>
+#include <cstdlib>
 
 #include "olmo_cpp/nn/quant.hpp"
 
@@ -291,6 +292,76 @@ torch::Tensor fp8_gemv_cuda(const Fp8Quantized& w, torch::Tensor x) {
   return y;
 }
 
+// -------------------------------------------------------------------------
+// FAST int4 AWQ GEMV (opt-in: OLMO_INT4_FAST=1). llama.cpp-style parallelism:
+//   * ONE WARP per output row (not a whole block) -> many rows in flight, and
+//     the reduction is a pure warp shuffle (no shared mem, no __syncthreads).
+//   * VECTORIZED loads: 16 bytes (uint4 = 32 nibbles) per load instruction
+//     instead of 1 byte -> saturates HBM the way the old scalar loop can't.
+// The dequant math (nibble unpack, -8 zero-point, per-group bf16 scale, fp32
+// x multiply) is byte-for-byte identical to int4_awq_gemv_kernel above, so
+// outputs match; only the memory schedule changes. ROWS_PER_BLOCK warps share
+// a block. Rows are 16B-aligned (in_features is a multiple of 32 for every
+// projection here), so the uint4 reinterpret is safe; a scalar tail covers any
+// remainder defensively.
+template <int ROWS_PER_BLOCK>
+__global__ void int4_awq_gemv_fast_kernel(
+    const uint8_t* __restrict__ W,
+    const float*   __restrict__ x,
+    const __nv_bfloat16* __restrict__ scales,
+    int in_features,
+    int group_size,
+    int out_features,
+    float*         __restrict__ y) {
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int row  = static_cast<int>(blockIdx.x) * ROWS_PER_BLOCK + warp;
+  if (row >= out_features) return;
+
+  const int in_half = in_features >> 1;                 // bytes per row
+  const int groups_per_row = in_features / group_size;
+  const uint8_t* W_row = W + static_cast<int64_t>(row) * in_half;
+  const __nv_bfloat16* S_row = scales + static_cast<int64_t>(row) * groups_per_row;
+  const uint4* W_row_v = reinterpret_cast<const uint4*>(W_row);
+  const int n_vec = in_half >> 4;                       // 16 bytes per uint4
+
+  float acc = 0.0f;
+  for (int v = lane; v < n_vec; v += 32) {
+    uint4 packed = W_row_v[v];
+    const uint8_t* pb = reinterpret_cast<const uint8_t*>(&packed);
+    const int base_byte = v << 4;
+    #pragma unroll
+    for (int k = 0; k < 16; ++k) {
+      const uint8_t byte = pb[k];
+      const int j = (base_byte + k) << 1;               // even input index
+      const float s = __bfloat162float(S_row[j / group_size]);
+      acc += static_cast<float>(static_cast<int>(byte & 0x0F) - 8) * s * x[j];
+      acc += static_cast<float>(static_cast<int>(byte >> 4)   - 8) * s * x[j + 1];
+    }
+  }
+  // Scalar tail (in_half not a multiple of 16 — not hit for these dims).
+  for (int b = (n_vec << 4) + lane; b < in_half; b += 32) {
+    const uint8_t byte = W_row[b];
+    const int j = b << 1;
+    const float s = __bfloat162float(S_row[j / group_size]);
+    acc += static_cast<float>(static_cast<int>(byte & 0x0F) - 8) * s * x[j];
+    acc += static_cast<float>(static_cast<int>(byte >> 4)   - 8) * s * x[j + 1];
+  }
+  #pragma unroll
+  for (int off = 16; off > 0; off >>= 1)
+    acc += __shfl_xor_sync(0xffffffff, acc, off);
+  if (lane == 0) y[row] = acc;
+}
+
+// Cached once: OLMO_INT4_FAST=1 selects the warp-per-row vectorized kernel.
+static bool int4_fast_enabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("OLMO_INT4_FAST");
+    return e && e[0] == '1';
+  }();
+  return on;
+}
+
 torch::Tensor int4_gemv_cuda(const Int4Quantized& w, torch::Tensor x) {
   TORCH_CHECK(w.weight.is_cuda() && x.is_cuda(),
               "int4_gemv_cuda: weight and x must be CUDA");
@@ -307,15 +378,24 @@ torch::Tensor int4_gemv_cuda(const Int4Quantized& w, torch::Tensor x) {
 
   auto y = torch::empty({out_features},
       torch::TensorOptions().dtype(torch::kFloat32).device(W.device()));
-  const int threads = 128;
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  int4_awq_gemv_kernel<<<static_cast<int>(out_features), threads, 0, stream>>>(
-      W.data_ptr<uint8_t>(),
-      xc.data_ptr<float>(),
-      reinterpret_cast<const __nv_bfloat16*>(S.data_ptr<at::BFloat16>()),
-      static_cast<int>(in_features),
-      static_cast<int>(w.group_size),
-      y.data_ptr<float>());
+  const auto* S_ptr = reinterpret_cast<const __nv_bfloat16*>(S.data_ptr<at::BFloat16>());
+  if (int4_fast_enabled()) {
+    // Warp-per-row + vectorized loads. ROWS_PER_BLOCK warps per block.
+    constexpr int RPB = 4;
+    const int threads = RPB * 32;  // 128
+    const int blocks = (static_cast<int>(out_features) + RPB - 1) / RPB;
+    int4_awq_gemv_fast_kernel<RPB><<<blocks, threads, 0, stream>>>(
+        W.data_ptr<uint8_t>(), xc.data_ptr<float>(), S_ptr,
+        static_cast<int>(in_features), static_cast<int>(w.group_size),
+        static_cast<int>(out_features), y.data_ptr<float>());
+  } else {
+    const int threads = 128;
+    int4_awq_gemv_kernel<<<static_cast<int>(out_features), threads, 0, stream>>>(
+        W.data_ptr<uint8_t>(), xc.data_ptr<float>(), S_ptr,
+        static_cast<int>(in_features), static_cast<int>(w.group_size),
+        y.data_ptr<float>());
+  }
   return y;
 }
 

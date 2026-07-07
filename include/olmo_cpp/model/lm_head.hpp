@@ -32,6 +32,7 @@
  */
 
 #include "olmo_cpp/model/layer_norm.hpp"
+#include "olmo_cpp/nn/quant.hpp"
 #include <torch/torch.h>
 
 namespace olmo_cpp {
@@ -54,9 +55,19 @@ class LMHeadImpl : public torch::nn::Module {
   torch::Tensor weight() const { return w_out_->weight; }
   bool has_norm() const { return norm_.has_value(); }
 
+  /// Switch the unembedding projection to INT4 weight-only. The LM head is the
+  /// single largest GEMM (d_model × vocab_size), so at batch-1 decode its fp32
+  /// weight is ~half the per-token HBM traffic; int4 cuts that ~8×. Frees the
+  /// dense w_out weight so it never occupies (V)RAM. forward() then routes the
+  /// projection through int4_linear() instead of fast_linear().
+  void set_int4(Int4Quantized w_out_q);
+  bool is_int4() const { return use_int4_; }
+
  private:
   std::optional<RMSNorm> norm_;
   torch::nn::Linear w_out_;
+  bool use_int4_ = false;
+  Int4Quantized int4_wout_;
 };
 
 TORCH_MODULE(LMHead);

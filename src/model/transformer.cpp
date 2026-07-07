@@ -330,8 +330,27 @@ void TransformerImpl::enable_int4(const std::string& sidecar_path, torch::Device
       ++n_ffn;
     }
   }
+  // 4) LM head (the biggest matrix, d_model×vocab). Backward-compatible: only
+  //    installs int4 if the sidecar actually carries it (older sidecars keep
+  //    the LM head fp32, so try_read returns false and we leave it dense).
+  bool lm_int4 = false;
+  {
+    Int4Quantized lm_q;
+    torch::Tensor gs;
+    if (arch.try_read("lm_head.w_out.weight.int4.weight", lm_q.weight) &&
+        arch.try_read("lm_head.w_out.weight.int4.scales", lm_q.scales) &&
+        arch.try_read("lm_head.w_out.weight.int4.group_size", gs)) {
+      lm_q.group_size = gs.item<int64_t>();
+      lm_q.weight = lm_q.weight.to(device).contiguous();
+      lm_q.scales = lm_q.scales.to(device).contiguous();
+      lm_head_->set_int4(std::move(lm_q));
+      lm_int4 = true;
+    }
+  }
+
   std::cout << "INT4: enabled on " << n_attn << " attention + " << n_ffn
-            << " FFN blocks from " << sidecar_path << std::endl;
+            << " FFN blocks" << (lm_int4 ? " + LM head" : "") << " from "
+            << sidecar_path << std::endl;
 }
 
 torch::Tensor TransformerImpl::forward(

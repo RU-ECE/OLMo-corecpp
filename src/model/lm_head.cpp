@@ -56,9 +56,25 @@ torch::Tensor LMHeadImpl::forward(torch::Tensor x) {
     // holder; deref with *norm_ to get the holder, then operator() to call.
     x = (*norm_)(x);
   }
+  if (use_int4_) {
+    // INT4 weight-only unembedding: int4_linear picks the GEMV kernel for the
+    // batch-1 decode row and dequant+matmul for multi-row prefill. This is the
+    // biggest single HBM saving at decode time (fp32 vocab×d weight -> int4).
+    return int4_linear(int4_wout_, x);
+  }
   // L (cuBLASLt direct): the LM head is the biggest GEMM in the model
   // ([B*S, d_model] × [d_model, vocab]); bypass the ATen dispatcher.
   return fast_linear(x, w_out_->weight, torch::Tensor());
+}
+
+void LMHeadImpl::set_int4(Int4Quantized w_out_q) {
+  int4_wout_ = std::move(w_out_q);
+  use_int4_ = true;
+  // Free the dense unembedding weight — unused under INT4 — so it never sits in
+  // (V)RAM (it is the single largest tensor in the model).
+  torch::NoGradGuard ng;
+  if (w_out_->weight.defined())
+    w_out_->weight.set_data(torch::empty({0}, w_out_->weight.options()));
 }
 
 }  // namespace olmo_cpp

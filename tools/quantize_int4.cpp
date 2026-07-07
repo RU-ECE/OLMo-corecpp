@@ -47,7 +47,13 @@ bool should_keep_fp(const std::string& name, const std::regex& keep_re) {
 
 int main(int argc, char** argv) {
   std::string in_path, out_path, conf_path;
-  std::string keep_pattern = "(^|\\.)(norm|embed|tokens?_embed|role_embed|char_embed|phrase_embed|lm_head\\.w_out)";
+  // LM head (lm_head.w_out) is now quantized too — it is the single largest
+  // matrix (d_model×vocab) and ~half the per-token HBM traffic at batch-1
+  // decode. Norms + embeddings stay fp (norms are tiny/sensitive; the embedding
+  // is a row lookup, not a GEMM, so quantizing it saves VRAM but not decode
+  // bandwidth — kept fp here for output quality). Pass --keep-pattern to
+  // override (e.g. add "|lm_head\\.w_out" to keep the LM head fp for quality).
+  std::string keep_pattern = "(^|\\.)(norm|embed|tokens?_embed|role_embed|char_embed|phrase_embed)";
   int64_t group_size = 128;
 
   for (int i = 1; i < argc; ++i) {
@@ -75,7 +81,19 @@ int main(int argc, char** argv) {
     auto cfg = olmo_cpp::load_config_from_json(conf_path);
     cfg.validate();
     olmo_cpp::Transformer model(cfg);
-    torch::load(model, in_path);
+    // Load on CPU: quantization is a host-side op (params are moved to CPU
+    // below), and loading directly on CPU makes the tool work on machines
+    // without CUDA (a CUDA-saved checkpoint otherwise tries the CUDA backend
+    // on load and aborts on a CPU/MPS box). bf16-saved checkpoints don't fit an
+    // fp32 model's storage, so fall back to a bf16 model then upcast to fp32.
+    try {
+      torch::load(model, in_path, torch::kCPU);
+    } catch (const c10::Error&) {
+      model = olmo_cpp::Transformer(cfg);
+      model->to(torch::kBFloat16);
+      torch::load(model, in_path, torch::kCPU);
+      model->to(torch::kFloat32);
+    }
     model->eval();
 
     torch::serialize::OutputArchive out_arch;

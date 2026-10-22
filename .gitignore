@@ -9,6 +9,8 @@ build/
 data/*.npy
 data/*.bin
 data/*.tok
+data/tinystories_raw/
+runs/
 
 # Checkpoints & model weights — NEVER commit (multi-GB).
 # NOTE: .gitignore has no inline comments — keep patterns on their own lines.
@@ -56,6 +58,7 @@ heartbeat_*.txt
 __pycache__/
 *.pyc
 .venv/
+.bench_venv/
 CLAUDE.md
 
 # Personal research plan — stays local, not tracked

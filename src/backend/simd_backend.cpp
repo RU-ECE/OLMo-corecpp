@@ -44,6 +44,11 @@
 namespace olmo_cpp {
 
 bool SIMDBackend::can_use_simd(const torch::Tensor& t) {
+  // The SIMD kernels write through raw pointers into a fresh tensor, which has
+  // no grad_fn. If autograd is recording and the input needs gradients, use
+  // the torch fallback so the graph stays connected (otherwise CPU/MPS DoRA
+  // training fails with "element 0 of tensors does not require grad").
+  if (torch::GradMode::is_enabled() && t.requires_grad()) return false;
   return t.is_contiguous() &&
          t.device().is_cpu() &&
          t.scalar_type() == torch::kFloat32;

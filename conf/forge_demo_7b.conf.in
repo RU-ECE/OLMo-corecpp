@@ -1,0 +1,74 @@
+# conf/forge_demo_7b.conf.in — Knowsy Forge demo: DoRA SFT of OLMo-2-1124-7B on Forge
+# agent trajectories, sized for ONE Colab A100 40GB. Filled in by
+# scripts/colab_forge_demo.sh (envsubst), once per run of the ablation:
+#   ${RUN} ${VOL} ${STEPS} ${SEQ} ${ACCUM} ${MTP_K} ${MTP_TYPE} ${MTP_RANK} ${LOG} ${SAVE_LINE}
+# (SAVE_LINE is "save<TAB><path>" for the demo run and a comment for timing runs;
+#  CKPT_INT = steps for the demo run so its final step leaves a checkpoint to merge.)
+# DoRA form is chosen by the environment: factored by default,
+# OLMO_DORA_MATERIALIZED=1 for the original (baseline) form.
+
+[model]
+d_model				4096
+vocab_size			100352
+n_layers			32
+n_heads				32
+n_kv_heads			32
+head_dim			128
+rope_theta			500000
+layer_norm_eps			1e-6
+init_std			0.02
+use_qk_norm			1
+use_head_qk_norm		0
+use_embedding_norm		0
+hidden_size_multiple_of		256
+hidden_size_multiplier		1.0
+block_type			reordered_norm
+attention_backend		sdpa
+layer_norm_type			rms_norm
+num_mtp_heads			${MTP_K}
+mtp_head_type			${MTP_TYPE}
+mtp_rank			${MTP_RANK}
+mtp_loss_weight			0.1
+activation_checkpoint_mode	full
+activation_checkpoint_interval	1
+
+[training]
+steps				${STEPS}
+batch_size			1
+seq_len				${SEQ}
+lr				1.0e-4
+warmup_steps			3
+grad_accum			${ACCUM}
+optimizer			adamw
+scheduler			cosine
+weight_decay			0.01
+max_grad_norm			1.0
+bf16				1
+amp				0
+grad_scaler			0
+log_interval			${LOG}
+finetune_from			${VOL}/olmo2-7b/olmo2_7b.pt
+sft_mask_path			${VOL}/forge-sft/sft_mask.npy
+dora				1
+dora_rank			32
+dora_alpha			32.0
+${SAVE_LINE}
+checkpoint_dir			${VOL}/runs/${RUN}/checkpoints
+checkpoint_interval		${CKPT_INT}
+keep_checkpoints		1
+resume				${RESUME}
+
+[optimization]
+fused				0
+foreach_optimizer		1
+gpu_data			0
+cuda_graph			0
+zero1				0
+fsdp				0
+
+[data]
+data_path			${VOL}/forge-sft/sft_tokens.npy
+bpe_vocab			${VOL}/olmo2-7b/vocab.json
+
+[device]
+device				cuda

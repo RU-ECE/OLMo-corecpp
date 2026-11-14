@@ -51,6 +51,7 @@
  *   logits.
  */
 #include "olmo_cpp/model/transformer.hpp"
+#include "olmo_cpp/model/sl_mtp_head.hpp"
 #include "olmo_cpp/train/activation_checkpoint.hpp"
 #include "olmo_cpp/backend/fused_lm_head_ce.hpp"
 #include <torch/nn/init.h>
@@ -101,7 +102,13 @@ TransformerImpl::TransformerImpl(const TransformerConfig& cfg)
   }
 
   // Create MTP prediction heads
+  TORCH_CHECK(cfg.mtp_head_type == "full" || cfg.mtp_head_type == "shared_lowrank",
+              "mtp_head_type must be \"full\" or \"shared_lowrank\", got ", cfg.mtp_head_type);
   for (int64_t k = 0; k < cfg.num_mtp_heads; ++k) {
+    if (cfg.mtp_head_type == "shared_lowrank") {
+      mtp_heads_->push_back(SLMTPHead(cfg.d_model, cfg.mtp_rank));
+      continue;
+    }
     mtp_heads_->push_back(MTPHead(cfg.d_model, cfg.layer_norm_eps));
   }
 }
@@ -109,7 +116,10 @@ TransformerImpl::TransformerImpl(const TransformerConfig& cfg)
 const std::vector<RoPEBuffers>& TransformerImpl::get_rope_buffers(
     int64_t seq_len, torch::Device device, torch::Dtype dtype) {
   // Reuse cached buffers if they cover the needed sequence length and dtype matches
-  if (seq_len <= cached_rope_len_ && !cached_rope_bufs_.empty() && dtype == cached_rope_dtype_) {
+  // Device is part of the key: a model run once and then moved with ->to()
+  // must not keep using tables on the old device.
+  if (seq_len <= cached_rope_len_ && !cached_rope_bufs_.empty() && dtype == cached_rope_dtype_ &&
+      device == cached_rope_device_) {
     return cached_rope_bufs_;
   }
 
@@ -122,6 +132,7 @@ const std::vector<RoPEBuffers>& TransformerImpl::get_rope_buffers(
   cached_rope_bufs_.assign(static_cast<size_t>(config_.n_layers), bufs);
   cached_rope_len_ = alloc_len;
   cached_rope_dtype_ = dtype;
+  cached_rope_device_ = device;
   return cached_rope_bufs_;
 }
 
@@ -135,9 +146,8 @@ void TransformerImpl::init_weights(torch::optional<torch::Generator> gen) {
       ? multi_res_embed_->semantic_weight()
       : embeddings_->weight;
   trunc_normal_(emb_weight, 0.0, emb_std, -3 * emb_std, 3 * emb_std, g);
-  if (embed_scale_) {
-    emb_weight.mul_(*embed_scale_);
-  }
+  // embed_scale is applied to the activations in every forward path; scaling
+  // the weights here as well made the effective scale embed_scale^2.
 
   for (int64_t i = 0; i < config_.n_layers; ++i) {
     auto block = blocks_->ptr<ReorderedNormTransformerBlockImpl>(i);
@@ -159,6 +169,10 @@ void TransformerImpl::init_weights(torch::optional<torch::Generator> gen) {
 
   // Initialize MTP head projections
   for (int64_t k = 0; k < config_.num_mtp_heads; ++k) {
+    if (auto* sl = mtp_heads_[k]->as<SLMTPHeadImpl>()) {
+      sl->reset(config_.init_std);  // U = 0, a = 1: every head starts as the main head
+      continue;
+    }
     auto head = mtp_heads_->ptr<MTPHeadImpl>(k);
     for (auto& p : head->parameters()) {
       // Only 2-D weight matrices; keep norm gains at 1.0 and biases at 0.0.
@@ -288,6 +302,30 @@ torch::Tensor TransformerImpl::forward_tree(torch::Tensor input_ids,
   return lm_head_(h);
 }
 
+torch::Tensor TransformerImpl::forward_tree_backbone(torch::Tensor input_ids, torch::Tensor attn_mask,
+                                                    const KVCache& prefix, torch::Tensor positions) {
+  TORCH_CHECK(input_ids.dim() == 2 && input_ids.size(0) == 1, "forward_tree_backbone: input_ids must be [1, N]");
+  const int64_t N = input_ids.size(1);
+  TORCH_CHECK(attn_mask.dim() == 2 && attn_mask.size(0) == N && attn_mask.size(1) == N,
+              "forward_tree_backbone: attn_mask must be [N, N]");
+  TORCH_CHECK(static_cast<int64_t>(prefix.layers.size()) == config_.n_layers, "forward_tree_backbone: cache layers");
+  auto h = use_multi_res_ ? multi_res_embed_->forward(input_ids) : embeddings_(input_ids);
+  if (embed_scale_ && !use_multi_res_) h = h * *embed_scale_;
+  if (config_.use_embedding_norm) h = (*embedding_norm_)(h);
+  auto device = input_ids.device();
+  positions = positions.to(device, torch::kInt64);
+  const int64_t max_pos = positions.max().item<int64_t>();
+  const auto& rope_bufs = get_rope_buffers(max_pos + 1, device, h.dtype().toScalarType());
+  auto mask_opts = torch::TensorOptions().dtype(h.dtype()).device(device);
+  auto add_mask = torch::where(attn_mask.to(device), torch::zeros({}, mask_opts),
+                               torch::full({}, -std::numeric_limits<float>::infinity(), mask_opts));
+  for (int64_t i = 0; i < config_.n_layers; ++i) {
+    auto block = blocks_->ptr<ReorderedNormTransformerBlockImpl>(i);
+    h = block->forward_with_mask(h, &rope_bufs[i], add_mask, &prefix.layers[static_cast<size_t>(i)], positions);
+  }
+  return h;
+}
+
 void TransformerImpl::enable_int4(const std::string& sidecar_path, torch::Device device) {
   torch::serialize::InputArchive arch;
   arch.load_from(sidecar_path);
@@ -389,6 +427,15 @@ torch::Tensor TransformerImpl::forward(
       main_h_flat, w_lm, main_labels_flat, ignore_index);
 
   // ── MTP heads ────────────────────────────────────────────────────
+  if (K > 0 && config_.mtp_head_type == "shared_lowrank") {
+    // SL-MTP: main + all heads through ONE shared vocabulary product, in
+    // row blocks with gradients formed in the forward, so no [B*S, V] logits
+    // tensor is ever kept (this replaces the main head's fused CE above).
+    std::vector<SLMTPHeadImpl*> heads;
+    for (int64_t k = 0; k < K; ++k) heads.push_back(mtp_heads_[k]->as<SLMTPHeadImpl>());
+    return sl_mtp_loss_chunked(h, w_lm, lm_head_->norm_gain(), lm_head_->norm_eps(), heads, *labels,
+                               ignore_index, config_.mtp_loss_weight, /*chunk_rows=*/512);
+  }
   if (K > 0) {
     auto mtp_loss_sum = torch::zeros({}, main_loss.options());
     int64_t valid_heads = 0;
@@ -414,7 +461,19 @@ torch::Tensor TransformerImpl::forward(
   return main_loss;
 }
 
-std::vector<torch::Tensor> TransformerImpl::forward_mtp_draft(torch::Tensor hidden_state) {
+std::vector<torch::Tensor> TransformerImpl::forward_mtp_draft(torch::Tensor hidden_state,
+                                                              torch::Tensor main_logits) {
+  if (main_logits.defined() && config_.num_mtp_heads > 0 && config_.mtp_head_type == "shared_lowrank" &&
+      !lm_head_->is_int4()) {
+    // SL-MTP drafting from the main logits the verify pass already produced:
+    // K x (V x r) reads instead of one more pass over the V x d unembedding.
+    std::vector<SLMTPHeadImpl*> heads;
+    for (int64_t k = 0; k < config_.num_mtp_heads; ++k) heads.push_back(mtp_heads_[k]->as<SLMTPHeadImpl>());
+    auto h = hidden_state.reshape({-1, hidden_state.size(-1)}).select(0, 0);  // [d]
+    auto out = sl_mtp_draft_logits(h, main_logits.reshape({-1}), lm_head_->weight(), lm_head_->norm_gain(),
+                                   lm_head_->norm_eps(), heads);
+    return out;
+  }
   // hidden_state: [1, 1, d_model] or [d_model] — the last position's hidden state
   if (hidden_state.dim() == 1) {
     hidden_state = hidden_state.unsqueeze(0).unsqueeze(0);
@@ -434,6 +493,10 @@ std::vector<torch::Tensor> TransformerImpl::forward_mtp_draft(torch::Tensor hidd
   std::vector<torch::Tensor> inputs;
   inputs.reserve(static_cast<size_t>(config_.num_mtp_heads));
   for (int64_t k = 0; k < config_.num_mtp_heads; ++k) {
+    if (auto* sl = mtp_heads_[k]->as<SLMTPHeadImpl>()) {
+      inputs.push_back(sl->mix(hidden_state));        // u_k; the LM head applies g and W
+      continue;
+    }
     auto head = mtp_heads_->ptr<MTPHeadImpl>(k);
     inputs.push_back(head->forward(hidden_state));    // [B=1, S=1, d]
   }

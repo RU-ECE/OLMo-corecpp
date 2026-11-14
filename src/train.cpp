@@ -268,6 +268,8 @@ void train_epoch(
         }
         {
           ProfileScope bwd_scope("backward");
+          // DDP reduces only the final, fully accumulated gradient (bug 2).
+          if (ddp && ddp->is_distributed()) ddp->set_sync_required(accum + 1 == grad_accum_steps);
           loss.backward();
         }
         accum_loss_tensor.add_(loss.detach());
@@ -935,6 +937,8 @@ void train(
 
         {
           ProfileScope bwd_scope("backward");
+          // DDP reduces only the final, fully accumulated gradient (bug 2).
+          if (ddp && ddp->is_distributed()) ddp->set_sync_required(accum + 1 == cfg.grad_accum_steps);
           if (grad_scaler) {
             grad_scaler->scale(loss).backward();
           } else {
@@ -1510,6 +1514,8 @@ void train(
             AutocastGuard ac(cfg.use_amp, device);
             loss = model->forward(input, labels, -100) / static_cast<float>(cfg.grad_accum_steps);
           }
+          // DDP reduces only the final, fully accumulated gradient (bug 2).
+          if (ddp && ddp->is_distributed()) ddp->set_sync_required(accum + 1 == cfg.grad_accum_steps);
           loss.backward();
           accum_loss_tensor.add_(loss.detach());
         }

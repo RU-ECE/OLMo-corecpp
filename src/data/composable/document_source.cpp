@@ -92,8 +92,9 @@ NumpyDocumentSource::NumpyDocumentSource(const std::string& path,
     const int64_t* data = arr.data<int64_t>();
     std::copy(data, data + n, flat.begin());
   } else if (arr.word_size == 2) {
-    // int16 / uint16 (some tokenized datasets use uint16)
-    const int16_t* data = arr.data<int16_t>();
+    // uint16: token ids are never negative, and reading them as int16
+    // turned every id >= 32768 (most of GPT-2's 50257) into a negative one.
+    const uint16_t* data = arr.data<uint16_t>();
     for (size_t i = 0; i < n; ++i) {
       flat[i] = static_cast<int64_t>(data[i]);
     }

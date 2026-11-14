@@ -167,6 +167,28 @@ int main() {
   expect(cpu_ctx.world_size == 1, "loopback ctx world=1");
   expect(cpu_ctx.backend == nullptr, "loopback ctx backend null");
 
+  // OverlapHookup must record every bucket's done event on EVERY step. Its
+  // fire counter used to run forever, so step 2+ recorded nothing and the
+  // optimizer waited on step 1's stale events (speed-plan bug 3). Events are
+  // no-op handles on CPU, so the bookkeeping runs here; NCCL needs CUDA.
+  {
+    dist::BucketManager mgr2(params, /*bucket_bytes=*/4096, /*world_size=*/1);
+    dist::OverlapHookup hook(mgr2, dist::make_loopback_ctx(Device::cpu()));
+    bool every_step = true;
+    for (int step = 0; step < 3; ++step) {
+      for (int i = 3; i >= 0; --i) mgr2.mark_ready(&owners[static_cast<size_t>(i)], nullptr);
+      hook.sync_and_finalize();
+      every_step = every_step && hook.last_step_fires() == hook.num_buckets();
+    }
+    expect(every_step, "OverlapHookup records all buckets on steps 1, 2 and 3");
+    // A step that skips a bucket must not finalize silently.
+    mgr2.mark_ready(&owners[3], nullptr);
+    mgr2.mark_ready(&owners[2], nullptr);  // bucket 0 only
+    bool threw = false;
+    try { hook.sync_and_finalize(); } catch (const std::exception&) { threw = true; }
+    expect(threw, "OverlapHookup refuses to finalize with a bucket unreduced");
+  }
+
   std::printf("---\n%d failed\n", g_failed);
   return g_failed;
 }

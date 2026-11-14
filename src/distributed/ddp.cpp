@@ -51,6 +51,8 @@
 #include "olmo_cpp/distributed/ddp.hpp"
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <torch/csrc/distributed/c10d/TCPStore.hpp>
+#include <torch/csrc/autograd/function_hook.h>
+#include <torch/csrc/autograd/variable.h>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -166,34 +168,49 @@ void DDPContext::register_grad_hooks(std::vector<torch::Tensor>& parameters,
     hook_state_.buckets[bidx].total_count++;
   }
 
-  // Register one hook per trainable parameter. The hook stores the
-  // gradient passed by autograd into the bucket and increments the
-  // bucket's ready counter. When the bucket fills, the hook dispatches
-  // an allreduce (unless sync_required_ is false — that's the no_sync
-  // case for non-final accumulation steps).
+  // One post-accumulate hook per trainable parameter (speed-plan bug 2 fix).
+  // The hook runs AFTER autograd has added this backward's contribution into
+  // p.grad, so the bucket reduces the accumulated .grad itself. The old hook
+  // ran before accumulation on the incoming grad and kept a reference to it,
+  // which made AccumulateGrad copy it into .grad: the async allreduce then
+  // wrote into a tensor nobody read. Its fill counter also only reset at the
+  // end of the step, so with grad accumulation only micro-batch 1 was ever
+  // dispatched.
+  //
+  // Each backward fills every bucket once; the counter resets on fill. A
+  // bucket dispatches only when sync_required_ is set (the trainer sets it
+  // on the final micro-batch). Buckets that never filled (unused parameters,
+  // or no backward at all) are reduced at finalize.
   for (size_t i = 0; i < parameters.size(); ++i) {
     if (param_to_bucket[i] == std::numeric_limits<size_t>::max()) continue;
-    const size_t bidx = param_to_bucket[i];
-    auto& p = parameters[i];
-    // Capture bidx + this by value; `this` is the DDPContext.
-    p.register_hook([this, bidx](const at::Tensor& grad) -> at::Tensor {
-      if (!this->sync_required_) return grad;
-      std::lock_guard<std::mutex> lock(*this->hook_state_.mu);
-      Bucket& b = this->hook_state_.buckets[bidx];
-      b.grads.push_back(grad);
-      b.ready_count++;
-      if (b.ready_count == b.total_count) {
-        // Bucket complete — dispatch the collective. ProcessGroupNCCL.allreduce
-        // takes ONE tensor per call (the multi-tensor form is deprecated and
-        // throws "Expecting one tensor only"), so reduce each grad individually;
-        // each returns a c10::Work we store and wait on at finalize time.
-        for (auto& g : b.grads) {
-          std::vector<at::Tensor> single{g};
-          this->hook_state_.pending_works.push_back(this->backend_->allreduce(single));
-        }
+    hook_state_.buckets[param_to_bucket[i]].params.push_back(parameters[i]);
+  }
+  struct Hook : torch::autograd::PostAccumulateGradHook {
+    DDPContext* self;
+    size_t bidx;
+    Hook(DDPContext* s, size_t b) : self(s), bidx(b) {}
+    void operator()(const torch::autograd::Variable& /*param*/) override {
+      std::lock_guard<std::mutex> lock(*self->hook_state_.mu);
+      Bucket& b = self->hook_state_.buckets[bidx];
+      if (++b.ready_count < b.total_count) return;
+      b.ready_count = 0;
+      if (!self->sync_required_) return;
+      TORCH_CHECK(!b.dispatched,
+                  "DDP: a gradient bucket was reduced twice in one step. With gradient "
+                  "accumulation, call set_sync_required(false) before every backward but "
+                  "the last one.");
+      b.dispatched = true;
+      for (auto& p : b.params) {
+        if (!p.grad().defined()) continue;
+        std::vector<at::Tensor> single{p.mutable_grad()};
+        self->hook_state_.pending_works.push_back(self->backend_->allreduce(single));
       }
-      return grad;
-    });
+    }
+  };
+  for (size_t i = 0; i < parameters.size(); ++i) {
+    if (param_to_bucket[i] == std::numeric_limits<size_t>::max()) continue;
+    torch::autograd::impl::set_post_acc_grad_hooks(
+        parameters[i], std::make_unique<Hook>(this, param_to_bucket[i]));
   }
 }
 
@@ -209,11 +226,17 @@ void DDPContext::allreduce_gradients(const std::vector<torch::Tensor>& parameter
       std::lock_guard<std::mutex> lock(*hook_state_.mu);
       works_to_wait = std::move(hook_state_.pending_works);
       hook_state_.pending_works.clear();
-      // Reset bucket fill state. The grad tensor references are owned by
-      // the model's parameter .grad attributes, which are still valid;
-      // we just drop our pointers so the next backward starts fresh.
+      // Buckets the backward did not dispatch (a parameter got no gradient,
+      // or no backward ran): reduce them now, in bucket order on every rank.
       for (auto& b : hook_state_.buckets) {
-        b.grads.clear();
+        if (!b.dispatched) {
+          for (auto& p : b.params) {
+            if (!p.grad().defined()) continue;
+            std::vector<at::Tensor> single{p.mutable_grad()};
+            works_to_wait.push_back(backend_->allreduce(single));
+          }
+        }
+        b.dispatched = false;
         b.ready_count = 0;
       }
     }

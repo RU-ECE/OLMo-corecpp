@@ -68,11 +68,14 @@ class ReorderedNormTransformerBlockImpl : public torch::nn::Module {
       IPagedKVCache* paged,
       int64_t layer_idx);
 
-  /// Tree-attention forward (item 8.1). Attention uses caller-supplied mask.
+  /// Tree-attention forward (item 8.1). Attention uses caller-supplied mask,
+  /// an optional read-only KV prefix and per-token positions.
   torch::Tensor forward_with_mask(
       torch::Tensor x,
       const RoPEBuffers* rope_bufs,
-      torch::Tensor attn_mask);
+      torch::Tensor attn_mask,
+      const LayerKVCache* prefix = nullptr,
+      const torch::Tensor& positions = torch::Tensor());
 
  private:
   /// Self-attention sublayer.

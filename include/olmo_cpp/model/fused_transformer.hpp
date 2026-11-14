@@ -125,6 +125,7 @@ class FusedTransformerImpl : public torch::nn::Module {
   int64_t cached_rope_len_ = 0;
   /// Activation dtype the cached buffers were built for.
   torch::Dtype cached_rope_dtype_ = torch::kFloat32;
+  torch::Device cached_rope_device_{torch::kCPU};
   /// Per-layer RoPE buffers (currently shared via tensor refcount).
   std::vector<RoPEBuffers> cached_rope_bufs_;
 };

@@ -99,10 +99,12 @@ torch::Tensor ReorderedNormTransformerBlockImpl::forward_paged(
 torch::Tensor ReorderedNormTransformerBlockImpl::forward_with_mask(
     torch::Tensor x,
     const RoPEBuffers* rope_bufs,
-    torch::Tensor attn_mask) {
+    torch::Tensor attn_mask,
+    const LayerKVCache* prefix,
+    const torch::Tensor& positions) {
   auto& backend = get_backend();
   backend.begin_scope();
-  auto attn_out = attention_->forward_with_mask(x, rope_bufs, attn_mask);
+  auto attn_out = attention_->forward_with_mask(x, rope_bufs, attn_mask, prefix, positions);
   auto h = attention_norm_->forward_add(attn_out, x);
   auto out = feed_forward_norm_->forward_add(feed_forward_(h), h);
   backend.end_scope();

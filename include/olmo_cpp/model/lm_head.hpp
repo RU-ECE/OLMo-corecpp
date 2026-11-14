@@ -54,6 +54,9 @@ class LMHeadImpl : public torch::nn::Module {
   }
   torch::Tensor weight() const { return w_out_->weight; }
   bool has_norm() const { return norm_.has_value(); }
+  /// Final-norm gain g and eps (SL-MTP folds g into its shared product).
+  torch::Tensor norm_gain() const { return norm_ ? (*norm_)->gain() : torch::Tensor(); }
+  double norm_eps() const { return norm_ ? (*norm_)->eps() : 0.0; }
 
   /// Switch the unembedding projection to INT4 weight-only. The LM head is the
   /// single largest GEMM (d_model × vocab_size), so at batch-1 decode its fp32

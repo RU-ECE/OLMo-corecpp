@@ -43,11 +43,10 @@ OverlapHookup::OverlapHookup(BucketManager& mgr, CommContext ctx)
   // ordering implicitly: all-reduces are issued sequentially on the same
   // comm_stream in bucket order, so the final bucket's done event
   // transitively ordered-after every earlier reduction.
-  int* fire_idx = new int(0);
   void* backend = ctx_.backend;
   Stream comm_stream = ctx_.comm_stream;
   Device dev = ctx_.device;
-  mgr_.set_allreduce([this, fire_idx, backend, comm_stream, dev](
+  mgr_.set_allreduce([this, backend, comm_stream, dev](
                          float* buf, size_t n, StreamHandle compute_s) {
     Stream compute{dev, compute_s};
     Event  grad_ready = Event::create(dev);
@@ -68,23 +67,30 @@ OverlapHookup::OverlapHookup(BucketManager& mgr, CommContext ctx)
     (void)backend; (void)buf; (void)n;
 #endif
 
-    int b = (*fire_idx)++;
-    if (b < static_cast<int>(bucket_done_.size())) {
-      bucket_done_[b].record(comm_stream);
+    // Bucket index within THIS step. The counter used to run forever, so
+    // from step 2 on no done event was re-recorded and sync_and_finalize()
+    // waited on step 1's stale events: the optimizer could read gradients
+    // NCCL was still reducing (speed-plan bug 3). It now resets per step.
+    const int b = fires_this_step_++;
+    if (b >= static_cast<int>(bucket_done_.size())) {
+      throw std::runtime_error("zwt::dist::OverlapHookup: more bucket reductions than buckets in one step");
     }
+    bucket_done_[b].record(comm_stream);
   });
-  // Ownership leak of fire_idx is intentional for the duration of the
-  // process — BucketManager's callback holds it. OverlapHookup lifetime is
-  // tied to the training loop; cleaning it up at OverlapHookup dtor would
-  // require tracking the std::function back, which is not worth the code.
 }
 
 void OverlapHookup::sync_and_finalize() {
   // Make the compute stream wait on every bucket_done event so the scatter
   // pass (and the subsequent optimizer step) read fully-reduced grads.
+  if (fires_this_step_ != static_cast<int>(bucket_done_.size())) {
+    throw std::runtime_error("zwt::dist::OverlapHookup: " + std::to_string(fires_this_step_) + " of " +
+                             std::to_string(bucket_done_.size()) + " buckets reduced this step");
+  }
   Stream compute = compute_stream(ctx_.device);
   for (auto& ev : bucket_done_) ev.wait(compute);
   mgr_.finalize(compute.handle);
+  last_step_fires_ = fires_this_step_;
+  fires_this_step_ = 0;
 }
 
 CommContext make_loopback_ctx(Device dev) {

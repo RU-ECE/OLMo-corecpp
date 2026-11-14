@@ -62,11 +62,15 @@ class OverlapHookup {
   void sync_and_finalize();
 
   int num_buckets() const { return static_cast<int>(bucket_done_.size()); }
+  // Buckets whose done event the last finished step recorded (tests).
+  int last_step_fires() const { return last_step_fires_; }
 
  private:
   BucketManager& mgr_;
   CommContext    ctx_;
   std::vector<Event> bucket_done_;  // one per bucket
+  int fires_this_step_ = 0;         // reset by sync_and_finalize()
+  int last_step_fires_ = 0;
 };
 
 // Thin no-op backend for CPU builds and unit tests — satisfies the contract

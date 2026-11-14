@@ -71,4 +71,37 @@ torch::Tensor compute_attention(
       q, k, v, float_mask, dropout_p, /*is_causal=*/false);
 }
 
+torch::Tensor sdpa_suffix_causal(
+    const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v,
+    int64_t window,
+    torch::Tensor& mask, int64_t& mask_S, int64_t& mask_full_S) {
+  const int64_t S = q.size(2);
+  const int64_t full_S = k.size(2);
+  TORCH_CHECK(S <= full_S, "sdpa_suffix_causal: ", S, " queries but only ", full_S, " keys");
+  if (S == 1 && window <= 0) {
+    // One query at the end sees every key.
+    return at::scaled_dot_product_attention(q, k, v, c10::nullopt, 0.0, false);
+  }
+  if (S == full_S && window <= 0) {
+    // Square causal: SDPA's flag is exact here and keeps the fast kernels.
+    return at::scaled_dot_product_attention(q, k, v, c10::nullopt, 0.0, true);
+  }
+  const bool stale = !mask.defined() || S != mask_S || full_S != mask_full_S ||
+                     mask.scalar_type() != q.scalar_type() || mask.device() != q.device();
+  if (stale) {
+    const int64_t offset = full_S - S;
+    auto bool_opts = torch::TensorOptions().dtype(torch::kBool).device(q.device());
+    auto ones = torch::ones({S, full_S}, bool_opts);
+    auto allowed = torch::tril(ones, offset);
+    if (window > 0) allowed = allowed & torch::triu(ones, offset - window);
+    // Additive mask in the activation dtype (SDPA rejects a fp32 bias on bf16 q/k/v).
+    auto mask_opts = torch::TensorOptions().dtype(q.scalar_type()).device(q.device());
+    mask = torch::where(allowed, torch::zeros({}, mask_opts),
+                        torch::full({}, -std::numeric_limits<float>::infinity(), mask_opts));
+    mask_S = S;
+    mask_full_S = full_S;
+  }
+  return at::scaled_dot_product_attention(q, k, v, mask, 0.0, false);
+}
+
 }  // namespace olmo_cpp

@@ -1,6 +1,10 @@
 #pragma once
 
 /**
+ * SUPERSEDED (speed plan bug 5): this step never rolls the KV cache back after a
+ * rejected draft and runs two forwards per step. Use olmo_cpp::spec::mtp_step
+ * (generate/spec_core.hpp), which is exact and tested by tools/test_spec_greedy.
+ *
  * include/olmo_cpp/generate/speculative_decode.hpp
  *
  * Speculative decoding driver that uses the model's *own* Multi-Token

@@ -74,6 +74,8 @@ FusedTransformerImpl::FusedTransformerImpl(const TransformerConfig& cfg)
     blocks_->push_back(FusedTransformerBlock(cfg, i));
   }
 
+  TORCH_CHECK(cfg.num_mtp_heads == 0 || cfg.mtp_head_type == "full",
+              "FusedTransformer supports only mtp_head_type=full; SL-MTP heads are in Transformer");
   for (int64_t k = 0; k < cfg.num_mtp_heads; ++k) {
     mtp_heads_->push_back(MTPHead(cfg.d_model, cfg.layer_norm_eps));
   }
@@ -81,7 +83,8 @@ FusedTransformerImpl::FusedTransformerImpl(const TransformerConfig& cfg)
 
 const std::vector<RoPEBuffers>& FusedTransformerImpl::get_rope_buffers(
     int64_t seq_len, torch::Device device, torch::Dtype dtype) {
-  if (seq_len <= cached_rope_len_ && !cached_rope_bufs_.empty() && dtype == cached_rope_dtype_) {
+  if (seq_len <= cached_rope_len_ && !cached_rope_bufs_.empty() && dtype == cached_rope_dtype_ &&
+      device == cached_rope_device_) {  // device too: see TransformerImpl::get_rope_buffers
     return cached_rope_bufs_;
   }
 
@@ -94,6 +97,7 @@ const std::vector<RoPEBuffers>& FusedTransformerImpl::get_rope_buffers(
   cached_rope_bufs_.assign(static_cast<size_t>(config_.n_layers), bufs);
   cached_rope_len_ = alloc_len;
   cached_rope_dtype_ = dtype;
+  cached_rope_device_ = device;
   return cached_rope_bufs_;
 }
 

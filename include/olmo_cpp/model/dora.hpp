@@ -19,6 +19,7 @@
  */
 #include <torch/torch.h>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 
 namespace olmo_cpp {
@@ -83,6 +84,9 @@ class DoRAAdapterImpl : public torch::nn::Module {
         "lora_A", torch::randn({rank, in}) * (1.0 / std::sqrt(static_cast<double>(in))));
     lora_B_ = register_parameter("lora_B", torch::zeros({out, rank}));
     magnitude_ = register_parameter("magnitude", torch::ones({out}));  // lazy-init in forward
+    // Factored by default; OLMO_DORA_MATERIALIZED=1 restores the original
+    // form (the baseline for speed comparisons).
+    factored_ = std::getenv("OLMO_DORA_MATERIALIZED") == nullptr;
   }
 
   /// x [..., in], base_weight [out, in] (frozen). Returns [..., out].
@@ -100,6 +104,13 @@ class DoRAAdapterImpl : public torch::nn::Module {
       }
       mag_init_ = true;
     }
+    return factored_ ? forward_factored(x, base_weight) : forward_materialized(x, base_weight);
+  }
+
+  /// The original form: builds W + sBA and the rescaled weight ([out, in]
+  /// each, kept by autograd) and backprops a full [out, in] dW'. Reference
+  /// for tests (tools/test_dora_factored) and the speed comparison.
+  torch::Tensor forward_materialized(const torch::Tensor& x, const torch::Tensor& base_weight) {
     auto delta = torch::matmul(lora_B_, lora_A_) * scaling_;            // [out, in]
     auto adapted = base_weight + delta;                                // [out, in]
     auto rn = adapted.to(torch::kFloat32).norm(2, 1, /*keepdim=*/true)
@@ -108,10 +119,47 @@ class DoRAAdapterImpl : public torch::nn::Module {
     return torch::matmul(x, W.transpose(0, 1));
   }
 
+  /// Same output without ever forming W + sBA:
+  ///   y  = (m / rn) * (x W^T + s (x A^T) B^T)
+  ///   rn_i^2 = |W_i|^2 + 2 s B_i . (W A^T)_i + s^2 B_i (A A^T) B_i^T
+  /// |W_i|^2 is cached (W is frozen); W A^T is one thin GEMM over W. The frozen
+  /// base costs one GEMM forward and one backward (dx only: no [out, in] dW'),
+  /// and nothing weight-sized is kept for the backward. Published as "Scaling
+  /// DoRA" (arXiv 2603.22276); adopted here, not claimed.
+  torch::Tensor forward_factored(const torch::Tensor& x, const torch::Tensor& base_weight) {
+    const auto f32 = torch::kFloat32;
+    const auto wd = base_weight.scalar_type();
+    // |W_i|^2, rebuilt only if the base weight's storage or version changes.
+    const int64_t key0 = reinterpret_cast<int64_t>(base_weight.data_ptr());
+    const int64_t key1 = static_cast<int64_t>(base_weight._version());
+    if (!w_sq_.defined() || key0 != w_key0_ || key1 != w_key1_) {
+      torch::NoGradGuard ng;
+      w_sq_ = base_weight.detach().to(f32).pow(2).sum(1);              // [out]
+      w_key0_ = key0;
+      w_key1_ = key1;
+    }
+    auto A = lora_A_, B = lora_B_;
+    auto U = torch::matmul(base_weight.detach(), A.to(wd).t()).to(f32);  // [out, r] = W A^T
+    auto M = torch::matmul(A.to(f32), A.to(f32).t());                     // [r, r]   = A A^T
+    auto Bf = B.to(f32);
+    const double s = scaling_;
+    auto rn2 = w_sq_ + 2.0 * s * (Bf * U).sum(1) + (s * s) * (torch::matmul(Bf, M) * Bf).sum(1);
+    auto rn = rn2.clamp_min(1e-12).sqrt().clamp_min(1e-6);                // [out] (fp32)
+    auto scale = (magnitude_.to(f32) / rn).to(x.scalar_type());          // [out]
+    auto base = torch::matmul(x, base_weight.detach().t());               // [..., out]
+    auto lora = torch::matmul(torch::matmul(x, A.to(x.scalar_type()).t()), B.to(x.scalar_type()).t()) * s;
+    return (base + lora) * scale;
+  }
+
+  void set_factored(bool on) { factored_ = on; }
+
  private:
   torch::Tensor lora_A_, lora_B_, magnitude_;
   double scaling_ = 1.0;
   bool mag_init_ = false;
+  bool factored_ = true;
+  torch::Tensor w_sq_;
+  int64_t w_key0_ = 0, w_key1_ = -1;
 };
 TORCH_MODULE(DoRAAdapter);
 

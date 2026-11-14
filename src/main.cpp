@@ -183,6 +183,8 @@ int main(int argc, char** argv) {
     cfg.hidden_size_multiplier  = model_ini.get_or<double>("hidden_size_multiplier", 1.5);
     cfg.num_mtp_heads       = model_ini.get_or<int64_t>("num_mtp_heads", 0);
     cfg.mtp_loss_weight     = model_ini.get_or<double>("mtp_loss_weight", 0.1);
+    cfg.mtp_head_type       = model_ini.get_or<std::string>("mtp_head_type", "full");
+    cfg.mtp_rank            = model_ini.get_or<int64_t>("mtp_rank", 64);
 
     // Sliding window attention
     cfg.sliding_window_size = model_ini.get_or<int64_t>("sliding_window_size", -1);

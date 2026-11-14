@@ -47,6 +47,11 @@ class RMSNormImpl : public torch::nn::Module {
   /// Fused: returns residual + rms_norm(x) * weight
   torch::Tensor forward_add(torch::Tensor x, torch::Tensor residual);
 
+  /// Gain (undefined when elementwise_affine is false) and epsilon, for
+  /// callers that fold the norm into other math (SL-MTP heads).
+  torch::Tensor gain() const { return elementwise_affine_ ? weight_ : torch::Tensor(); }
+  double eps() const { return eps_; }
+
  private:
   torch::Tensor weight_;
   double eps_;

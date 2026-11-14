@@ -73,7 +73,10 @@ class TransformerImpl : public torch::nn::Module {
   /// MTP draft: given hidden state at the last position, returns logits from
   /// each MTP head. Used for speculative decoding.
   /// Returns vector of [vocab_size] logit tensors, one per MTP head.
-  std::vector<torch::Tensor> forward_mtp_draft(torch::Tensor hidden_state);
+  /// main_logits (optional, [V] = LMHead of the same hidden state): with
+  /// SL-MTP heads the drafts are then computed without reading W at all.
+  std::vector<torch::Tensor> forward_mtp_draft(torch::Tensor hidden_state,
+                                               torch::Tensor main_logits = torch::Tensor());
 
   /// Get the backbone hidden states (no LM head). Used by speculative decode
   /// to verify candidate tokens.
@@ -102,6 +105,13 @@ class TransformerImpl : public torch::nn::Module {
   /// No KV cache: each verify is a fresh forward.
   torch::Tensor forward_tree(torch::Tensor input_ids,
                               torch::Tensor attn_mask);
+
+  /// Context-aware tree verify: the tree's tokens attend to every cached
+  /// token (read-only; the cache is not changed) and to their ancestors in
+  /// attn_mask, at RoPE positions `positions` [N]. Returns the backbone
+  /// output [1, N, d] (apply_lm_head gives the logits).
+  torch::Tensor forward_tree_backbone(torch::Tensor input_ids, torch::Tensor attn_mask,
+                                      const KVCache& prefix, torch::Tensor positions);
 
   /// Apply truncated-normal init to all parameters with model-specific
   /// scaling (separate stds for embeddings vs. blocks vs. LM head).
@@ -167,6 +177,8 @@ class TransformerImpl : public torch::nn::Module {
   int64_t cached_rope_len_ = 0;
   /// Activation dtype used for the cached RoPE tables.
   torch::Dtype cached_rope_dtype_ = torch::kFloat32;
+  /// Device of the cached RoPE tables.
+  torch::Device cached_rope_device_{torch::kCPU};
   /// Per-layer RoPE buffers (currently shared across layers via refcount).
   std::vector<RoPEBuffers> cached_rope_bufs_;
 };

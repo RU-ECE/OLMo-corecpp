@@ -88,7 +88,9 @@ class AttentionImpl : public torch::nn::Module {
   torch::Tensor forward_with_mask(
       torch::Tensor x,
       const RoPEBuffers* rope_bufs,
-      torch::Tensor attn_mask);
+      torch::Tensor attn_mask,
+      const LayerKVCache* prefix = nullptr,
+      const torch::Tensor& positions = torch::Tensor());
 
   /// Enable INT4 weight-only inference: the four projections route through
   /// int4_linear() instead of the dense Linears. The dense w_q_/.../w_out_
@@ -155,6 +157,9 @@ class AttentionImpl : public torch::nn::Module {
   uint32_t cached_w_packed_v_k_ = 0;
   uint32_t cached_w_packed_v_v_ = 0;
   bool     cached_w_packed_valid_ = false;
+  const void* cached_w_packed_p_q_ = nullptr;  // storage of each source weight
+  const void* cached_w_packed_p_k_ = nullptr;
+  const void* cached_w_packed_p_v_ = nullptr;
   torch::Tensor packed_qkv_weight();
 
   /// DoRA finetune: when true, route q/k/v/out through these adapters (frozen

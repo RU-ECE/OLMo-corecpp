@@ -1,6 +1,11 @@
 #pragma once
 
 /**
+ * SUPERSEDED (speed plan bug 5): the verify pass (forward_tree) sees only the
+ * tree tokens, not the prompt/KV context, and depth 1 is seeded from MTP head 0
+ * (a t+2 predictor). Use olmo_cpp::spec::mtp_tree_step (generate/spec_core.hpp),
+ * which is exact; tools/chat.cpp --tree-decode now uses it.
+ *
  * include/olmo_cpp/generate/tree_speculative.hpp
  *
  * Tree-shaped speculative decoding (item 8.1) — Medusa / EAGLE style.

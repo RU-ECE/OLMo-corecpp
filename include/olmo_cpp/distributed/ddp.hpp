@@ -104,8 +104,15 @@ class DDPContext {
   /// expert-parallel, etc.). Returns null when DDP is inactive.
   c10::intrusive_ptr<c10d::Backend> backend() const { return backend_; }
 
+  /// Wrap an existing c10d backend (custom launchers; tools/test_ddp_accum
+  /// uses an in-process two-rank backend).
+  static DDPContext from_backend(c10::intrusive_ptr<c10d::Backend> backend, int rank,
+                                 int world_size) {
+    return DDPContext(std::move(backend), rank, world_size);
+  }
+
  private:
-  // Private ctor; instances are produced by init_from_env().
+  // Private ctor; instances are produced by init_from_env() / from_backend().
   DDPContext(c10::intrusive_ptr<c10d::Backend> backend, int rank, int world_size);
 
   c10::intrusive_ptr<c10d::Backend> backend_;  // c10d collective backend (Gloo).
@@ -119,9 +126,10 @@ class DDPContext {
   // hook dispatches an allreduce over the bucket's gradient list and
   // records the c10::Work in pending_works_ for finalize-time wait.
   struct Bucket {
-    std::vector<at::Tensor> grads;  // populated as hooks fire
-    int64_t total_count = 0;        // expected fill count
-    int64_t ready_count = 0;        // current fill count
+    std::vector<at::Tensor> params;  // the bucket's parameters (their .grad is reduced)
+    int64_t total_count = 0;         // hooks per backward
+    int64_t ready_count = 0;         // hooks seen in the current backward
+    bool dispatched = false;         // reduced during this step's backward
   };
   struct HookState {
     std::vector<Bucket> buckets;

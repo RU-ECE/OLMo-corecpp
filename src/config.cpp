@@ -167,6 +167,8 @@ TransformerConfig load_config_from_json(const std::string& path) {
   // Multi-Token Prediction
   cfg.num_mtp_heads = j.value("num_mtp_heads", cfg.num_mtp_heads);
   cfg.mtp_loss_weight = j.value("mtp_loss_weight", cfg.mtp_loss_weight);
+  cfg.mtp_head_type = j.value("mtp_head_type", cfg.mtp_head_type);
+  cfg.mtp_rank = j.value("mtp_rank", cfg.mtp_rank);
 
   // DoRA (so chat/inference can rebuild + load a DoRA-finetuned checkpoint:
   // the .pt has the base Linears + adapter params; the model must be built with

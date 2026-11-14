@@ -20,6 +20,7 @@ add_library(olmo_kernels SHARED
     fused_ffn_wmma.cu          # I + item 2: tensor-core (WMMA) variant
     fused_ffn_tma.cu           # I + item W: TMA async-load variant (sm_90+)
     fused_lm_head_ce.cu        # A3 — fused LM-head + softmax-CE
+    sl_mtp_ce.cu               # SL-MTP chunked loss row kernels
     rms_norm_backward.cu       # B3 — fused RMSNorm backward
     # Host-side TMA descriptor builder. Lives HERE (not in olmo_cpp) because
     # make_tma_descriptor is called only by fused_ffn_tma.cu and by nothing in

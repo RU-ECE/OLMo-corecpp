@@ -78,6 +78,29 @@ endif()
 find_package(Torch REQUIRED)
 find_package(ZLIB REQUIRED)
 
+# LibTorch >= 2.10 headers refuse anything below C++20 (torch/all.h: #error if
+# __cplusplus < 202002L). Pick the standard from the LibTorch actually found,
+# so pip torch on Colab/H100 boxes and Homebrew LibTorch both build without a
+# compiler-launcher hack. -DOLMO_CXX_STANDARD=17|20 overrides.
+set(OLMO_CXX_STANDARD "" CACHE STRING "C++ standard (empty: 20 if LibTorch's headers require it, else 17)")
+set(_olmo_std 17)
+foreach(_d ${TORCH_INCLUDE_DIRS})
+  if(EXISTS "${_d}/torch/csrc/api/include/torch/all.h")
+    file(STRINGS "${_d}/torch/csrc/api/include/torch/all.h" _olmo_req REGEX "__cplusplus < 202002L")
+    if(_olmo_req)
+      set(_olmo_std 20)
+    endif()
+  endif()
+endforeach()
+if(OLMO_CXX_STANDARD)
+  set(_olmo_std ${OLMO_CXX_STANDARD})
+endif()
+set(CMAKE_CXX_STANDARD ${_olmo_std})
+if(CMAKE_CUDA_COMPILER)
+  set(CMAKE_CUDA_STANDARD ${_olmo_std})
+endif()
+message(STATUS "C++ standard: ${_olmo_std}")
+
 # Detect which autocast C++ API is available (changed across PyTorch versions).
 # Use STATIC_LIBRARY target type so try_compile only compiles (no link step),
 # avoiding protobuf and other transitive dependency issues.
@@ -85,7 +108,7 @@ include(CheckCXXSourceCompiles)
 set(_SAVE_TARGET_TYPE ${CMAKE_TRY_COMPILE_TARGET_TYPE})
 set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 set(CMAKE_REQUIRED_INCLUDES ${TORCH_INCLUDE_DIRS})
-set(CMAKE_REQUIRED_FLAGS "${TORCH_CXX_FLAGS} -std=c++17")
+set(CMAKE_REQUIRED_FLAGS "${TORCH_CXX_FLAGS} -std=c++${_olmo_std}")
 
 # Probe 1: newest API — is_autocast_enabled(at::kCUDA) (PyTorch >= 2.4)
 check_cxx_source_compiles("
@@ -180,6 +203,7 @@ set(OLMO_SOURCES
     src/model/feed_forward.cpp
     src/model/attention.cpp
     src/model/attention_config.cpp
+    src/model/sl_mtp_head.cpp
     src/model/block.cpp
     src/model/block_variants.cpp
     src/model/lm_head.cpp
@@ -240,6 +264,7 @@ set(OLMO_SOURCES
     src/backend/persistent_decode.cpp  # fast-inference [13] (stub)
     src/nn/quant.cpp  # fast-inference [14] FP8 + [15] INT4
     src/generate/draft_model_speculative.cpp  # fast-inference [17]
+    src/generate/spec_core.cpp  # exact MTP self-speculation (speed plan bug 5)
     src/model/paged_kv_cache.cpp  # fast-inference [1] partial (concat shim)
     src/model/block_manager.cpp  # fast-inference [9] (page allocator)
     src/model/shared_block_pool.cpp  # fast-inference [I-7] (ref-counted shared pool)
@@ -314,7 +339,9 @@ elseif(OLMO_USE_DDP AND GLOO_INCLUDE_DIR)
                        "(set -DOLMO_USE_ADVANCED_PARALLEL=ON to compile stubs)")
     endif()
 else()
-    list(APPEND OLMO_SOURCES src/distributed/ddp_stub.cpp)
+    # No collective backend: ddp.cpp still builds (init_from_env() returns
+    # nullopt), so the hook logic is testable everywhere (tools/test_ddp_accum).
+    list(APPEND OLMO_SOURCES src/distributed/ddp.cpp)
 endif()
 add_library(olmo_cpp STATIC ${OLMO_SOURCES})
 if(OLMO_USE_NCCL)
@@ -688,6 +715,68 @@ add_executable(test_fused_ce tools/test_fused_ce.cpp)
 target_link_libraries(test_fused_ce PRIVATE olmo_cpp)
 target_include_directories(test_fused_ce PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(test_fused_ce PRIVATE -O3 -march=native)
+
+# Speed plan bug 5: speculative decoding must equal greedy decoding token for
+# token, and cached multi-token attention must equal the no-cache forward.
+add_executable(test_spec_greedy tools/test_spec_greedy.cpp)
+target_link_libraries(test_spec_greedy PRIVATE olmo_cpp)
+target_include_directories(test_spec_greedy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(test_spec_greedy PRIVATE -O2)
+
+# Speed plan bugs 1 + 4: every trainable parameter must get a gradient on
+# each device's training backend (cuBLASLt / SIMD fast paths cut the graph).
+add_executable(test_grad_coverage tools/test_grad_coverage.cpp)
+target_link_libraries(test_grad_coverage PRIVATE olmo_cpp)
+target_include_directories(test_grad_coverage PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(test_grad_coverage PRIVATE -O2)
+
+# Speed plan bug 2: two in-process DDP ranks with gradient accumulation must
+# match a single-model reference after every step.
+add_executable(test_ddp_accum tools/test_ddp_accum.cpp)
+target_link_libraries(test_ddp_accum PRIVATE olmo_cpp)
+target_include_directories(test_ddp_accum PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(test_ddp_accum PRIVATE -O2)
+
+# SL-MTP: factored heads == direct heads (losses and all gradients, fp64).
+add_executable(test_slmtp tools/test_slmtp.cpp)
+target_link_libraries(test_slmtp PRIVATE olmo_cpp)
+target_include_directories(test_slmtp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(test_slmtp PRIVATE -O2)
+
+# SL-MTP cost benchmark: full heads vs SL-MTP direct vs SL-MTP factored.
+add_executable(bench_slmtp tools/bench_slmtp.cpp)
+target_link_libraries(bench_slmtp PRIVATE olmo_cpp)
+target_include_directories(bench_slmtp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(bench_slmtp PRIVATE -O2)
+
+# Structural tokenizer: decode(encode(x)) must equal x on real files.
+add_executable(test_structural_roundtrip tools/test_structural_roundtrip.cpp)
+target_link_libraries(test_structural_roundtrip PRIVATE olmo_cpp)
+target_include_directories(test_structural_roundtrip PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(test_structural_roundtrip PRIVATE -O2)
+
+# SL-MTP kill test: frozen trunk, full-rank vs low-rank heads (see the tool's header).
+add_executable(slmtp_killtest tools/slmtp_killtest.cpp)
+target_link_libraries(slmtp_killtest PRIVATE olmo_cpp)
+target_include_directories(slmtp_killtest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${JSON_INCLUDE_DIR})
+target_compile_options(slmtp_killtest PRIVATE -O2)
+
+# SL-MTP self-speculation, end to end: plain vs speculative greedy decode speed.
+add_executable(bench_spec_decode tools/bench_spec_decode.cpp)
+target_link_libraries(bench_spec_decode PRIVATE olmo_cpp)
+target_include_directories(bench_spec_decode PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(bench_spec_decode PRIVATE -O2)
+
+# Diagnostic: a real checkpoint, CPU vs MPS, per sequence length.
+add_executable(mps_diag tools/mps_diag.cpp)
+target_link_libraries(mps_diag PRIVATE olmo_cpp)
+target_include_directories(mps_diag PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+# Factored DoRA == materialised DoRA (fp64) + speed at a 7B FFN shape.
+add_executable(test_dora_factored tools/test_dora_factored.cpp)
+target_link_libraries(test_dora_factored PRIVATE olmo_cpp)
+target_include_directories(test_dora_factored PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(test_dora_factored PRIVATE -O2)
 
 # A2 — fused QKV+RoPE forward/backward parity vs the discrete ATen chain.
 add_executable(test_fused_qkv_rope tools/test_fused_qkv_rope.cpp)

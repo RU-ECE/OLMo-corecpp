@@ -43,6 +43,14 @@
 
 namespace olmo_cpp {
 
+namespace {
+// A trainable weight needs the autograd path even when the activation does
+// not (e.g. a norm gain fed by frozen embeddings).
+bool weight_needs_grad(const torch::Tensor& w) {
+  return torch::GradMode::is_enabled() && w.defined() && w.requires_grad();
+}
+}  // namespace
+
 bool SIMDBackend::can_use_simd(const torch::Tensor& t) {
   // The SIMD kernels write through raw pointers into a fresh tensor, which has
   // no grad_fn. If autograd is recording and the input needs gradients, use
@@ -55,7 +63,7 @@ bool SIMDBackend::can_use_simd(const torch::Tensor& t) {
 }
 
 torch::Tensor SIMDBackend::rms_norm(torch::Tensor x, torch::Tensor weight, double eps) {
-  if (!can_use_simd(x)) {
+  if (!can_use_simd(x) || weight_needs_grad(weight)) {
     return IBackend::rms_norm(x, weight, eps);
   }
 
@@ -121,7 +129,7 @@ torch::Tensor SIMDBackend::residual_rms_norm(torch::Tensor x, torch::Tensor resi
                                               torch::Tensor weight, double eps) {
   // Fuse: add + rms_norm in place.
   // For SIMD path: compute x+residual directly then run fused rms_norm.
-  if (!can_use_simd(x) || !can_use_simd(residual)) {
+  if (!can_use_simd(x) || !can_use_simd(residual) || weight_needs_grad(weight)) {
     return IBackend::residual_rms_norm(x, residual, weight, eps);
   }
 

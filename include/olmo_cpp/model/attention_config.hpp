@@ -55,4 +55,18 @@ torch::Tensor compute_attention(
     const SlidingWindowConfig& sw_config = {},
     double dropout_p = 0.0);
 
+/// Causal SDPA for a query block that sits at the END of the key sequence:
+/// training (S_q == S_kv), decode (S_q == 1), and the multi-token cases that
+/// append to a KV cache (speculative verify, chunked prefill: 1 < S_q < S_kv).
+/// Query i is at absolute position (S_kv - S_q) + i and may see keys
+/// j <= (S_kv - S_q) + i. SDPA's own is_causal is top-left aligned when
+/// S_q != S_kv, so that case gets an explicit bottom-right mask; before this
+/// helper the cached multi-token case ran with no mask at all (bug 5).
+/// window > 0 also drops keys j < (S_kv - S_q) + i - window, as the modules
+/// always did. The mask is cached in (mask, mask_S, mask_full_S).
+torch::Tensor sdpa_suffix_causal(
+    const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v,
+    int64_t window,
+    torch::Tensor& mask, int64_t& mask_S, int64_t& mask_full_S);
+
 }  // namespace olmo_cpp

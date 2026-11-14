@@ -60,6 +60,7 @@
 #include "olmo_cpp/backend/fused_qkv_rope.hpp"   // H3: fused QKV+RoPE kernel
 #include "olmo_cpp/backend/cublas_direct.hpp"    // H3: fast_linear (cuBLASLt direct)
 #include "olmo_cpp/profiler.hpp"
+#include "olmo_cpp/model/attention_config.hpp"  // sdpa_suffix_causal
 #include <ATen/ops/scaled_dot_product_attention.h>
 #include <limits>
 
@@ -141,10 +142,8 @@ torch::Tensor FusedAttentionImpl::forward(
       v = v.unsqueeze(2).expand({B, n_kv_heads_, n_heads_rep_, kS, head_dim_})
            .reshape({B, n_heads_, kS, head_dim_});
     }
-    bool is_causal_fused =
-        (S > 1) && (layer_cache == nullptr || layer_cache->seq_len() == S);
-    auto attn_out =
-        at::scaled_dot_product_attention(q, k, v, c10::nullopt, 0.0, is_causal_fused);
+    auto attn_out = sdpa_suffix_causal(q, k, v, /*window=*/-1,
+                                       cached_attn_mask_, cached_mask_S_, cached_mask_full_S_);
     attn_out = attn_out.transpose(1, 2).reshape({B, S, -1});
     return fast_linear(attn_out, w_out_->weight,
                        w_out_->bias.defined() ? w_out_->bias : torch::Tensor());
@@ -200,38 +199,10 @@ torch::Tensor FusedAttentionImpl::forward(
   }
 
   // ── Attention ──
-  bool is_causal = (S > 1) && (layer_cache == nullptr || layer_cache->seq_len() == S);
-  auto full_S = k.size(2);
-
-  torch::Tensor attn_out;
-
-  if (sliding_window_size_ > 0 && S > 1) {
-    // Reuse cached mask when dimensions haven't changed. Same fix as in
-    // attention.cpp: build the band mask via tril/triu (one kernel each)
-    // instead of two arange tensors and a chain of boolean ops, and use
-    // rank-0 zero/-inf scalars in torch::where to skip allocating two SxS
-    // tensors only to throw one away.
-    if (S != cached_mask_S_ || full_S != cached_mask_full_S_) {
-      const auto offset = full_S - S;
-      auto bool_opts = torch::TensorOptions().dtype(torch::kBool).device(x.device());
-      auto ones      = torch::ones({S, full_S}, bool_opts);
-      auto allowed   = torch::tril(ones, offset)
-                         & torch::triu(ones, offset - sliding_window_size_);
-
-      auto mask_opts = torch::TensorOptions().dtype(x.dtype()).device(x.device());
-      cached_attn_mask_ = torch::where(
-          allowed,
-          torch::zeros({}, mask_opts),
-          torch::full({}, -std::numeric_limits<float>::infinity(), mask_opts));
-      cached_mask_S_      = S;
-      cached_mask_full_S_ = full_S;
-    }
-
-    attn_out = at::scaled_dot_product_attention(q, k, v, cached_attn_mask_, 0.0, false);
-  } else {
-    // On CUDA this dispatches to FlashAttention2 automatically
-    attn_out = at::scaled_dot_product_attention(q, k, v, c10::nullopt, 0.0, is_causal);
-  }
+  // Bug 5 fix: one helper picks the mask. The old code ran the cached
+  // multi-token case (speculative verify, chunked prefill) with no mask.
+  torch::Tensor attn_out = sdpa_suffix_causal(
+      q, k, v, sliding_window_size_, cached_attn_mask_, cached_mask_S_, cached_mask_full_S_);
 
   // ── Output projection ──
   attn_out = attn_out.transpose(1, 2).reshape({B, S, -1});

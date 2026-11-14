@@ -16,10 +16,9 @@
  * acceptance rate than MTP because the draft model has its own
  * representation, but adds a separate model load + per-step forward.
  *
- * DRAFT — interface only; orchestration logic similar to existing
- * speculative_decode_step but with a second Transformer plus its
- * own KV cache. Loading the draft model and running it through the
- * same pipeline (BPE tokenizer, etc.) is the integration cost.
+ * Wired into tools/chat.cpp (--draft-checkpoint). The step was rewritten
+ * for speed-plan bug 5: drafts used to be compared with the target's
+ * prediction one position too late, and both KV caches kept a stale entry.
  */
 
 #pragma once
@@ -45,6 +44,10 @@ struct DraftModelSpeculativeState {
   int64_t draft_len;       // dynamic k, may shift via accept-rate
   int64_t total_drafted;
   int64_t total_accepted;
+  // Same invariant as spec_core.hpp: both caches hold every committed token
+  // except `pending`, the newest one. Set by draft_model_speculative_prefill.
+  int64_t pending = -1;
+  bool done = false;
 
   DraftModelSpeculativeState(Transformer* tgt, Transformer* drf,
                              int64_t target_n_layers, int64_t draft_n_layers,
@@ -56,8 +59,23 @@ struct DraftModelSpeculativeState {
         total_drafted(0), total_accepted(0) {}
 };
 
-/// One speculative step. Returns number of tokens accepted (>=1).
-/// Modifies all_tokens in place to append accepted tokens.
+/// Runs the prompt (all_tokens) through both models, draws the first new
+/// token from the target, appends it to all_tokens and makes it pending.
+/// Must be called once before the first step. Returns 1.
+int64_t draft_model_speculative_prefill(
+    DraftModelSpeculativeState& state,
+    std::vector<int64_t>& all_tokens,
+    torch::Device device,
+    double temperature,
+    int64_t top_k,
+    double top_p,
+    double repetition_penalty,
+    std::mt19937& rng,
+    BPETokenizer& tokenizer);
+
+/// One speculative step. Returns the number of tokens appended to
+/// all_tokens (>= 1 unless an EOS was already committed). Greedy output is
+/// identical to greedy decoding with the target alone (tools/test_spec_greedy).
 int64_t draft_model_speculative_step(
     DraftModelSpeculativeState& state,
     std::vector<int64_t>& all_tokens,

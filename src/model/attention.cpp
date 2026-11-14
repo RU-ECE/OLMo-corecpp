@@ -25,6 +25,7 @@
  */
 #include "olmo_cpp/model/attention.hpp"
 #include "olmo_cpp/backend/paged_attention.hpp"
+#include "olmo_cpp/model/attention_config.hpp"  // sdpa_suffix_causal
 #include "olmo_cpp/backend/cublas_direct.hpp"
 #include "olmo_cpp/backend/fused_qkv_rope.hpp"
 #include <ATen/ops/scaled_dot_product_attention.h>
@@ -47,12 +48,23 @@ torch::Tensor AttentionImpl::packed_qkv_weight() {
   const uint32_t v_q = w_q_->weight._version();
   const uint32_t v_k = w_k_->weight._version();
   const uint32_t v_v = w_v_->weight._version();
+  // Version counters alone miss module->to(device) and torch::load, which
+  // swap the parameters' storage without bumping them; a stale packed weight
+  // then crashes (other device) or silently uses the old values (same device).
+  // The cache is also keyed on each weight's storage.
+  const void* p_q = w_q_->weight.data_ptr();
+  const void* p_k = w_k_->weight.data_ptr();
+  const void* p_v = w_v_->weight.data_ptr();
   if (cached_w_packed_valid_ &&
       v_q == cached_w_packed_v_q_ &&
       v_k == cached_w_packed_v_k_ &&
-      v_v == cached_w_packed_v_v_) {
+      v_v == cached_w_packed_v_v_ &&
+      p_q == cached_w_packed_p_q_ && p_k == cached_w_packed_p_k_ && p_v == cached_w_packed_p_v_) {
     return cached_w_packed_;
   }
+  cached_w_packed_p_q_ = p_q;
+  cached_w_packed_p_k_ = p_k;
+  cached_w_packed_p_v_ = p_v;
   cached_w_packed_ = torch::cat({w_q_->weight, w_k_->weight, w_v_->weight}, /*dim=*/0);
   cached_w_packed_v_q_ = v_q;
   cached_w_packed_v_k_ = v_k;
@@ -178,8 +190,8 @@ torch::Tensor AttentionImpl::forward(
       k = k.unsqueeze(2).expand({B, n_kv_heads_, n_heads_rep_, kS, head_dim_}).reshape({B, n_heads_, kS, head_dim_});
       v = v.unsqueeze(2).expand({B, n_kv_heads_, n_heads_rep_, kS, head_dim_}).reshape({B, n_heads_, kS, head_dim_});
     }
-    bool is_causal_fused = (S > 1) && (layer_cache == nullptr || layer_cache->seq_len() == S);
-    auto attn_out = at::scaled_dot_product_attention(q, k, v, c10::nullopt, 0.0, is_causal_fused);
+    auto attn_out = sdpa_suffix_causal(q, k, v, /*window=*/-1,
+                                       cached_attn_mask_, cached_mask_S_, cached_mask_full_S_);
     attn_out = attn_out.transpose(1, 2).reshape({B, S, -1});
     return fast_linear(attn_out, w_out_->weight,
                        w_out_->bias.defined() ? w_out_->bias : torch::Tensor());
@@ -253,44 +265,10 @@ torch::Tensor AttentionImpl::forward(
     v = v.unsqueeze(2).expand({B, n_kv_heads_, n_heads_rep_, kS, head_dim_}).reshape({B, n_heads_, kS, head_dim_});
   }
 
-  bool is_causal = (S > 1) && (layer_cache == nullptr || layer_cache->seq_len() == S);
-  auto full_S = k.size(2);
-
-  torch::Tensor attn_out;
-
-  if (sliding_window_size_ > 0 && S > 1) {
-    // Reuse cached mask when dimensions haven't changed.
-    if (S != cached_mask_S_ || full_S != cached_mask_full_S_) {
-      // The mask we want is the band of diagonals [offset - window, offset]
-      // (causal upper bound at offset, lower bound at offset - window). Build
-      // it as a single bool kernel via tril/triu so we don't allocate two
-      // arange tensors and pile up boolean ops. The previous implementation
-      // also had a no-op refinement: the original `mask` already enforced
-      // `cols <= (rows + offset)`, so the `if (is_causal)` clause re-ANDed
-      // an identical condition for free.
-      const auto offset = full_S - S;
-      auto bool_opts = torch::TensorOptions().dtype(torch::kBool).device(x.device());
-      auto ones      = torch::ones({S, full_S}, bool_opts);
-      auto allowed   = torch::tril(ones, offset)
-                         & torch::triu(ones, offset - sliding_window_size_);
-
-      // Mask dtype must match the activation dtype so SDPA doesn't reject a
-      // BF16 q/k/v with an FP32 attention bias (same class of bug as the one
-      // that killed 7B startup). torch::where with rank-0 tensors avoids the
-      // alloc-of-two-SxS-tensors-then-discard pattern the old code used.
-      auto mask_opts = torch::TensorOptions().dtype(x.dtype()).device(x.device());
-      cached_attn_mask_ = torch::where(
-          allowed,
-          torch::zeros({}, mask_opts),
-          torch::full({}, -std::numeric_limits<float>::infinity(), mask_opts));
-      cached_mask_S_      = S;
-      cached_mask_full_S_ = full_S;
-    }
-
-    attn_out = at::scaled_dot_product_attention(q, k, v, cached_attn_mask_, 0.0, false);
-  } else {
-    attn_out = at::scaled_dot_product_attention(q, k, v, c10::nullopt, 0.0, is_causal);
-  }
+  // Bug 5 fix: one helper picks the mask. The old code ran the cached
+  // multi-token case (speculative verify, chunked prefill) with no mask.
+  torch::Tensor attn_out = sdpa_suffix_causal(
+      q, k, v, sliding_window_size_, cached_attn_mask_, cached_mask_S_, cached_mask_full_S_);
 
   attn_out = attn_out.transpose(1, 2).reshape({B, S, -1});
   if (use_int4_) return int4_linear(int4_out_, attn_out);
@@ -305,10 +283,16 @@ torch::Tensor AttentionImpl::forward(
 
 // Tree-attention forward (item 8.1). Standard projections + RoPE, then
 // SDPA with the caller-supplied additive 2-D mask. No cache.
+// prefix (read-only) puts the cached context in front of the tokens: every
+// token sees all of it, plus what attn_mask allows among the new tokens.
+// positions [S] are the tokens' absolute RoPE positions (tree nodes sit at
+// prefix length + depth, not at their index in the flattened tree).
 torch::Tensor AttentionImpl::forward_with_mask(
     torch::Tensor x,
     const RoPEBuffers* rope_bufs,
-    torch::Tensor attn_mask) {
+    torch::Tensor attn_mask,
+    const LayerKVCache* prefix,
+    const torch::Tensor& positions) {
   auto B = x.size(0);
   auto S = x.size(1);
   auto q = use_int4_ ? int4_linear(int4_q_, x) : w_q_(x);
@@ -322,14 +306,29 @@ torch::Tensor AttentionImpl::forward_with_mask(
   if (q_norm_ && use_head_qk_norm_) q = (*q_norm_)(q);
   if (k_norm_ && use_head_qk_norm_) k = (*k_norm_)(k);
   if (rope_bufs) {
-    auto [q_rot, k_rot] = (*rope_)->apply(q, k, *rope_bufs, std::optional<int64_t>(0));
-    q = q_rot; k = k_rot;
+    if (positions.defined()) {
+      RoPEBuffers at_pos;
+      at_pos.pos_sin = rope_bufs->pos_sin.index_select(0, positions);
+      at_pos.pos_cos = rope_bufs->pos_cos.index_select(0, positions);
+      auto [q_rot, k_rot] = (*rope_)->apply(q, k, at_pos, std::optional<int64_t>(0));
+      q = q_rot; k = k_rot;
+    } else {
+      auto [q_rot, k_rot] = (*rope_)->apply(q, k, *rope_bufs, std::optional<int64_t>(0));
+      q = q_rot; k = k_rot;
+    }
   }
+  if (prefix && prefix->seq_len() > 0) {
+    const int64_t L = prefix->seq_len();
+    k = torch::cat({prefix->k.narrow(2, 0, L), k}, 2);
+    v = torch::cat({prefix->v.narrow(2, 0, L), v}, 2);
+    attn_mask = torch::cat({torch::zeros({S, L}, attn_mask.options()), attn_mask}, 1);
+  }
+  const int64_t kS = k.size(2);
   if (n_heads_rep_ > 1) {
-    k = k.unsqueeze(2).expand({B, n_kv_heads_, n_heads_rep_, S, head_dim_})
-            .reshape({B, n_heads_, S, head_dim_});
-    v = v.unsqueeze(2).expand({B, n_kv_heads_, n_heads_rep_, S, head_dim_})
-            .reshape({B, n_heads_, S, head_dim_});
+    k = k.unsqueeze(2).expand({B, n_kv_heads_, n_heads_rep_, kS, head_dim_})
+            .reshape({B, n_heads_, kS, head_dim_});
+    v = v.unsqueeze(2).expand({B, n_kv_heads_, n_heads_rep_, kS, head_dim_})
+            .reshape({B, n_heads_, kS, head_dim_});
   }
   auto attn_out = at::scaled_dot_product_attention(q, k, v, attn_mask, 0.0, false);
   attn_out = attn_out.transpose(1, 2).reshape({B, S, -1});

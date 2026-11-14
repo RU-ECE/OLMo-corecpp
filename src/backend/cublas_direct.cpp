@@ -231,13 +231,31 @@ void cublas_direct_reset_cache() {
 #endif
 }
 
+#ifdef OLMO_HAS_CUBLASLT
+namespace {
+// True when autograd would need a graph through these operands.
+bool records_grad(std::initializer_list<torch::Tensor> ts) {
+  if (!torch::GradMode::is_enabled()) return false;
+  for (const auto& t : ts)
+    if (t.defined() && t.requires_grad()) return true;
+  return false;
+}
+}  // namespace
+#endif
+
 torch::Tensor fast_linear(torch::Tensor x,
                            torch::Tensor weight,
                            torch::Tensor bias) {
 #ifdef OLMO_HAS_CUBLASLT
   // x: [..., K], weight: [N, K]. Output: [..., N].
+  // The cuBLASLt call writes into a fresh tensor with no grad_fn, so it is
+  // only taken when autograd is not recording (inference, or inside a custom
+  // autograd Function where grad mode is off). Before this check every
+  // training call site (attention/FFN projections) lost its gradient on CUDA
+  // (speed-plan bug 1); tools/test_grad_coverage catches it.
   if (x.is_cuda() && weight.is_cuda() && supported_lt_dtype(x.scalar_type())
-      && x.scalar_type() == weight.scalar_type()) {
+      && x.scalar_type() == weight.scalar_type()
+      && !records_grad({x, weight, bias})) {
     c10::cuda::CUDAGuard guard(x.device());
     auto x_c = x.contiguous();
     auto w_c = weight.contiguous();
@@ -299,7 +317,8 @@ torch::Tensor fast_matmul(torch::Tensor a,
                            bool transb) {
 #ifdef OLMO_HAS_CUBLASLT
   if (a.is_cuda() && b.is_cuda() && supported_lt_dtype(a.scalar_type())
-      && a.scalar_type() == b.scalar_type() && a.dim() == 2 && b.dim() == 2) {
+      && a.scalar_type() == b.scalar_type() && a.dim() == 2 && b.dim() == 2
+      && !records_grad({a, b})) {  // see fast_linear: no autograd on this path
     c10::cuda::CUDAGuard guard(a.device());
     auto a_c = a.contiguous();
     auto b_c = b.contiguous();

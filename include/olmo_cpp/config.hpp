@@ -185,6 +185,12 @@ struct TransformerConfig {
   int64_t num_mtp_heads = 0;        // 0 = disabled, 2-4 recommended
   /// Aggregate weight on the auxiliary MTP losses relative to next-token loss.
   double mtp_loss_weight = 0.1;     // weight for auxiliary MTP losses
+  /// "full": each head is proj(D x D) + RMSNorm, then the shared LM head.
+  /// "shared_lowrank" (SL-MTP): head k is u_k = a_k h + U_k V_k^T h through the
+  /// shared final norm and LM head, computed in factored form so its marginal
+  /// cost is ~2*V*mtp_rank per token instead of 2*V*d (see model/sl_mtp_head.hpp).
+  std::string mtp_head_type = "full";
+  int64_t mtp_rank = 64;
 
   // === Float8 ===
   /// Enable FP8 GEMMs on H100+ (Transformer Engine path).

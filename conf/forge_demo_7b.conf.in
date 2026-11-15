@@ -2,7 +2,7 @@
 # agent trajectories, sized for ONE Colab A100 40GB. Filled in by
 # scripts/colab_forge_demo.sh (envsubst), once per run of the ablation:
 #   ${RUN} ${VOL} ${STEPS} ${SEQ} ${ACCUM} ${MTP_K} ${MTP_TYPE} ${MTP_RANK} ${LOG} ${SAVE_LINE}
-#   ${LR} ${TRAIN_LM_HEAD} (1 = also train the LM head, so the model learns to emit <|im_end|>)
+#   ${MDIR} (converted model + tokenizer) ${SFT} (packed tokens + mask) ${LR} ${TRAIN_LM_HEAD} (1 = also train the LM head, so the model learns to emit <|im_end|>)
 # (SAVE_LINE is a comment today; "save<TAB><path>" would also write a full model.
 #  CKPT_INT = steps for the demo run so its final step leaves a checkpoint to merge.)
 # DoRA form is chosen by the environment: factored by default,
@@ -48,8 +48,8 @@ bf16				1
 amp				0
 grad_scaler			0
 log_interval			${LOG}
-finetune_from			${VOL}/olmo2-7b/olmo2_7b.pt
-sft_mask_path			${VOL}/forge-sft/sft_mask.npy
+finetune_from			${MDIR}/olmo2_7b.pt
+sft_mask_path			${SFT}/sft_mask.npy
 dora				1
 dora_rank			32
 dora_alpha			32.0
@@ -69,8 +69,8 @@ zero1				0
 fsdp				0
 
 [data]
-data_path			${VOL}/forge-sft/sft_tokens.npy
-bpe_vocab			${VOL}/olmo2-7b/vocab.json
+data_path			${SFT}/sft_tokens.npy
+bpe_vocab			${MDIR}/vocab.json
 
 [device]
 device				cuda

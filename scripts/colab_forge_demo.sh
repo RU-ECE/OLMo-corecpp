@@ -33,9 +33,16 @@ ABL_ACCUM=${ABL_ACCUM:-4}
 EPOCHS=${EPOCHS:-3}
 TRAIN_ACCUM=${TRAIN_ACCUM:-4}
 LR=${LR:-1.0e-4}
-# 1 = the demo run also trains the LM head: the base model has never emitted <|im_end|>,
-# and without this the finetuned model writes a correct tool call and then never stops.
-TRAIN_LM_HEAD=${TRAIN_LM_HEAD:-1}
+# Starting model. The Instruct model already ends its turns with <|endoftext|> in its own
+# (Tulu) chat format; the base model has never ended a turn, so with it the demo run also
+# trains the LM head (TRAIN_LM_HEAD=1) to learn ChatML's <|im_end|>.
+BASE_MODEL=${BASE_MODEL:-allenai/OLMo-2-1124-7B}
+case "$BASE_MODEL" in
+  *Instruct*) MDIR=$VOL/olmo2-7b-instruct; TEMPLATE=tulu;   TRAIN_LM_HEAD=${TRAIN_LM_HEAD:-0} ;;
+  *)          MDIR=$VOL/olmo2-7b;          TEMPLATE=chatml; TRAIN_LM_HEAD=${TRAIN_LM_HEAD:-1} ;;
+esac
+SFT=$VOL/forge-sft-$TEMPLATE
+export MDIR SFT
 DEMO_LM_HEAD=$TRAIN_LM_HEAD
 R=$VOL/results
 mkdir -p "$R" "$VOL/runs"
@@ -69,11 +76,11 @@ fi
 if has data; then
   log "data"
   pip -q install tokenizers datasets huggingface_hub >/dev/null 2>&1 || true
-  mkdir -p "$VOL/olmo2-7b" "$VOL/forge-data"
+  mkdir -p "$MDIR" "$VOL/forge-data"
   python - <<PY
 from huggingface_hub import hf_hub_download
 for f in ["tokenizer.json", "vocab.json", "merges.txt", "config.json"]:
-    hf_hub_download("allenai/OLMo-2-1124-7B", f, local_dir="$VOL/olmo2-7b")
+    hf_hub_download("$BASE_MODEL", f, local_dir="$MDIR")
 PY
   python -I "$FORGE/export_sft.py" "$FORGE/trajectories" "$VOL/forge-data" | tee -a "$R/demo.log"
   # General instruction data so a small agent set does not erase general skill.
@@ -96,32 +103,32 @@ sys.stdout.flush()
 os._exit(0)  # the streaming reader's worker threads can hang interpreter exit
 PY
   fi
-  python "$FORGE/prep_forge_sft.py" --tokenizer "$VOL/olmo2-7b/tokenizer.json" \
+  python "$FORGE/prep_forge_sft.py" --tokenizer "$MDIR/tokenizer.json" \
     --forge "$VOL/forge-data/sft.jsonl" --general "$VOL/forge-data/tulu.jsonl" --general-ratio 3 \
-    --repeat-forge 4 --seq-len "$SEQ" --out "$VOL/forge-sft" | tee "$R/data.txt"
+    --repeat-forge 4 --seq-len "$SEQ" --template "$TEMPLATE" --out "$SFT" | tee "$R/data.txt"
   if grep -q "kept forge=0 " "$R/data.txt"; then
     log "data FAILED: no Forge conversation fits in SEQ=$SEQ tokens (see $R/data.txt); the demo would learn nothing from Forge"
     exit 1
   fi
   # Every conversation must sit whole inside one training window (prep's --layout windows).
   if [ -f "$FORGE/check_sft_windows.py" ]; then
-    python "$FORGE/check_sft_windows.py" "$VOL/olmo2-7b/tokenizer.json" "$SEQ" "$VOL/forge-sft" | tee -a "$R/data.txt" \
+    python "$FORGE/check_sft_windows.py" "$MDIR/tokenizer.json" "$SEQ" "$SFT" "$TEMPLATE" | tee -a "$R/data.txt" \
       || { log "data FAILED: a conversation straddles a training window (see $R/data.txt)"; exit 1; }
   fi
 fi
 
-if has model && [ -s "$VOL/olmo2-7b/olmo2_7b.pt" ]; then
-  log "model: $VOL/olmo2-7b/olmo2_7b.pt already converted"
+if has model && [ -s "$MDIR/olmo2_7b.pt" ]; then
+  log "model: $MDIR/olmo2_7b.pt already converted"
 elif has model; then
-  log "model: download + convert OLMo-2-1124-7B"
+  log "model: download + convert $BASE_MODEL"
   python - <<PY
 from huggingface_hub import snapshot_download
-snapshot_download("allenai/OLMo-2-1124-7B", local_dir="$VOL/olmo2-7b",
+snapshot_download("$BASE_MODEL", local_dir="$MDIR",
                   allow_patterns=["*.safetensors", "*.json", "*.txt"])
 PY
-  "$B/convert_hf" --hf-dir "$VOL/olmo2-7b" --config "$ROOT/configs/olmo2_1124_7B.json" \
-    --output "$VOL/olmo2-7b/olmo2_7b.pt" 2>&1 | tail -3 | tee -a "$R/demo.log"
-  rm -f "$VOL"/olmo2-7b/*.safetensors   # the .pt has everything
+  "$B/convert_hf" --hf-dir "$MDIR" --config "$ROOT/configs/olmo2_1124_7B.json" \
+    --output "$MDIR/olmo2_7b.pt" 2>&1 | tail -3 | tee -a "$R/demo.log"
+  rm -f "$MDIR"/*.safetensors   # the .pt has everything
 fi
 
 # One training run: $1 name, $2 steps, $3 accum, $4 mtp heads, $5 type, $6 rank, $7 log interval, rest = env
@@ -158,7 +165,7 @@ if has ablation; then
 fi
 
 if has train; then
-  NSEQ=$(python -c "import numpy as np; print(np.load('$VOL/forge-sft/sft_tokens.npy', mmap_mode='r').size // $SEQ)")
+  NSEQ=$(python -c "import numpy as np; print(np.load('$SFT/sft_tokens.npy', mmap_mode='r').size // $SEQ)")
   STEPS=$(( (NSEQ * EPOCHS + TRAIN_ACCUM - 1) / TRAIN_ACCUM ))
   log "demo training: $NSEQ sequences x $EPOCHS epochs -> $STEPS steps (accum $TRAIN_ACCUM)"
   run forge_demo "$STEPS" "$TRAIN_ACCUM" 3 shared_lowrank 128 1 || { log "demo training FAILED; not exporting"; exit 1; }
@@ -170,7 +177,7 @@ if has export; then
   # GGUF f16, then Q4_K_M for qrt. llama.cpp pinned to Forge's b11900.
   D=$VOL/runs/forge_demo
   log "export: merge"
-  NSEQ=$(python -c "import numpy as np; print(np.load('$VOL/forge-sft/sft_tokens.npy', mmap_mode='r').size // $SEQ)")
+  NSEQ=$(python -c "import numpy as np; print(np.load('$SFT/sft_tokens.npy', mmap_mode='r').size // $SEQ)")
   STEPS=$(( (NSEQ * EPOCHS + TRAIN_ACCUM - 1) / TRAIN_ACCUM ))
   export RUN=forge_demo VOL STEPS SEQ ACCUM=$TRAIN_ACCUM MTP_K=3 MTP_TYPE=shared_lowrank MTP_RANK=128 LOG=1 \
          SAVE_LINE="# merge only" CKPT_INT=$STEPS RESUME=1 LR TRAIN_LM_HEAD=$DEMO_LM_HEAD
@@ -178,7 +185,7 @@ if has export; then
   MERGE_EXPORT="$D/merged.pt" "$B/olmo_train" "$D.merge.conf" > "$R/merge.log" 2>&1; rc=$?; log "merge exit $rc"
   [ $rc -eq 0 ] && [ -s "$D/merged.pt" ] || { tail -5 "$R/merge.log" | tee -a "$R/demo.log"; log "merge FAILED"; exit 1; }
   "$B/export_hf_olmo2" --config "$ROOT/configs/olmo2_1124_7B.json" --ckpt "$D/merged.pt" --out "$D/hf" \
-    --tokenizer-dir "$VOL/olmo2-7b" 2>&1 | tail -2 | tee -a "$R/demo.log"
+    --tokenizer-dir "$MDIR" 2>&1 | tail -2 | tee -a "$R/demo.log"
   [ ${PIPESTATUS[0]} -eq 0 ] || { log "HF export FAILED"; exit 1; }
   [ -d /content/llama.cpp ] || git clone -q --depth 1 --branch b11900 https://github.com/ggml-org/llama.cpp /content/llama.cpp \
     || git clone -q --depth 1 https://github.com/ggml-org/llama.cpp /content/llama.cpp
@@ -186,11 +193,11 @@ if has export; then
   # torch that olmo_train links against. The converter needs only these (gguf comes from llama.cpp/gguf-py).
   pip -q install sentencepiece safetensors >/dev/null 2>&1
   python -c "import torch; assert torch.cuda.is_available(), torch.__version__" || { log "torch was changed; stopping"; exit 1; }
-  python /content/llama.cpp/convert_hf_to_gguf.py "$D/hf" --outtype f16 --outfile "$D/forge-demo-olmo2-7b-f16.gguf" \
+  python /content/llama.cpp/convert_hf_to_gguf.py "$D/hf" --outtype f16 --outfile "$D/forge-demo-$(basename "$MDIR")-f16.gguf" \
     > "$R/gguf.log" 2>&1; log "gguf exit $?"
   cmake -S /content/llama.cpp -B /content/llama.cpp/build -DGGML_CUDA=OFF -DLLAMA_CURL=OFF > /dev/null 2>&1
   cmake --build /content/llama.cpp/build --target llama-quantize -j"$(nproc)" > /dev/null 2>&1
-  /content/llama.cpp/build/bin/llama-quantize "$D/forge-demo-olmo2-7b-f16.gguf" "$D/forge-demo-olmo2-7b-q4_k_m.gguf" Q4_K_M \
+  /content/llama.cpp/build/bin/llama-quantize "$D/forge-demo-$(basename "$MDIR")-f16.gguf" "$D/forge-demo-$(basename "$MDIR")-q4_k_m.gguf" Q4_K_M \
     > "$R/quantize.log" 2>&1; log "quantize exit $?"
   ls -la "$D"/*.gguf 2>/dev/null | tee -a "$R/demo.log"
 fi

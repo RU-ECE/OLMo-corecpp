@@ -81,6 +81,8 @@ trained on), output identical to plain greedy in every run:
 | 2 epochs, 1.6M tokens, model's own picks | **1.241×** | **1.261×** | **47.9%** | 1.66 |
 
 On the earlier prompt set (stories past 2,000) the same progression is 1.065× → 1.152× → 1.177× (1 draft).
+Training against the model's whole distribution instead of its pick (`--target soft`, from the cached h,
+same data and epochs) is a tie: 1.214× / 1.204×, acceptance 44.5% vs 43.0%. More text is the lever that works.
 Each step helps: longer training, self-distillation (+4 points of agreement over the real-token target
 at equal training) and more text. The plan's ~1.9× needs about 70% acceptance; the next levers are more
 text and training the heads with the trunk (FastMTP's route to 2×).

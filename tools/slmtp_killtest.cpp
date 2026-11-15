@@ -23,7 +23,7 @@
  *                          --text f.txt --out DIR [--seq 512] [--tokens 600000] [--device mps]
  *   slmtp_killtest train --config c.json --ckpt m.pt --features DIR --variant full|sl
  *                        [--rank 64] [--heads 3] [--epochs 1] [--batch 2] [--lr 1e-3]
- *                        [--eval-frac 0.1] [--fix-a0] [--target real|greedy] [--save heads.pt] [--device mps]
+ *                        [--eval-frac 0.1] [--fix-a0] [--target real|greedy|soft] [--save heads.pt] [--device mps]
  * Prints one JSON line with the results.
  */
 #include "olmo_cpp/config.hpp"
@@ -189,7 +189,13 @@ int train(const std::map<std::string, std::string>& a) {
   // --target greedy: self-distillation. Head k learns the model's own greedy pick for token
   // t+k+2 (made at position t+k+1) instead of the real token: greedy speculative decoding
   // accepts a draft exactly when it equals that pick.
-  const bool greedy_target = get(a, "target", "real") == "greedy";
+  const std::string target = get(a, "target", "real");
+  const bool greedy_target = target == "greedy";
+  // --target soft: the model's whole distribution for token t+k+2 (its main head at position
+  // t+k+1, computed from the cached h), cross-entropy against it: the head also learns the
+  // model's confidence and runner-ups, not just its pick.
+  const bool soft_target = target == "soft";
+  TORCH_CHECK(target == "real" || greedy_target || soft_target, "--target real|greedy|soft");
 
   std::ifstream mf(dir / "meta.json");
   std::stringstream ms;
@@ -303,13 +309,25 @@ int train(const std::map<std::string, std::string>& a) {
     const int64_t b = std::min(B, n_train - i);
     auto h = H.narrow(0, i, b).to(dev, torch::kFloat32);
     auto y = variant == "full" ? torch::Tensor() : torch::matmul(h * g, W.t());  // frozen: no grad
+    torch::Tensor main_p;  // the trunk's own next-token distribution at every position
+    if (soft_target) {
+      torch::NoGradGuard ng;
+      auto yy = y.defined() ? y : torch::matmul(h * g, W.t());
+      main_p = torch::softmax(yy * torch::rsqrt(h.pow(2).mean(-1, true) + eps), -1);
+    }
     torch::Tensor loss;
     for (int64_t k = 0; k < K; ++k) {
       const int64_t shift = k + 1, m = S - shift - 1;
       auto lg = head_logits(k, h, y).narrow(1, 0, m);
-      auto truth = (greedy_target ? greedy.narrow(0, i, b).narrow(1, shift, m)
-                                  : tokens.narrow(0, i, b).narrow(1, shift + 1, m)).to(dev);
-      auto l = torch::nn::functional::cross_entropy(lg.reshape({-1, lg.size(-1)}), truth.reshape(-1));
+      torch::Tensor l;
+      if (soft_target) {
+        auto p = main_p.narrow(1, shift, m);  // the model's distribution for token t+k+2
+        l = -(p * torch::log_softmax(lg, -1)).sum(-1).mean();
+      } else {
+        auto truth = (greedy_target ? greedy.narrow(0, i, b).narrow(1, shift, m)
+                                    : tokens.narrow(0, i, b).narrow(1, shift + 1, m)).to(dev);
+        l = torch::nn::functional::cross_entropy(lg.reshape({-1, lg.size(-1)}), truth.reshape(-1));
+      }
       loss = loss.defined() ? loss + l : l;
     }
     loss = loss / static_cast<double>(K);
@@ -327,7 +345,7 @@ int train(const std::map<std::string, std::string>& a) {
   const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   auto after = evaluate();
   nlohmann::json out = {{"variant", variant + (fix_a0 ? "-a0" : "")},
-                        {"target", greedy_target ? "greedy" : "real"},
+                        {"target", target},
                         {"rank", variant == "full" ? d : r},
                         {"trainable_params", n_params},
                         {"lr", lr},

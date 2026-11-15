@@ -144,7 +144,28 @@ Untrained Instruct is already near the trained base model and knows its turn end
 for the real demo (`BASE_MODEL=allenai/OLMo-2-1124-7B-Instruct`). Export (merge 14.5 min, HF write ~13 min,
 GGUF + Q4_K_M ~10 min) now takes longer than training; writing the merge in bf16 would halve the first two.
 
-**Limit of this data:** 6 tasks, 12 passing runs, 7 that fit 4096 tokens. A usable agent needs more: 46 new
+**More data, then the real test (2026-11-15).** 46 new tasks (38 train, 8 held out, `make_tasks.py`).
+Qwen2.5-Coder-32B-Instruct as the agent on the 38 × 3 runs: 99 of 138 trajectories (with the original 24)
+pass all three Forge gates (79% of the new runs). OLMo-2-7B-Instruct + DoRA on them (140 Forge + 198 general
+conversations, 471k tokens, 87 steps at 6,168 ms): main loss on its training windows 0.321, turn end 0.107.
+
+Scored by Forge's own gates on the 8 held-out tasks (×2 attempts, temperature 0.2, 30 steps, qrt Q4_K_M,
+4096 context):
+
+| Model | All 3 gates | Contract | Render | Acceptance | 6-task benchmark |
+|---|---|---|---|---|---|
+| OLMo-2-7B-Instruct, untrained | 0/16 | 0 | 0 | 0 | 0/6 |
+| + DoRA on 99 Forge trajectories | 0/16 | 7 | 5 | 0 | 0/6 |
+
+A first scoring gave 0/16 for both for a different reason: OLMo-2-Instruct's chat template drops tool
+results and call arguments, so the served model never saw what its tools returned and repeated its first
+call. `forge_tulu_tools.jinja` (Forge repo) renders them exactly as training did (identical text on all 24
+trajectories) and is now stamped into the exported GGUF. With it the trained model works through real agent
+steps (scaffold, write files, `knowsy_check`, fix), and no run hit the context limit; it fails on code: most
+widgets do not parse (unexpected end of input, invalid regular expression) or lack the requested controls.
+OLMo-2-7B is a general model; the next lever is a code base model (scores below).
+
+**Limit of the first data:** 6 tasks, 12 passing runs, 7 that fit 4096 tokens. A usable agent needs more: 46 new
 tasks (`bench/knowsybench/make_tasks.py`, 38 for training, 8 held out), trajectories generated with
 Qwen2.5-Coder-32B-Instruct and kept only when all three Forge gates pass, then scoring on the held-out tasks
 with the same gates.

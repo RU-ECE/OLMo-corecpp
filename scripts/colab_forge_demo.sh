@@ -33,6 +33,11 @@ ABL_ACCUM=${ABL_ACCUM:-4}
 EPOCHS=${EPOCHS:-3}
 TRAIN_ACCUM=${TRAIN_ACCUM:-4}
 LR=${LR:-1.0e-4}
+# Data mix: Forge conversations repeated REPEAT_FORGE times; general Tulu-3 conversations
+# GENERAL_RATIO per Forge one (capped by the 400 fetched). 4 / 3 suits the 12-trajectory set;
+# with ~100+ generated trajectories use 2 / 1.
+REPEAT_FORGE=${REPEAT_FORGE:-4}
+GENERAL_RATIO=${GENERAL_RATIO:-3}
 # Starting model. The Instruct model already ends its turns with <|endoftext|> in its own
 # (Tulu) chat format; the base model has never ended a turn, so with it the demo run also
 # trains the LM head (TRAIN_LM_HEAD=1) to learn ChatML's <|im_end|>.
@@ -104,8 +109,8 @@ os._exit(0)  # the streaming reader's worker threads can hang interpreter exit
 PY
   fi
   python "$FORGE/prep_forge_sft.py" --tokenizer "$MDIR/tokenizer.json" \
-    --forge "$VOL/forge-data/sft.jsonl" --general "$VOL/forge-data/tulu.jsonl" --general-ratio 3 \
-    --repeat-forge 4 --seq-len "$SEQ" --template "$TEMPLATE" --out "$SFT" | tee "$R/data.txt"
+    --forge "$VOL/forge-data/sft.jsonl" --general "$VOL/forge-data/tulu.jsonl" --general-ratio "$GENERAL_RATIO" \
+    --repeat-forge "$REPEAT_FORGE" --seq-len "$SEQ" --template "$TEMPLATE" --out "$SFT" | tee "$R/data.txt"
   if grep -q "kept forge=0 " "$R/data.txt"; then
     log "data FAILED: no Forge conversation fits in SEQ=$SEQ tokens (see $R/data.txt); the demo would learn nothing from Forge"
     exit 1

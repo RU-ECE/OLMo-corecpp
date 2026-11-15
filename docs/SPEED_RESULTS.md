@@ -108,21 +108,46 @@ bin packing (`prep_forge_sft.py --layout windows`, Forge repo): 0 cuts, 0 lost, 
 **Ablation** (OLMo-2-1124-7B, DoRA r=32 on all 7 projections, pure bf16, full activation checkpointing,
 4 × 4096 tokens per step, same data order; 8 steps each, steady-state = median of steps 2–7):
 
-| Configuration | Step | Tokens/s | Speedup | Peak GPU memory (nvidia-smi) | Loss, steps 1 / 7 |
-|---|---|---|---|---|---|
-| Materialised DoRA + 2 full-rank MTP heads (the repo's recipe) | 7,852 ms | 2,087 | 1.00× | 40,312 MiB (at the 40 GB limit) | 6.391 / 6.677 |
-| Factored DoRA + 2 full-rank heads | 6,385 ms | 2,566 | **1.23×** | 39,934 MiB | 6.384 / 6.675 |
-| Factored DoRA + 3 SL-MTP heads (r=128, chunked loss, row kernels) | 6,121 ms | 2,677 | **1.28×** | 37,278 MiB | 6.299 / 6.580 |
+| Configuration | Step | Tokens/s | Speedup | Logged loss after 7 steps |
+|---|---|---|---|---|
+| Materialised DoRA + 2 full-rank MTP heads (the repo's recipe) | 7,866 ms | 2,083 | 1.00× | 2.376 |
+| Factored DoRA + 2 full-rank heads | 6,402 ms | 2,559 | **1.23×** | 2.375 |
+| Factored DoRA + 3 SL-MTP heads (r=128, chunked loss, row kernels) | 6,142 ms | 2,668 | **1.28×** | 2.541 (3 heads, not comparable) |
 
-The SL-MTP run trains one more head and is still the fastest and smallest. Logged loss = main CE +
-0.1 × mean head CE; the heads start untrained, so they dominate it (see the main-loss check below).
+Re-run with all fixes (2026-11-15 00:54); the pre-fix run's step times agree within 0.3%. The SL-MTP run trains
+one more head and is still the fastest. Logged loss = main CE + 0.1 × mean head CE, so it is not comparable
+across head types. Estimated utilisation ≈ 38% of A100 bf16 peak (FLOP count: ≈ 45 GFLOP per token with
+full recompute and a frozen base). nvidia-smi peaks (31–40 GB) track the caching allocator, not need, and
+changed between identical runs, so no memory claim is made.
 
-**These ablation losses were measured before the RoPE fix (bug 8) and are invalid; the step times stand.**
-After the RoPE and DoRA-init fixes, the trainer's own main loss (no MTP heads, lr 0, one epoch of the 36
-windows) is **0.9648** against Hugging Face's **0.9657** (before: 6.5314).
+**Correctness check:** after the RoPE and DoRA-init fixes, the trainer's own main loss (no MTP heads, lr 0,
+one epoch of the 36 windows) is **0.9648** against Hugging Face's **0.9657** (before: 6.5314).
 
-_Pending (re-run started on Colab 2026-11-15 00:54 with the fixed code): ablation, demo training, export.
-Results land in `/content/forge_demo/results/results.json`._
+**Demo model v0** (base OLMo-2-1124-7B, ChatML, 27 steps = 3 epochs, LM head frozen, Q4_K_M 4.47 GB exported).
+Hugging Face on the same windows: main loss 0.966 → **0.839** (mean per window); `<|im_end|>` 24.6 → 11.5 nats.
+Greedy reply to a Forge task: the base model repeats the prompt; the demo emits a correct `knowsy_scaffold`
+tool call (name, category, widget, prefix) but never ends its turn, because a base model has never produced
+`<|im_end|>` and low-rank adapters barely move that output row.
+
+| Start (same 7 Forge conversations, 27 steps; Hugging Face scores) | Main loss, mean per window | Turn-end token (nats) | Greedy reply stops |
+|---|---|---|---|
+| Base, untrained (ChatML) | 0.966 | 24.6 | no (repeats the prompt) |
+| Base, DoRA, LM head frozen | 0.839 | 11.5 | no: correct tool call, then loops |
+| Base, DoRA + LM head trained (`train_lm_head`, +2% step time) | 0.616 | 5.96 | no: complete tool call, then loops |
+| OLMo-2-1124-7B-**Instruct**, untrained (its own Tulu format) | 0.682 | 1.93 | n/a (writes code instead of a tool call) |
+| **Instruct, DoRA, 27 steps** | **0.486** | **0.28** | **yes**, after 102 tokens: a `knowsy_scaffold` call, then `<\|endoftext\|>` |
+
+The trained Instruct reply has the right tool and widget id/category but drops `class_name` and `prefix` and
+adds junk keys: format and stopping are solved, argument correctness needs more than 7 conversations.
+
+Untrained Instruct is already near the trained base model and knows its turn end, so it is the starting point
+for the real demo (`BASE_MODEL=allenai/OLMo-2-1124-7B-Instruct`). Export (merge 14.5 min, HF write ~13 min,
+GGUF + Q4_K_M ~10 min) now takes longer than training; writing the merge in bf16 would halve the first two.
+
+**Limit of this data:** 6 tasks, 12 passing runs, 7 that fit 4096 tokens. A usable agent needs more: 46 new
+tasks (`bench/knowsybench/make_tasks.py`, 38 for training, 8 held out), trajectories generated with
+Qwen2.5-Coder-32B-Instruct and kept only when all three Forge gates pass, then scoring on the held-out tasks
+with the same gates.
 
 ## 6. Ideas and open problems (not yet measured)
 

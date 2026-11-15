@@ -170,6 +170,50 @@ tasks (`bench/knowsybench/make_tasks.py`, 38 for training, 8 held out), trajecto
 Qwen2.5-Coder-32B-Instruct and kept only when all three Forge gates pass, then scoring on the held-out tasks
 with the same gates.
 
+### 5b. Qwen2 (Qwen2.5-Coder) in llm-cpp
+
+Reference scores on the same held-out tasks put the code models far ahead of the trained OLMo-2-7B
+(Qwen2.5-Coder 7B 1/16, 14B 6/16, 32B 10/16), so the demo moves to Qwen2.5-Coder-14B-Instruct.
+New in llm-cpp: `block_type pre_norm`, q/k/v bias (`attention_bias`), an exact FFN width
+(`ffn_hidden_size`), the Qwen2 name map in `convert_hf` (pre-norm: `input_layernorm` is the attention
+norm, `post_attention_layernorm` the FFN norm; tied embeddings copied), and `configs/qwen2.5_coder_14B.json`.
+
+Logits against Hugging Face (`tools/test_hf_logits`, `scripts/hf_logits.py`; full forward, prefill then
+KV-cached decode, and the DoRA model in train mode at step 0):
+
+| Model | fp32, max rel diff | greedy agreement |
+|---|---|---|
+| tiny random Qwen2 (GQA 8/2, FFN 344, random biases and norms) | 4.7e-7 | 96/96 |
+| Qwen2.5-Coder-0.5B-Instruct | 1.5e-5 | 128/128 |
+
+In pure bf16 the 0.5B model is 5.3e-2 from the fp32 reference, inside Hugging Face's own bf16 error
+(7.7e-2, same 124/128 greedy agreement). Planted faults fail the test: wrong block type or a missing bias
+(the converter now refuses: every checkpoint tensor must land, every parameter must be filled), and a wrong
+rope theta (rel 1.3e-2 while greedy still agrees, which is why the gate is the tolerance, not argmax).
+
+Memory, so a 14B fits one GPU and an 83 GB host: the model is built in bf16 from the start (`bf16=1`),
+and `finetune_from`, the parity tools and the merge stream the checkpoint into the existing parameters
+(`load_matching`: copy by name, dtype and device follow the model; unexpected or missing tensors are
+errors). Before, the base load built a second full model in fp32: 2 × 59 GB for 14B.
+
+Training data for an instruct model must be the tokens its server runs. The serving runtime (llama.cpp's
+Jinja engine) tokenizes message text and template text separately, so no token crosses a boundary such as
+`History.` | `\n\n# Tools`; tokenizing the rendered string whole matched 0 of 12 real agent prompts. The
+data is now produced by the serving code itself (12/12 identical, 0.5B and 14B GGUFs), and each turn is
+trained on the compacted context the agent actually sends at that step.
+
+Bug found by the 14B run: the CUDA RMSNorm backward refused rows wider than 4096 ("D must be in
+(0, 4096]", the first backward of Qwen2.5-14B's d = 5120). The cap was a shared-memory guess: two fp32
+rows fit the default 48 KB up to D = 6140, wider rows now opt in to the device's larger shared memory,
+and rows that still do not fit use the exact formula in ATen. `test_cuda_parity` checks the gradient at
+D = 768, 5120, 8192 (opt-in) and 24576 (fallback), bf16 and fp32: all pass on the A100.
+
+Open, found by the same `test_cuda_parity` run (A100, 2026-11-15) and not on the DoRA training path:
+the fused FFN WMMA kernel's bf16 forward is off by 128 (tolerance 0.2), and the fused QKV+RoPE kernel's
+bf16 forward q/k are off by 0.5 (tolerance 0.05). The fused FFN runs only with `fused 1`; the fused QKV
+path runs on CUDA for models with no QK-norm, no q/k/v bias and no DoRA (e.g. Llama-style), training and
+paged inference. Both need a root cause before either path is trusted.
+
 ## 6. Ideas and open problems (not yet measured)
 
 - Fuse the logit GEMM into the SL-MTP row kernel (bf16 already beats materialised full heads; fusion would cut the remaining [tokens × vocab] passes).

@@ -99,11 +99,12 @@ namespace {
 
 __global__ void apply_rope_f32_kernel(
     const float* __restrict__ x,         // [..., D] queries or keys, contiguous
-    const float* __restrict__ cos_buf,   // [D]   precomputed cosines
-    const float* __restrict__ sin_buf,   // [D]   precomputed sines
+    const float* __restrict__ cos_buf,   // [S, D] cosines, one row per position
+    const float* __restrict__ sin_buf,   // [S, D] sines
     float* __restrict__ out,             // [..., D] rotated output
     int64_t total_elements,              // numel(x)
-    int64_t dim) {                       // D (head_dim)
+    int64_t dim,                         // D (head_dim)
+    int64_t seq) {                       // S: rows in the tables (x is [..., S, D]); 1 = shared
   int64_t idx    = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
   int64_t half   = dim / 2;              // boundary between "first half" and "second half"
@@ -121,9 +122,11 @@ __global__ void apply_rope_f32_kernel(
     } else {
       x_rot = x[row * dim + col - half];
     }
-    // Apply the rotation.  cos_buf[col] and sin_buf[col] together
-    // encode the position-dependent angle for this dim slot.
-    out[i] = x_val * cos_buf[col] + x_rot * sin_buf[col];
+    // Apply the rotation for this row's position. The tables used to be read
+    // at [col] only, i.e. every token rotated as position 0 (cos 1, sin 0):
+    // RoPE was a no-op on CUDA.
+    int64_t t = (row % seq) * dim + col;
+    out[i] = x_val * cos_buf[t] + x_rot * sin_buf[t];
   }
 }
 
@@ -139,7 +142,8 @@ __global__ void apply_rope_bf16_kernel(
     const __nv_bfloat16* __restrict__ sin_buf,
     __nv_bfloat16* __restrict__ out,
     int64_t total_elements,
-    int64_t dim) {
+    int64_t dim,
+    int64_t seq) {
   int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
   int64_t half = dim / 2;
@@ -154,8 +158,9 @@ __global__ void apply_rope_bf16_kernel(
     } else {
       x_rot = __bfloat162float(x[row * dim + col - half]);
     }
-    float c = __bfloat162float(cos_buf[col]);
-    float s = __bfloat162float(sin_buf[col]);
+    int64_t t = (row % seq) * dim + col;
+    float c = __bfloat162float(cos_buf[t]);
+    float s = __bfloat162float(sin_buf[t]);
     out[i] = __float2bfloat16(x_val * c + x_rot * s);
   }
 }
@@ -182,7 +187,9 @@ __global__ void apply_rope_qk_f32_kernel(
     float* __restrict__ k_out,
     int64_t q_total,
     int64_t k_total,
-    int64_t dim) {
+    int64_t dim,
+    int64_t seq_q,
+    int64_t seq_k) {
   int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
   int64_t half = dim / 2;
@@ -206,7 +213,8 @@ __global__ void apply_rope_qk_f32_kernel(
     } else {
       x_rot = src[row * dim + col - half];
     }
-    dst[local_i] = x_val * cos_ptr[col] + x_rot * sin_ptr[col];
+    int64_t t = (row % (is_q ? seq_q : seq_k)) * dim + col;
+    dst[local_i] = x_val * cos_ptr[t] + x_rot * sin_ptr[t];
   }
 }
 
@@ -223,7 +231,9 @@ __global__ void apply_rope_qk_bf16_kernel(
     __nv_bfloat16* __restrict__ k_out,
     int64_t q_total,
     int64_t k_total,
-    int64_t dim) {
+    int64_t dim,
+    int64_t seq_q,
+    int64_t seq_k) {
   int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
   int64_t half = dim / 2;
@@ -247,10 +257,30 @@ __global__ void apply_rope_qk_bf16_kernel(
     } else {
       x_rot = __bfloat162float(src[row * dim + col - half]);
     }
-    float c = __bfloat162float(cos_ptr[col]);
-    float s = __bfloat162float(sin_ptr[col]);
+    int64_t t = (row % (is_q ? seq_q : seq_k)) * dim + col;
+    float c = __bfloat162float(cos_ptr[t]);
+    float s = __bfloat162float(sin_ptr[t]);
     dst[local_i] = __float2bfloat16(x_val * c + x_rot * s);
   }
+}
+
+// Rows in a cos/sin table laid out the way the kernels read it: [..., S, D] with
+// the position axis directly before D in both the table and x (attention applies
+// RoPE to [B, H, S, D] with tables [1, 1, S, D]), or a single shared row (S = 1).
+// Returns 0 when the layout is anything else; the caller then uses the reference.
+int64_t rope_table_rows(const torch::Tensor& x, const torch::Tensor& cos, const torch::Tensor& sin) {
+  const int64_t dim = x.size(-1);
+  if (cos.scalar_type() != x.scalar_type() || sin.scalar_type() != x.scalar_type()) return 0;
+  if (cos.size(-1) != dim || !cos.sizes().equals(sin.sizes()) || cos.numel() % dim != 0) return 0;
+  const int64_t seq = cos.numel() / dim;
+  if (seq == 1) return 1;
+  if (cos.dim() >= 2 && x.dim() >= 2 && cos.size(-2) == seq && x.size(-2) == seq) return seq;
+  return 0;
+}
+
+torch::Tensor rope_reference(const torch::Tensor& x, const torch::Tensor& cos, const torch::Tensor& sin) {
+  auto ch = x.chunk(2, -1);
+  return (x * cos + torch::cat({-ch[1], ch[0]}, -1) * sin).to(x.scalar_type());
 }
 
 }  // namespace
@@ -262,6 +292,8 @@ torch::Tensor apply_rope_cuda(
     const torch::Tensor& cos,
     const torch::Tensor& sin) {
   TORCH_CHECK(x.is_cuda() && cos.is_cuda() && sin.is_cuda());
+  const int64_t seq = rope_table_rows(x, cos, sin);
+  if (seq == 0) return rope_reference(x, cos, sin);
   auto x_c = x.contiguous();
   auto cos_c = cos.contiguous();
   auto sin_c = sin.contiguous();
@@ -281,14 +313,14 @@ torch::Tensor apply_rope_cuda(
         reinterpret_cast<const __nv_bfloat16*>(cos_c.data_ptr<at::BFloat16>()),
         reinterpret_cast<const __nv_bfloat16*>(sin_c.data_ptr<at::BFloat16>()),
         reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
-        numel, dim);
+        numel, dim, seq);
   } else {
     apply_rope_f32_kernel<<<blocks, threads, 0, stream>>>(
         x_c.data_ptr<float>(),
         cos_c.data_ptr<float>(),
         sin_c.data_ptr<float>(),
         out.data_ptr<float>(),
-        numel, dim);
+        numel, dim, seq);
   }
   return out;
 }
@@ -301,6 +333,10 @@ std::vector<torch::Tensor> apply_rope_qk_cuda(
     const torch::Tensor& cos_k,
     const torch::Tensor& sin_k) {
   TORCH_CHECK(q.is_cuda() && k.is_cuda());
+  const int64_t seq_q = rope_table_rows(q, cos_q, sin_q);
+  const int64_t seq_k = rope_table_rows(k, cos_k, sin_k);
+  if (seq_q == 0 || seq_k == 0 || q.size(-1) != k.size(-1))
+    return {rope_reference(q, cos_q, sin_q), rope_reference(k, cos_k, sin_k)};
   auto q_c = q.contiguous();
   auto k_c = k.contiguous();
   auto cos_q_c = cos_q.contiguous();
@@ -331,7 +367,7 @@ std::vector<torch::Tensor> apply_rope_qk_cuda(
         reinterpret_cast<const __nv_bfloat16*>(sin_k_c.data_ptr<at::BFloat16>()),
         reinterpret_cast<__nv_bfloat16*>(q_out.data_ptr<at::BFloat16>()),
         reinterpret_cast<__nv_bfloat16*>(k_out.data_ptr<at::BFloat16>()),
-        q_total, k_total, dim);
+        q_total, k_total, dim, seq_q, seq_k);
   } else {
     apply_rope_qk_f32_kernel<<<blocks, threads, 0, stream>>>(
         q_c.data_ptr<float>(),
@@ -342,7 +378,7 @@ std::vector<torch::Tensor> apply_rope_qk_cuda(
         sin_k_c.data_ptr<float>(),
         q_out.data_ptr<float>(),
         k_out.data_ptr<float>(),
-        q_total, k_total, dim);
+        q_total, k_total, dim, seq_q, seq_k);
   }
 
   return {q_out, k_out};

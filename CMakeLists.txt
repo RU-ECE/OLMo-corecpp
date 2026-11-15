@@ -778,6 +778,24 @@ target_link_libraries(test_dora_factored PRIVATE olmo_cpp)
 target_include_directories(test_dora_factored PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(test_dora_factored PRIVATE -O2)
 
+# Checkpoints round-trip bit-exactly and a save adds < 2.5x the model in host RAM.
+add_executable(test_checkpoint_io tools/test_checkpoint_io.cpp)
+target_link_libraries(test_checkpoint_io PRIVATE olmo_cpp)
+target_include_directories(test_checkpoint_io PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(test_checkpoint_io PRIVATE -O2)
+
+# Main next-token loss on SFT windows, for parity with Hugging Face.
+add_executable(eval_sft_loss tools/eval_sft_loss.cpp)
+target_link_libraries(eval_sft_loss PRIVATE olmo_cpp)
+target_include_directories(eval_sft_loss PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cnpy)
+target_compile_options(eval_sft_loss PRIVATE -O2)
+
+# A DoRA finetune starts exactly at the base model (init_weights must not touch the adapters).
+add_executable(test_dora_init tools/test_dora_init.cpp)
+target_link_libraries(test_dora_init PRIVATE olmo_cpp)
+target_include_directories(test_dora_init PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(test_dora_init PRIVATE -O2)
+
 # A2 — fused QKV+RoPE forward/backward parity vs the discrete ATen chain.
 add_executable(test_fused_qkv_rope tools/test_fused_qkv_rope.cpp)
 target_link_libraries(test_fused_qkv_rope PRIVATE olmo_cpp)

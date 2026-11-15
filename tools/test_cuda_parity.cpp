@@ -16,6 +16,7 @@
 #include "olmo_cpp/backend/fused_qkv_rope.hpp"
 #include "olmo_cpp/backend/fused_lm_head_ce.hpp"
 #include "olmo_cpp/backend/backend.hpp"
+#include "olmo_cpp/backend/cuda_backend.hpp"
 #include "olmo_cpp/model/layer_norm.hpp"
 
 #include <cmath>
@@ -38,6 +39,8 @@ float max_diff(torch::Tensor a, torch::Tensor b) {
   return (a.to(torch::kFloat32) - b.to(torch::kFloat32)).abs().max().item<float>();
 }
 
+int g_parity_failures = 0;
+
 void section(const std::string& name) {
   std::cout << "\n=== " << name << " ===\n" << std::flush;
 }
@@ -45,9 +48,10 @@ void section(const std::string& name) {
 void result(const std::string& tag, float diff, float tol) {
   std::cout << "  " << std::left << std::setw(40) << tag
             << " max |diff| = " << std::scientific << std::setprecision(3) << diff;
-  if (diff > tol) {
+  if (diff > tol) {  // keep going: one broken kernel must not hide the others
     std::cout << "  [FAIL — tol=" << tol << "]\n";
-    std::exit(1);
+    ++g_parity_failures;
+    return;
   }
   std::cout << "  [ok]\n";
 }
@@ -254,6 +258,48 @@ int main() {
     result("backward grad_up",   max_diff(up.grad(),   ur.grad()), 1e-1f);
   }
 
+  // ── RoPE with per-position tables, the layout attention uses ──────
+  // q/k are [B, H, S, D] and the tables [1, 1, S, D]. The kernels used to read
+  // the tables at [col] only, so every token was rotated as position 0 (cos 1,
+  // sin 0): RoPE did nothing on CUDA while the ATen reference rotated properly.
+  section("apply_rope with per-position tables — CUDA backend");
+  {
+    olmo_cpp::use_cuda_backend();
+    const int64_t B = 2, H = 4, S = 64, D = 64;
+    auto f32 = torch::TensorOptions().dtype(torch::kFloat32).device(dev);
+    auto inv = torch::pow(torch::full({}, 10000.0, f32), -torch::arange(0, D / 2, f32) * 2.0 / D);
+    auto ang = torch::arange(S, f32).unsqueeze(1) * inv.unsqueeze(0);          // [S, D/2]
+    auto full = torch::cat({ang, ang}, -1);                                     // [S, D]
+    auto cos = full.cos().view({1, 1, S, D}), sin = full.sin().view({1, 1, S, D});
+    auto rope_ref = [](const torch::Tensor& x, const torch::Tensor& c, const torch::Tensor& s) {
+      auto ch = x.chunk(2, -1);
+      return x * c + torch::cat({-ch[1], ch[0]}, -1) * s;
+    };
+    for (auto dt : {torch::kFloat32, torch::kBFloat16}) {
+      const std::string name = dt == torch::kFloat32 ? "fp32" : "bf16";
+      const float tol = dt == torch::kFloat32 ? 1e-5f : 3e-2f;
+      auto x = torch::randn({B, H, S, D}, f32).to(dt).set_requires_grad(true);
+      auto y = olmo_cpp::get_backend().apply_rope(x, sin.to(dt), cos.to(dt));
+      auto up = torch::randn_like(y);
+      (y.to(torch::kFloat32) * up.to(torch::kFloat32)).sum().backward();
+      auto xr = x.detach().to(torch::kFloat32).set_requires_grad(true);
+      auto yr = rope_ref(xr, cos, sin);
+      (yr * up.to(torch::kFloat32)).sum().backward();
+      result(name + " forward (kernel vs reference)", max_diff(y, yr), tol);
+      result(name + " backward grad_x", max_diff(x.grad(), xr.grad()), 2 * tol);
+      // The check can fail: rotating every token as position 0 is far off.
+      auto y0 = rope_ref(xr.detach(), cos.narrow(2, 0, 1), sin.narrow(2, 0, 1));
+      const float d0 = max_diff(y0, yr.detach());
+      std::cout << "  " << name << " position-0-only rotation differs by " << d0
+                << (d0 > 0.5f ? "  [ok: the check can fail]\n" : "  [FAIL: check too weak]\n");
+      if (d0 <= 0.5f) ++g_parity_failures;
+    }
+  }
+
+  if (g_parity_failures) {
+    std::cout << "\nFAILED: " << g_parity_failures << " CUDA parity check(s)\n";
+    return 1;
+  }
   std::cout << "\nALL CUDA PARITY TESTS PASSED\n";
   return 0;
 }

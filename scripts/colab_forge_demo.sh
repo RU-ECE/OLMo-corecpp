@@ -24,15 +24,24 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VOL=${VOL:-/content/forge_demo}
 FORGE=${FORGE:-/content/forge_data}
 STAGES=${STAGES:-"build data model ablation train"}
-SEQ=${SEQ:-2048}
+# 4096 = OLMo-2-1124-7B's trained context, which is also the cap Forge's qrt runtime
+# applies (n_ctx <= n_ctx_train). Forge trajectories are 3k-12k tokens: at 2048 every
+# one is dropped; at 4096, 7 of 12 fit (measured 2026-11-14).
+SEQ=${SEQ:-4096}
 ABL_STEPS=${ABL_STEPS:-8}
 ABL_ACCUM=${ABL_ACCUM:-4}
 EPOCHS=${EPOCHS:-3}
-TRAIN_ACCUM=${TRAIN_ACCUM:-8}
+TRAIN_ACCUM=${TRAIN_ACCUM:-4}
 R=$VOL/results
 mkdir -p "$R" "$VOL/runs"
 log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$R/demo.log"; }
 has() { [[ " $STAGES " == *" $1 "* ]]; }
+# Fill ${VAR}s in a config template from the environment. Python, not envsubst: Colab
+# has no gettext, and envsubst left every config empty there. An unset variable is an error.
+render() {
+  python3 -c 'import os, string, sys; sys.stdout.write(string.Template(open(sys.argv[1]).read()).substitute(os.environ))' \
+    "$1" > "$2" && grep -q '^\[model\]' "$2" || { log "config render FAILED: $1 -> $2"; exit 1; }
+}
 
 if has build; then
   log "build"
@@ -61,8 +70,11 @@ for f in ["tokenizer.json", "vocab.json", "merges.txt", "config.json"]:
 PY
   python -I "$FORGE/export_sft.py" "$FORGE/trajectories" "$VOL/forge-data" | tee -a "$R/demo.log"
   # General instruction data so a small agent set does not erase general skill.
+  if [ "$(wc -l < "$VOL/forge-data/tulu.jsonl" 2>/dev/null || echo 0)" -ge 400 ]; then
+    echo "tulu.jsonl already has 400 conversations; reusing it"
+  else
   python - <<PY
-import json, itertools
+import json, os, sys
 from datasets import load_dataset
 ds = load_dataset("allenai/tulu-3-sft-mixture", split="train", streaming=True)
 with open("$VOL/forge-data/tulu.jsonl", "w") as f:
@@ -73,10 +85,22 @@ with open("$VOL/forge-data/tulu.jsonl", "w") as f:
         f.write(json.dumps({"messages": msgs}) + "\n"); n += 1
         if n >= 400: break
 print("tulu conversations:", n)
+sys.stdout.flush()
+os._exit(0)  # the streaming reader's worker threads can hang interpreter exit
 PY
+  fi
   python "$FORGE/prep_forge_sft.py" --tokenizer "$VOL/olmo2-7b/tokenizer.json" \
     --forge "$VOL/forge-data/sft.jsonl" --general "$VOL/forge-data/tulu.jsonl" --general-ratio 3 \
     --repeat-forge 4 --seq-len "$SEQ" --out "$VOL/forge-sft" | tee "$R/data.txt"
+  if grep -q "kept forge=0 " "$R/data.txt"; then
+    log "data FAILED: no Forge conversation fits in SEQ=$SEQ tokens (see $R/data.txt); the demo would learn nothing from Forge"
+    exit 1
+  fi
+  # Every conversation must sit whole inside one training window (prep's --layout windows).
+  if [ -f "$FORGE/check_sft_windows.py" ]; then
+    python "$FORGE/check_sft_windows.py" "$VOL/olmo2-7b/tokenizer.json" "$SEQ" "$VOL/forge-sft" | tee -a "$R/data.txt" \
+      || { log "data FAILED: a conversation straddles a training window (see $R/data.txt)"; exit 1; }
+  fi
 fi
 
 if has model; then
@@ -96,10 +120,10 @@ run() {
   local name=$1 steps=$2 accum=$3 k=$4 type=$5 rank=$6 logi=$7; shift 7
   export RUN=$name VOL STEPS=$steps SEQ ACCUM=$accum MTP_K=$k MTP_TYPE=$type MTP_RANK=$rank LOG=$logi
   export SAVE_LINE="# no checkpoint for timing runs" CKPT_INT=100000 RESUME=${RESUME:-0}
+  # The demo run's last step leaves a resumable checkpoint; export merges from it, so no
+  # separate full-model `save` (another 14.8 GB written and held in RAM at the end).
   [ "$name" = forge_demo ] && export CKPT_INT=$steps
-  # The INI parser splits key and value on a TAB only.
-  [ "$name" = forge_demo ] && export SAVE_LINE=$'save\t'"$VOL/runs/$name/model.pt"
-  envsubst < "$ROOT/conf/forge_demo_7b.conf.in" > "$VOL/runs/$name.conf"
+  render "$ROOT/conf/forge_demo_7b.conf.in" "$VOL/runs/$name.conf"
   mkdir -p "$VOL/runs/$name"
   # Peak GPU memory: sample nvidia-smi every 0.5 s while the run lasts.
   ( while true; do nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits; sleep 0.5; done ) \
@@ -110,10 +134,13 @@ run() {
   local rc=$?
   kill $mon 2>/dev/null; wait $mon 2>/dev/null
   log "run $name exit $rc in $(( $(date +%s) - t0 )) s"
+  [ $rc -eq 0 ] || tail -5 "$R/$name.log" | tee -a "$R/demo.log"
+  return $rc
 }
 
 if has ablation; then
   log "ablation: $ABL_STEPS steps x accum $ABL_ACCUM x seq $SEQ"
+  # A failed timing run is logged and the next one still runs.
   run baseline "$ABL_STEPS" "$ABL_ACCUM" 2 full 0   1 OLMO_DORA_MATERIALIZED=1
   run fdora    "$ABL_STEPS" "$ABL_ACCUM" 2 full 0   1
   run slmtp    "$ABL_STEPS" "$ABL_ACCUM" 3 shared_lowrank 128 1
@@ -123,7 +150,7 @@ if has train; then
   NSEQ=$(python -c "import numpy as np; print(np.load('$VOL/forge-sft/sft_tokens.npy', mmap_mode='r').size // $SEQ)")
   STEPS=$(( (NSEQ * EPOCHS + TRAIN_ACCUM - 1) / TRAIN_ACCUM ))
   log "demo training: $NSEQ sequences x $EPOCHS epochs -> $STEPS steps (accum $TRAIN_ACCUM)"
-  run forge_demo "$STEPS" "$TRAIN_ACCUM" 3 shared_lowrank 128 1
+  run forge_demo "$STEPS" "$TRAIN_ACCUM" 3 shared_lowrank 128 1 || { log "demo training FAILED; not exporting"; exit 1; }
 fi
 
 if has export; then
@@ -136,13 +163,18 @@ if has export; then
   STEPS=$(( (NSEQ * EPOCHS + TRAIN_ACCUM - 1) / TRAIN_ACCUM ))
   export RUN=forge_demo VOL STEPS SEQ ACCUM=$TRAIN_ACCUM MTP_K=3 MTP_TYPE=shared_lowrank MTP_RANK=128 LOG=1 \
          SAVE_LINE="# merge only" CKPT_INT=$STEPS RESUME=1
-  envsubst < "$ROOT/conf/forge_demo_7b.conf.in" > "$D.merge.conf"
-  MERGE_EXPORT="$D/merged.pt" "$B/olmo_train" "$D.merge.conf" > "$R/merge.log" 2>&1; log "merge exit $?"
+  render "$ROOT/conf/forge_demo_7b.conf.in" "$D.merge.conf"
+  MERGE_EXPORT="$D/merged.pt" "$B/olmo_train" "$D.merge.conf" > "$R/merge.log" 2>&1; rc=$?; log "merge exit $rc"
+  [ $rc -eq 0 ] && [ -s "$D/merged.pt" ] || { tail -5 "$R/merge.log" | tee -a "$R/demo.log"; log "merge FAILED"; exit 1; }
   "$B/export_hf_olmo2" --config "$ROOT/configs/olmo2_1124_7B.json" --ckpt "$D/merged.pt" --out "$D/hf" \
     --tokenizer-dir "$VOL/olmo2-7b" 2>&1 | tail -2 | tee -a "$R/demo.log"
+  [ ${PIPESTATUS[0]} -eq 0 ] || { log "HF export FAILED"; exit 1; }
   [ -d /content/llama.cpp ] || git clone -q --depth 1 --branch b11900 https://github.com/ggml-org/llama.cpp /content/llama.cpp \
     || git clone -q --depth 1 https://github.com/ggml-org/llama.cpp /content/llama.cpp
-  pip -q install -r /content/llama.cpp/requirements/requirements-convert_hf_to_gguf.txt >/dev/null 2>&1 || pip -q install gguf sentencepiece >/dev/null 2>&1
+  # NOT llama.cpp's requirements file: it pins a CPU-only torch (==2.11.0) and would replace the CUDA
+  # torch that olmo_train links against. The converter needs only these (gguf comes from llama.cpp/gguf-py).
+  pip -q install sentencepiece safetensors >/dev/null 2>&1
+  python -c "import torch; assert torch.cuda.is_available(), torch.__version__" || { log "torch was changed; stopping"; exit 1; }
   python /content/llama.cpp/convert_hf_to_gguf.py "$D/hf" --outtype f16 --outfile "$D/forge-demo-olmo2-7b-f16.gguf" \
     > "$R/gguf.log" 2>&1; log "gguf exit $?"
   cmake -S /content/llama.cpp -B /content/llama.cpp/build -DGGML_CUDA=OFF -DLLAMA_CURL=OFF > /dev/null 2>&1

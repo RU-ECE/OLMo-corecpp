@@ -2,7 +2,7 @@
 # agent trajectories, sized for ONE Colab A100 40GB. Filled in by
 # scripts/colab_forge_demo.sh (envsubst), once per run of the ablation:
 #   ${RUN} ${VOL} ${STEPS} ${SEQ} ${ACCUM} ${MTP_K} ${MTP_TYPE} ${MTP_RANK} ${LOG} ${SAVE_LINE}
-# (SAVE_LINE is "save<TAB><path>" for the demo run and a comment for timing runs;
+# (SAVE_LINE is a comment today; "save<TAB><path>" would also write a full model.
 #  CKPT_INT = steps for the demo run so its final step leaves a checkpoint to merge.)
 # DoRA form is chosen by the environment: factored by default,
 # OLMO_DORA_MATERIALIZED=1 for the original (baseline) form.

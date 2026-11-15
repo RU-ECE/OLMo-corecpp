@@ -80,6 +80,9 @@ void apply_mup_init(
     // Defensive: skip undefined or empty parameters (can happen for unused
     // optional submodules that nonetheless register a placeholder).
     if (!p.defined() || p.numel() == 0) continue;
+    // DoRA/LoRA adapters keep their own init (lora_B = 0 keeps the base model exact
+    // at step 0); see TransformerImpl::init_weights and tools/test_dora_init.
+    if (name.find("dora_") != std::string::npos || name.find("lora_") != std::string::npos) continue;
 
     // --- Norm weights must be checked FIRST (they appear inside lm_head, blocks, etc.) ---
     // RMSNorm/LayerNorm gains are 1-D; pin them to 1.0 so the layer starts

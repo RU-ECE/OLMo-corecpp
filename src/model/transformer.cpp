@@ -151,13 +151,19 @@ void TransformerImpl::init_weights(torch::optional<torch::Generator> gen) {
 
   for (int64_t i = 0; i < config_.n_layers; ++i) {
     auto block = blocks_->ptr<ReorderedNormTransformerBlockImpl>(i);
-    for (auto& p : block->parameters()) {
+    for (auto& it : block->named_parameters()) {
+      auto& p = it.value();
       // ONLY initialize 2-D weight matrices (Linear weights). 1-D params are
       // RMSNorm/QK-norm gains (must stay 1.0) and biases (must stay 0.0);
       // overwriting a norm gain with N(0, init_std) noise collapses that
       // sublayer's residual contribution and destroys the tuned init. This
       // loop previously trunc_normal_'d *every* param, zeroing all 24 block
       // norm gains — the root of the garbage/NaN training.
+      // DoRA/LoRA adapters keep their own init (lora_B = 0, so W' == W at step 0).
+      // Drawing lora_B from N(0, init_std) here moved every adapted projection away
+      // from the pretrained weight before the first step: OLMo-2-7B's main loss on the
+      // Forge SFT windows was 6.5 instead of 1.03 (tools/test_dora_init).
+      if (it.key().find("dora_") != std::string::npos || it.key().find("lora_") != std::string::npos) continue;
       if (p.defined() && p.dim() >= 2) {
         trunc_normal_(p, 0.0, config_.init_std, -3 * config_.init_std, 3 * config_.init_std, g);
       }

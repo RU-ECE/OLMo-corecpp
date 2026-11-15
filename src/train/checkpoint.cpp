@@ -60,6 +60,7 @@
 
 #include <torch/serialize.h>
 #include <algorithm>
+#include <cstdlib>
 #include <future>
 #include <iostream>
 #include <sstream>
@@ -83,6 +84,43 @@ CheckpointManager::CheckpointManager(const std::string& base_path, int num_io_th
 
 std::string CheckpointManager::shard_dir(const std::string& tag, int rank) const {
   return base_path_ + "/" + tag + "/rank_" + std::to_string(rank);
+}
+
+// A local checkpoint is written and read as a file by the archive itself. Going
+// through FileSystem::write_file/read_file holds the serialized shard in memory
+// three more times (ostringstream, its string, the byte vector; the same on load):
+// a 7B DoRA save on Colab peaked at 69.6 GB host RSS that way and was OOM-killed.
+// Remote filesystems (s3://, gs://, http) keep the byte-buffer path; OLMO_CKPT_BYTES=1
+// forces it locally too (tools/test_checkpoint_io uses that to show the old peak).
+static bool local_file(const FileSystem* fs, const std::string& path, std::string& out) {
+  if (!dynamic_cast<const LocalFileSystem*>(fs) || std::getenv("OLMO_CKPT_BYTES")) return false;
+  out = path.rfind("file://", 0) == 0 ? path.substr(7) : path;
+  return true;
+}
+
+static void write_archive(FileSystem* fs, torch::serialize::OutputArchive& archive,
+                          const std::string& path) {
+  std::string local;
+  if (local_file(fs, path, local)) {
+    archive.save_to(local);
+    return;
+  }
+  std::ostringstream oss;
+  archive.save_to(oss);
+  std::string s = oss.str();
+  fs->write_file(path, std::vector<uint8_t>(s.begin(), s.end()));
+}
+
+static void read_archive(FileSystem* fs, torch::serialize::InputArchive& archive,
+                         const std::string& path) {
+  std::string local;
+  if (local_file(fs, path, local)) {
+    archive.load_from(local);
+    return;
+  }
+  auto data = fs->read_file(path);
+  std::istringstream iss(std::string(data.begin(), data.end()));
+  archive.load_from(iss);
 }
 
 // ---------------------------------------------------------------------------
@@ -164,11 +202,7 @@ void CheckpointManager::save(const std::string& tag,
     for (int i = start; i < end && i < static_cast<int>(param_list.size()); ++i) {
       archive.write(param_list[i].first, param_list[i].second);
     }
-    std::ostringstream oss;
-    archive.save_to(oss);
-    std::string s = oss.str();
-    std::vector<uint8_t> data(s.begin(), s.end());
-    fs_->write_file(dir + "/model_chunk_" + std::to_string(start) + ".pt", data);
+    write_archive(fs_.get(), archive, dir + "/model_chunk_" + std::to_string(start) + ".pt");
   };
 
   for (int i = 0; i < static_cast<int>(param_list.size()); i += params_per_thread) {
@@ -179,7 +213,6 @@ void CheckpointManager::save(const std::string& tag,
 
   // Save optimizer state
   {
-    std::ostringstream oss;
     torch::serialize::OutputArchive opt_archive;
     // Save optimizer state_dict manually: param group lrs and states
     const auto& groups = optimizer.param_groups();
@@ -188,10 +221,7 @@ void CheckpointManager::save(const std::string& tag,
       opt_archive.write("group_" + std::to_string(g) + "_lr",
                         torch::tensor(lr));
     }
-    opt_archive.save_to(oss);
-    std::string s = oss.str();
-    std::vector<uint8_t> data(s.begin(), s.end());
-    fs_->write_file(dir + "/optimizer.pt", data);
+    write_archive(fs_.get(), opt_archive, dir + "/optimizer.pt");
   }
 
   // Write metadata
@@ -214,15 +244,17 @@ std::future<void> CheckpointManager::save_async(const std::string& tag,
                                                   const torch::optim::Optimizer& optimizer,
                                                   const CheckpointMetadata& meta,
                                                   int rank, int world_size) {
-  // Clone param data to CPU to avoid racing with training
-  // (we snapshot the current state)
+  // Snapshot every parameter to CPU so training can continue while the save runs.
+  // Copy device -> host directly: the old .clone().cpu() first cloned on the GPU,
+  // a whole-model spike in device memory (14.8 GB for the 7B) at every checkpoint.
   auto params = model.named_parameters();
   std::unordered_map<std::string, torch::Tensor> snapshot;
   for (const auto& p : params) {
-    snapshot[p.key()] = p.value().detach().clone().cpu();
+    snapshot[p.key()] = p.value().detach().to(torch::kCPU, /*non_blocking=*/false, /*copy=*/true);
   }
 
-  return std::async(std::launch::async, [this, tag, snapshot, meta, rank, world_size]() {
+  return std::async(std::launch::async, [this, tag, snapshot = std::move(snapshot), meta, rank,
+                                         world_size]() {
     std::string dir = shard_dir(tag, rank);
     fs_->mkdir(dir);
 
@@ -230,11 +262,7 @@ std::future<void> CheckpointManager::save_async(const std::string& tag,
     for (const auto& [name, tensor] : snapshot) {
       archive.write(name, tensor);
     }
-    std::ostringstream oss;
-    archive.save_to(oss);
-    std::string s = oss.str();
-    std::vector<uint8_t> data(s.begin(), s.end());
-    fs_->write_file(dir + "/model.pt", data);
+    write_archive(fs_.get(), archive, dir + "/model.pt");
 
     CheckpointMetadata full_meta = meta;
     full_meta.rank = rank;
@@ -260,11 +288,8 @@ CheckpointMetadata CheckpointManager::load(const std::string& tag,
 
   for (const auto& f : files) {
     if (f.find("model") != std::string::npos && f.find(".pt") != std::string::npos) {
-      auto data = fs_->read_file(dir + "/" + f);
-      std::string s(data.begin(), data.end());
-      std::istringstream iss(s);
       torch::serialize::InputArchive archive;
-      archive.load_from(iss);
+      read_archive(fs_.get(), archive, dir + "/" + f);
 
       // Load each tensor into the model
       for (const auto& item : model.named_parameters()) {

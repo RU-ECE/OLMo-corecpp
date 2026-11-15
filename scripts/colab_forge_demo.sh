@@ -204,6 +204,16 @@ if has export; then
   cmake --build /content/llama.cpp/build --target llama-quantize -j"$(nproc)" > /dev/null 2>&1
   /content/llama.cpp/build/bin/llama-quantize "$D/forge-demo-$(basename "$MDIR")-f16.gguf" "$D/forge-demo-$(basename "$MDIR")-q4_k_m.gguf" Q4_K_M \
     > "$R/quantize.log" 2>&1; log "quantize exit $?"
+  # Tool calls and tool results must reach the model at inference exactly as training rendered them
+  # (export_sft.py: <tool_call>{json}</tool_call> in the assistant turn, <tool_response> user turns).
+  # OLMo-2-Instruct's own template drops tool results and call arguments: the trained model then
+  # repeats its first call forever. Stamp the matching template into the GGUF qrt will load.
+  if [ "$TEMPLATE" = tulu ] && [ -f "$FORGE/forge_tulu_tools.jinja" ]; then
+    Q="$D/forge-demo-$(basename "$MDIR")-q4_k_m.gguf"
+    python /content/llama.cpp/gguf-py/gguf/scripts/gguf_new_metadata.py --chat-template-file "$FORGE/forge_tulu_tools.jinja" \
+      "$Q" "$Q.tmp" > "$R/template.log" 2>&1 < /dev/null && mv "$Q.tmp" "$Q"
+    log "tool chat template exit $?"
+  fi
   ls -la "$D"/*.gguf 2>/dev/null | tee -a "$R/demo.log"
 fi
 

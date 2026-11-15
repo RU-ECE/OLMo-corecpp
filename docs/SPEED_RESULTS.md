@@ -18,6 +18,9 @@ All timings are medians of repeated runs after warm-up.
 | 5 speculative decoding | suffix-causal mask for cached multi-token blocks; exact linear, draft-model and tree steps | 46 checks speculative == greedy; old mask fails 16; context-blind tree accepts 0–4 of 26–30 | `test_spec_greedy` |
 | latent | `embed_scale` applied twice; uint16 tokens read as int16; sliding-window decode ignored the window | — | `test_spec_greedy` (window) |
 | found while testing | packed-QKV and RoPE caches ignored device moves/reloads; MPS `.to(kCPU, kFloat64)` returned garbage logits; LibTorch 2.14 needs C++20 (autocast probes silently fell back) | real OLMo-2 1B: greedy on MPS printed "iesziesz…" → correct text | `test_spec_greedy mps`, `bench_spec_decode` |
+| 6 DoRA finetunes did not start from the base model | `init_weights()` (run by `main.cpp` for every job, finetunes included) drew every 2-D block parameter from N(0, 0.02), DoRA's `lora_B` too, so W + s·BA ≠ W before step 0; adapters now keep their own init (also in µP init) | tiny model: step-0 logits 11% off the base → 1.6e-7; max \|lora_B\| 0.06 → 0 | `test_dora_init` |
+| 8 RoPE did nothing on CUDA | all four `kernels/rope.cu` kernels read the cos/sin tables at `[col]`, i.e. position 0 (cos 1, sin 0) for every token, while attention passes one row per position; the backward (ATen) did rotate, so forward and backward disagreed. Kernels now index `(row mod S)·D + col`, with a reference fallback for any other layout | kernel vs reference max \|diff\|: fp32 7.28 → 0, bf16 7.81 → bf16 rounding (equal to rotating everything as position 0). OLMo-2-1124-7B main loss on 4 Forge windows, bf16: CUDA backend 6.559, without it 1.034, Hugging Face 1.039 | `test_cuda_parity` (new RoPE case), `eval_sft_loss --cuda-backend 1`, `scripts/hf_sft_loss.py` |
+| 7 checkpoint save held the model in RAM 4–6× | archives serialised into an ostringstream, copied to a string, then to a byte vector (load: the same); `save_async` also cloned on the GPU first. Local checkpoints now stream to/from the file; snapshot copies straight to host | 7B DoRA save on Colab peaked at 69.6 GB host RSS and was OOM-killed. 512 MB model: +3,009 MB (5.9×) → +449 MB (0.9×) | `test_checkpoint_io` (`OLMO_CKPT_BYTES=1` plants the old path) |
 
 ## 2. SL-MTP (shared-logit low-rank MTP heads)
 
@@ -85,7 +88,41 @@ boundaries, and all GPT-2 ids ≥ 50,000. Its 9.6% fewer tokens on code cannot b
 
 ## 5. Forge demo on the A100 (7B DoRA SFT, `scripts/colab_forge_demo.sh`)
 
-_Pending: ablation (materialised DoRA + full heads vs factored DoRA vs + SL-MTP), demo training, export._
+**Data** (12 gate-passing Forge agent trajectories, ×4 upsampled, + Tulu-3 general conversations at 3:1).
+Trajectories are 3k–12k tokens. Sequence length is 4096: OLMo-2-1124-7B's trained context and the cap
+Forge's qrt runtime applies (`n_ctx ≤ n_ctx_train`).
+
+| Sequence length | Forge conversations kept (of 48) | Tokens |
+|---|---|---|
+| 2048 (first attempt) | 0, so the demo would have learned nothing from Forge | 52,765 |
+| 4096 | 28 (7 unique) | 145,005 |
+| 6144 / 8192 | 44 (11 unique) | 220,917 |
+| 12288 | 48 | 260,761 |
+
+Packing fix: llm-cpp trains on fixed windows `tokens[k·S : k·S+S]`. Concatenated conversations cut one at
+**34 of 34** window boundaries, so the second half of most trajectories trained without its system
+prompt and task, and 1,203 assistant tokens after the last window were never trained. Whole-conversation
+bin packing (`prep_forge_sft.py --layout windows`, Forge repo): 0 cuts, 0 lost, 1.7% padding, 36 windows,
+85,133 trained tokens (`check_sft_windows.py`, which fails on the old layout).
+
+**Ablation** (OLMo-2-1124-7B, DoRA r=32 on all 7 projections, pure bf16, full activation checkpointing,
+4 × 4096 tokens per step, same data order; 8 steps each, steady-state = median of steps 2–7):
+
+| Configuration | Step | Tokens/s | Speedup | Peak GPU memory (nvidia-smi) | Loss, steps 1 / 7 |
+|---|---|---|---|---|---|
+| Materialised DoRA + 2 full-rank MTP heads (the repo's recipe) | 7,852 ms | 2,087 | 1.00× | 40,312 MiB (at the 40 GB limit) | 6.391 / 6.677 |
+| Factored DoRA + 2 full-rank heads | 6,385 ms | 2,566 | **1.23×** | 39,934 MiB | 6.384 / 6.675 |
+| Factored DoRA + 3 SL-MTP heads (r=128, chunked loss, row kernels) | 6,121 ms | 2,677 | **1.28×** | 37,278 MiB | 6.299 / 6.580 |
+
+The SL-MTP run trains one more head and is still the fastest and smallest. Logged loss = main CE +
+0.1 × mean head CE; the heads start untrained, so they dominate it (see the main-loss check below).
+
+**These ablation losses were measured before the RoPE fix (bug 8) and are invalid; the step times stand.**
+After the RoPE and DoRA-init fixes, the trainer's own main loss (no MTP heads, lr 0, one epoch of the 36
+windows) is **0.9648** against Hugging Face's **0.9657** (before: 6.5314).
+
+_Pending (re-run started on Colab 2026-11-15 00:54 with the fixed code): ablation, demo training, export.
+Results land in `/content/forge_demo/results/results.json`._
 
 ## 6. Ideas and open problems (not yet measured)
 

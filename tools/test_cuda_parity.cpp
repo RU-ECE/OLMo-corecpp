@@ -200,38 +200,41 @@ int main() {
   }
 
   // ── 4. RMSNorm autograd flow (AutogradCUDA registration) ─────────
+  // Widths: 768 and 5120 (the kernel, rows in default shared memory; 5120 = Qwen2.5-14B,
+  // which failed with "D must be in (0, 4096]" before), 8192 (the kernel with opted-in
+  // larger shared memory), 24576 (does not fit: the exact ATen formula).
   section("RMSNorm gradient flow — AutogradCUDA wrapper");
-  {
-    const int64_t B = 4, S = 16, d = 768;
-    auto bf16 = torch::TensorOptions().dtype(torch::kBFloat16).device(dev);
-    auto x = torch::randn({B, S, d}, bf16).set_requires_grad(true);
-    auto w = torch::randn({d},        bf16).set_requires_grad(true);
+  for (int64_t d : {768, 5120, 8192, 24576}) {
+    for (auto dt : {torch::kBFloat16, torch::kFloat32}) {
+      const int64_t B = 4, S = 16;
+      const bool bf = dt == torch::kBFloat16;
+      auto o = torch::TensorOptions().dtype(dt).device(dev);
+      auto x = torch::randn({B, S, d}, o).set_requires_grad(true);
+      auto w = torch::randn({d}, o).set_requires_grad(true);
 
-    // Forward via the model's RMSNorm module (which calls the kernel
-    // through get_backend().rms_norm). The AutogradCUDA wrapper is
-    // what makes the kernel's output participate in autograd.
-    auto y = olmo_cpp::get_backend().rms_norm(x, w, 1e-6);
-    PARITY_REQUIRE(y.requires_grad(), "rms_norm output should require_grad");
-    PARITY_REQUIRE(y.grad_fn() != nullptr, "rms_norm output should have a grad_fn (AutogradCUDA wrapper)");
+      // Forward via the backend (the kernel); the AutogradCUDA wrapper makes it
+      // participate in autograd, and its backward is rms_norm_backward_cuda.
+      auto y = olmo_cpp::get_backend().rms_norm(x, w, 1e-6);
+      PARITY_REQUIRE(y.requires_grad(), "rms_norm output should require_grad");
+      PARITY_REQUIRE(y.grad_fn() != nullptr, "rms_norm output should have a grad_fn (AutogradCUDA wrapper)");
+      auto upstream = torch::randn_like(y);
+      (y * upstream).sum().backward();
+      PARITY_REQUIRE(x.grad().defined(), "grad_x should be populated");
+      PARITY_REQUIRE(w.grad().defined(), "grad_w should be populated");
 
-    auto upstream = torch::randn_like(y);
-    auto loss = (y * upstream).sum();
-    loss.backward();
-    PARITY_REQUIRE(x.grad().defined(), "grad_x should be populated");
-    PARITY_REQUIRE(w.grad().defined(), "grad_w should be populated");
+      // ATen RMSNorm in fp32 as the reference.
+      auto xr = x.detach().clone().set_requires_grad(true);
+      auto wr = w.detach().clone().set_requires_grad(true);
+      auto x32 = xr.to(torch::kFloat32);
+      auto rms = (x32 * x32).mean(-1, true).add(1e-6).rsqrt();
+      auto yr  = (x32 * rms * wr.to(torch::kFloat32)).to(dt);
+      (yr * upstream).sum().backward();
 
-    // Compare against ATen-computed RMSNorm.
-    auto xr = x.detach().clone().set_requires_grad(true);
-    auto wr = w.detach().clone().set_requires_grad(true);
-    auto x32 = xr.to(torch::kFloat32);
-    auto rms = (x32 * x32).mean(-1, true).add(1e-6).rsqrt();
-    auto yr  = (x32 * rms * wr.to(torch::kFloat32)).to(torch::kBFloat16);
-    auto loss_r = (yr * upstream).sum();
-    loss_r.backward();
-
-    result("forward y",        max_diff(y, yr),               8e-2f);
-    result("backward grad_x",  max_diff(x.grad(), xr.grad()), 1e-1f);
-    result("backward grad_w",  max_diff(w.grad(), wr.grad()), 1.5e-1f);
+      const std::string tag = " d=" + std::to_string(d) + (bf ? " bf16" : " fp32");
+      result("forward y" + tag,        max_diff(y, yr),               bf ? 8e-2f : 1e-4f);
+      result("backward grad_x" + tag,  max_diff(x.grad(), xr.grad()), bf ? 1e-1f : 1e-3f);
+      result("backward grad_w" + tag,  max_diff(w.grad(), wr.grad()), bf ? 1.5e-1f : 1e-3f);
+    }
   }
 
   // ── 5. silu_mul autograd flow ────────────────────────────────────

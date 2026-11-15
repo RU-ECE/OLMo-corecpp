@@ -23,7 +23,7 @@
  * grad_w is allocated in fp32 (we cast back to compute dtype host-side
  * after the kernel), to keep accumulation precise across N rows of
  * bf16 source. Atomic contention on D entries × N rows is acceptable
- * on Ampere+ for the shapes we care about (D ≤ 4096).
+ * on Ampere+ for the shapes we care about (any D whose two fp32 rows fit in shared memory).
  *
  * The matching schema-registered backward op is dispatched from
  * cuda_ops_autograd.cpp's RmsNormFn::backward — the fused kernel
@@ -45,7 +45,6 @@ namespace {
 
 constexpr int kWarpSize = 32;
 constexpr int kThreadsPerBlock = 256;
-constexpr int kMaxD = 4096;
 
 template <typename T>
 __device__ __forceinline__ float to_float(T v);
@@ -170,25 +169,52 @@ rms_norm_backward_cuda(torch::Tensor grad_y,
   auto gy_c = grad_y.contiguous();
   const int D = static_cast<int>(x_c.size(-1));
   const int64_t total = x_c.numel();
+  TORCH_CHECK(D > 0, "rms_norm_backward_cuda: empty last dimension");
   const int N = static_cast<int>(total / D);
-  TORCH_CHECK(D > 0 && D <= kMaxD,
-              "rms_norm_backward_cuda: D must be in (0, ", kMaxD, "]");
-
-  auto grad_x = torch::empty_like(x_c);
 
   torch::Tensor weight_c;
   bool has_weight = weight.has_value() && weight->defined();
   if (has_weight) weight_c = weight->contiguous();
 
-  // grad_w accumulator in fp32 (atomic-add precision).
-  auto fp32_opts = torch::TensorOptions().dtype(torch::kFloat32).device(x.device());
-  torch::Tensor grad_w_fp32;
-  if (has_weight) grad_w_fp32 = torch::zeros({D}, fp32_opts);
-
+  // The kernel keeps two fp32 rows (x, grad_y) in shared memory. Up to 48 KB needs no
+  // opt-in (D <= 6140, e.g. Qwen2.5-14B/32B's 5120); larger rows opt in to the device's
+  // bigger shared memory (A100: 163 KB, D up to ~20k); a row that still does not fit, or a
+  // failed opt-in, takes the exact formula in ATen. (This used to stop at D = 4096.)
   const int warps_per_block = kThreadsPerBlock / kWarpSize;
   const size_t shmem_bytes =
         (size_t)(2 * D) * sizeof(float)             // sh_x + sh_gy
       + (size_t)warps_per_block * sizeof(float);    // block-reduce scratch
+  auto reference = [&]() -> std::pair<torch::Tensor, torch::Tensor> {
+    auto xf  = x_c.view({N, D}).to(torch::kFloat32);
+    auto gyf = gy_c.view({N, D}).to(torch::kFloat32);
+    auto rms = (xf.pow(2).mean(-1, /*keepdim=*/true) + eps).rsqrt();
+    auto xh  = xf * rms;
+    auto gxh = has_weight ? gyf * weight_c.to(torch::kFloat32) : gyf;
+    auto mean_term = (gxh * xh).mean(-1, /*keepdim=*/true);
+    auto gx = (rms * (gxh - xh * mean_term)).to(x_c.scalar_type()).view(x_c.sizes());
+    torch::Tensor gw;
+    if (has_weight) gw = (gyf * xh).sum(0).to(weight_c.scalar_type());
+    return {gx, gw};
+  };
+  if (shmem_bytes > 48 * 1024) {
+    int dev = 0, max_optin = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&max_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+    if (shmem_bytes > static_cast<size_t>(max_optin)) return reference();
+    cudaError_t e = x.scalar_type() == torch::kBFloat16
+        ? cudaFuncSetAttribute(rms_norm_backward_kernel<__nv_bfloat16>,
+                               cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shmem_bytes))
+        : cudaFuncSetAttribute(rms_norm_backward_kernel<float>,
+                               cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shmem_bytes));
+    if (e != cudaSuccess) { cudaGetLastError(); return reference(); }
+  }
+
+  auto grad_x = torch::empty_like(x_c);
+
+  // grad_w accumulator in fp32 (atomic-add precision).
+  auto fp32_opts = torch::TensorOptions().dtype(torch::kFloat32).device(x.device());
+  torch::Tensor grad_w_fp32;
+  if (has_weight) grad_w_fp32 = torch::zeros({D}, fp32_opts);
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 

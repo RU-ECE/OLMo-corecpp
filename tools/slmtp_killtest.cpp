@@ -23,7 +23,7 @@
  *                          --text f.txt --out DIR [--seq 512] [--tokens 600000] [--device mps]
  *   slmtp_killtest train --config c.json --ckpt m.pt --features DIR --variant full|sl
  *                        [--rank 64] [--heads 3] [--epochs 1] [--batch 2] [--lr 1e-3]
- *                        [--eval-frac 0.1] [--fix-a0] [--save heads.pt] [--device mps]
+ *                        [--eval-frac 0.1] [--fix-a0] [--target real|greedy] [--save heads.pt] [--device mps]
  * Prints one JSON line with the results.
  */
 #include "olmo_cpp/config.hpp"
@@ -186,6 +186,10 @@ int train(const std::map<std::string, std::string>& a) {
   const double eval_frac = std::stod(get(a, "eval-frac", "0.1"));
   const bool fix_a0 = a.count("fix-a0") > 0;
   const int64_t max_steps = std::stoll(get(a, "max-steps", "0"));
+  // --target greedy: self-distillation. Head k learns the model's own greedy pick for token
+  // t+k+2 (made at position t+k+1) instead of the real token: greedy speculative decoding
+  // accepts a draft exactly when it equals that pick.
+  const bool greedy_target = get(a, "target", "real") == "greedy";
 
   std::ifstream mf(dir / "meta.json");
   std::stringstream ms;
@@ -303,7 +307,8 @@ int train(const std::map<std::string, std::string>& a) {
     for (int64_t k = 0; k < K; ++k) {
       const int64_t shift = k + 1, m = S - shift - 1;
       auto lg = head_logits(k, h, y).narrow(1, 0, m);
-      auto truth = tokens.narrow(0, i, b).narrow(1, shift + 1, m).to(dev);
+      auto truth = (greedy_target ? greedy.narrow(0, i, b).narrow(1, shift, m)
+                                  : tokens.narrow(0, i, b).narrow(1, shift + 1, m)).to(dev);
       auto l = torch::nn::functional::cross_entropy(lg.reshape({-1, lg.size(-1)}), truth.reshape(-1));
       loss = loss.defined() ? loss + l : l;
     }
@@ -322,6 +327,7 @@ int train(const std::map<std::string, std::string>& a) {
   const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   auto after = evaluate();
   nlohmann::json out = {{"variant", variant + (fix_a0 ? "-a0" : "")},
+                        {"target", greedy_target ? "greedy" : "real"},
                         {"rank", variant == "full" ? d : r},
                         {"trainable_params", n_params},
                         {"lr", lr},

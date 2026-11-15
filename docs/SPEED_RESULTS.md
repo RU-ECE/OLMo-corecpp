@@ -66,6 +66,25 @@ output identical to plain greedy in every run):
 
 Draft step cost (3 heads): 3.8 → 0.73 ms (1B, 5.2×) and 7.2 → 0.69 ms (7B, 10.5×) on the M4 Pro.
 
+**Training the heads for drafting (2026-11-15).** Acceptance is what limits the speedup, so the heads
+were trained longer, on more text, and against the model's own greedy picks instead of the real next
+token (`slmtp_killtest train --target greedy`: head k learns the token the model itself would choose at
+t+k+2, which is exactly what a greedy verify accepts; the pick is cached by `extract`). Same frozen
+OLMo-2-0425-1B, rank 128, decoding 6 prompts × 128 tokens from stories past index 20,000 (never
+trained on), output identical to plain greedy in every run:
+
+| Heads | 1 draft | 2 drafts | Acceptance (1 draft) | Tokens per forward (2 drafts) |
+|---|---|---|---|---|
+| 1 epoch, 0.45M tokens, real next token (kill test) | 1.168× | 1.083× | 37.7% | 1.42 |
+| 4 epochs, same tokens, real next token | 1.180× | 1.161× | 39.7% | 1.53 |
+| 4 epochs, same tokens, model's own picks | 1.202× | 1.209× | 43.0% | 1.60 |
+| 2 epochs, 1.6M tokens, model's own picks | **1.241×** | **1.261×** | **47.9%** | 1.66 |
+
+On the earlier prompt set (stories past 2,000) the same progression is 1.065× → 1.152× → 1.177× (1 draft).
+Each step helps: longer training, self-distillation (+4 points of agreement over the real-token target
+at equal training) and more text. The plan's ~1.9× needs about 70% acceptance; the next levers are more
+text and training the heads with the trunk (FastMTP's route to 2×).
+
 ## 3. Factored DoRA (published: arXiv 2603.22276; adopted, not claimed)
 
 `y = (m/‖W+sBA‖)·(xWᵀ + s(xAᵀ)Bᵀ)`, with the row norm from `‖W_i‖² + 2s·B_i·(WAᵀ)_i + s²·B_i(AAᵀ)B_iᵀ`.
@@ -241,7 +260,7 @@ paged inference. Both need a root cause before either path is trusted.
 
 - Fuse the logit GEMM into the SL-MTP row kernel (bf16 already beats materialised full heads; fusion would cut the remaining [tokens × vocab] passes).
 - Tree speculation: write the accepted nodes' KV during the verify, removing the second forward per step.
-- Train SL-MTP heads longer / with the trunk (acceptance 29% today; ~70% would give ~1.9× decode).
+- Train SL-MTP heads with the trunk and on more text (acceptance 48% with self-distilled heads on 1.6M tokens, 1.26×; ~70% would give ~1.9× decode).
 - Make the structural tokenizer lossless (slot boundaries, whitespace, full BPE range), then measure.
 - Re-run the 2× H100 DDP baselines (old code never synchronised ranks).
 - Metal: the measured missing "free verify window" in llama.cpp (51 → 219 ms for 2 → 7 tokens on 7B q4).

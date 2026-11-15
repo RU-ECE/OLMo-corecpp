@@ -202,6 +202,29 @@ Jinja engine) tokenizes message text and template text separately, so no token c
 data is now produced by the serving code itself (12/12 identical, 0.5B and 14B GGUFs), and each turn is
 trained on the compacted context the agent actually sends at that step.
 
+**The 14B demo (A100 80GB, 2026-11-15).** DoRA r32 on every projection of Qwen2.5-Coder-14B-Instruct,
+LM head frozen, 2 epochs over 99 gate-passing teacher runs (712 per-step samples) + 356 general chat
+samples: 410 windows of 6144 tokens, 2.52M tokens (303k trained), 205 steps of 4 × 6144 tokens at
+14.74 s = 1,670 tok/s, 56 min, peak 60.5 GB. Starting loss checked against Hugging Face first (1.1381 vs
+1.1333 on 6 windows). Merge, Qwen2 HF export, GGUF, Q4_K_M; the served prompts tokenize identically
+with the trained and the base GGUF.
+
+Held-out (8 unseen tasks, every attempt must pass contract, render and hidden acceptance; temperature
+0.2, 30 steps, qrt Q4_K_M):
+
+| | first gates | gates with explained syntax errors + privacy rules |
+|---|---|---|
+| Qwen2.5-Coder-14B-Instruct, untrained | 16/48 (33%) | 8/32 (25%) |
+| **+ DoRA on Forge trajectories** | **19/48 (40%)** | **19/32 (59%)** |
+| Qwen2.5-Coder-32B-Instruct (the teacher) | 10/16 | |
+| Claude Code (Opus 5.5), 1 attempt | 7/8 | |
+
+The failed trained runs were one loop: "syntax error at line N" with no code led the model to comment
+out line N, then N+1 (each comment breaks a chained statement: "Unexpected token '.'"). With the error
+shown with its code and a repair hint, the trained model fixes it; the untrained one does not use the
+hint (25%), so under the product's gates the finetune more than doubles the pass rate
+(two-proportion z ≈ 2.7).
+
 Bug found by the 14B run: the CUDA RMSNorm backward refused rows wider than 4096 ("D must be in
 (0, 4096]", the first backward of Qwen2.5-14B's d = 5120). The cap was a shared-memory guess: two fp32
 rows fit the default 48 KB up to D = 6140, wider rows now opt in to the device's larger shared memory,

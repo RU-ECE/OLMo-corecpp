@@ -113,6 +113,11 @@ struct TrainConfig {
   /// finetune on one GPU. See olmo_cpp/model/dora.hpp.
   bool use_dora = false;
   int dora_rank = 16;
+  // DoRA only: also train the LM head (output embedding). A base model has never
+  // produced chat-template tokens such as <|im_end|>; low-rank adapters on the
+  // projections barely move that one untrained output row (7B demo: 24.6 -> 11.5
+  // nats after 27 steps, and generation never stops). Adds V*d trainable params.
+  bool train_lm_head = false;
   double dora_alpha = 32.0;
   /// Steps between eval passes when an evaluator is wired up.
   int64_t eval_interval = 500;  // steps between evals

@@ -491,7 +491,8 @@ void train(
     int64_t n_train = 0, n_total = 0;
     for (auto& it : model->named_parameters()) {
       const bool trainable = it.key().find("dora_") != std::string::npos ||
-                             it.key().find("mtp_heads") != std::string::npos;
+                             it.key().find("mtp_heads") != std::string::npos ||
+                             (cfg.train_lm_head && it.key() == "lm_head.w_out.weight");
       it.value().set_requires_grad(trainable);
       n_total += it.value().numel();
       if (trainable) n_train += it.value().numel();

@@ -32,6 +32,11 @@ ABL_STEPS=${ABL_STEPS:-8}
 ABL_ACCUM=${ABL_ACCUM:-4}
 EPOCHS=${EPOCHS:-3}
 TRAIN_ACCUM=${TRAIN_ACCUM:-4}
+LR=${LR:-1.0e-4}
+# 1 = the demo run also trains the LM head: the base model has never emitted <|im_end|>,
+# and without this the finetuned model writes a correct tool call and then never stops.
+TRAIN_LM_HEAD=${TRAIN_LM_HEAD:-1}
+DEMO_LM_HEAD=$TRAIN_LM_HEAD
 R=$VOL/results
 mkdir -p "$R" "$VOL/runs"
 log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$R/demo.log"; }
@@ -43,7 +48,10 @@ render() {
     "$1" > "$2" && grep -q '^\[model\]' "$2" || { log "config render FAILED: $1 -> $2"; exit 1; }
 }
 
-if has build; then
+B=$ROOT/build-cuda
+if has build && [ -x "$B/olmo_train" ] && [ -z "${REBUILD:-}" ]; then
+  log "build: already built ($B; REBUILD=1 to force)"
+elif has build; then
   log "build"
   pip -q install ninja >/dev/null 2>&1 || true
   ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d .)
@@ -57,7 +65,6 @@ if has build; then
   ninja -C "$ROOT/build-cuda" -j"$(nproc)" olmo_train convert_hf bench_spec_decode $EXTRA >> "$R/build.log" 2>&1 \
     || { log "build FAILED"; grep -n error "$R/build.log" | head; exit 1; }
 fi
-B=$ROOT/build-cuda
 
 if has data; then
   log "data"
@@ -103,7 +110,9 @@ PY
   fi
 fi
 
-if has model; then
+if has model && [ -s "$VOL/olmo2-7b/olmo2_7b.pt" ]; then
+  log "model: $VOL/olmo2-7b/olmo2_7b.pt already converted"
+elif has model; then
   log "model: download + convert OLMo-2-1124-7B"
   python - <<PY
 from huggingface_hub import snapshot_download
@@ -118,7 +127,9 @@ fi
 # One training run: $1 name, $2 steps, $3 accum, $4 mtp heads, $5 type, $6 rank, $7 log interval, rest = env
 run() {
   local name=$1 steps=$2 accum=$3 k=$4 type=$5 rank=$6 logi=$7; shift 7
-  export RUN=$name VOL STEPS=$steps SEQ ACCUM=$accum MTP_K=$k MTP_TYPE=$type MTP_RANK=$rank LOG=$logi
+  export RUN=$name VOL STEPS=$steps SEQ ACCUM=$accum MTP_K=$k MTP_TYPE=$type MTP_RANK=$rank LOG=$logi LR
+  export TRAIN_LM_HEAD=0
+  [ "$name" = forge_demo ] && export TRAIN_LM_HEAD=${DEMO_LM_HEAD}
   export SAVE_LINE="# no checkpoint for timing runs" CKPT_INT=100000 RESUME=${RESUME:-0}
   # The demo run's last step leaves a resumable checkpoint; export merges from it, so no
   # separate full-model `save` (another 14.8 GB written and held in RAM at the end).
@@ -162,7 +173,7 @@ if has export; then
   NSEQ=$(python -c "import numpy as np; print(np.load('$VOL/forge-sft/sft_tokens.npy', mmap_mode='r').size // $SEQ)")
   STEPS=$(( (NSEQ * EPOCHS + TRAIN_ACCUM - 1) / TRAIN_ACCUM ))
   export RUN=forge_demo VOL STEPS SEQ ACCUM=$TRAIN_ACCUM MTP_K=3 MTP_TYPE=shared_lowrank MTP_RANK=128 LOG=1 \
-         SAVE_LINE="# merge only" CKPT_INT=$STEPS RESUME=1
+         SAVE_LINE="# merge only" CKPT_INT=$STEPS RESUME=1 LR TRAIN_LM_HEAD=$DEMO_LM_HEAD
   render "$ROOT/conf/forge_demo_7b.conf.in" "$D.merge.conf"
   MERGE_EXPORT="$D/merged.pt" "$B/olmo_train" "$D.merge.conf" > "$R/merge.log" 2>&1; rc=$?; log "merge exit $rc"
   [ $rc -eq 0 ] && [ -s "$D/merged.pt" ] || { tail -5 "$R/merge.log" | tee -a "$R/demo.log"; log "merge FAILED"; exit 1; }

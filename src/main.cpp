@@ -306,6 +306,7 @@ int main(int argc, char** argv) {
     train_cfg.use_dora   = train_ini.get_or<bool>("dora", false);
     train_cfg.dora_rank  = train_ini.get_or<int>("dora_rank", 16);
     train_cfg.dora_alpha = train_ini.get_or<double>("dora_alpha", 32.0);
+    train_cfg.train_lm_head = train_ini.get_or<bool>("train_lm_head", false);
     // Mirror to the model config so attention/FFN build the DoRA adapters.
     cfg.use_dora   = train_cfg.use_dora;
     cfg.dora_rank  = train_cfg.dora_rank;

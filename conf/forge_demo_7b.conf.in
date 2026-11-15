@@ -2,6 +2,7 @@
 # agent trajectories, sized for ONE Colab A100 40GB. Filled in by
 # scripts/colab_forge_demo.sh (envsubst), once per run of the ablation:
 #   ${RUN} ${VOL} ${STEPS} ${SEQ} ${ACCUM} ${MTP_K} ${MTP_TYPE} ${MTP_RANK} ${LOG} ${SAVE_LINE}
+#   ${LR} ${TRAIN_LM_HEAD} (1 = also train the LM head, so the model learns to emit <|im_end|>)
 # (SAVE_LINE is a comment today; "save<TAB><path>" would also write a full model.
 #  CKPT_INT = steps for the demo run so its final step leaves a checkpoint to merge.)
 # DoRA form is chosen by the environment: factored by default,
@@ -36,7 +37,7 @@ activation_checkpoint_interval	1
 steps				${STEPS}
 batch_size			1
 seq_len				${SEQ}
-lr				1.0e-4
+lr				${LR}
 warmup_steps			3
 grad_accum			${ACCUM}
 optimizer			adamw
@@ -52,6 +53,7 @@ sft_mask_path			${VOL}/forge-sft/sft_mask.npy
 dora				1
 dora_rank			32
 dora_alpha			32.0
+train_lm_head			${TRAIN_LM_HEAD}
 ${SAVE_LINE}
 checkpoint_dir			${VOL}/runs/${RUN}/checkpoints
 checkpoint_interval		${CKPT_INT}

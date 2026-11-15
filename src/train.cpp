@@ -69,6 +69,7 @@
 #include "olmo_cpp/train/checkpoint.hpp"
 #include "olmo_cpp/eval/evaluator.hpp"
 #include "olmo_cpp/io/filesystem.hpp"
+#include "olmo_cpp/io/load_matching.hpp"
 #include <torch/nn/init.h>
 #include <iostream>
 #include <iomanip>
@@ -334,43 +335,37 @@ void train_epoch(
 // Full-featured train() with all infrastructure
 // ---------------------------------------------------------------------------
 
-// Non-strict base load for finetuning + MTP retrofit. The base .pt was saved
-// with num_mtp_heads=0; the finetune model is built with MTP heads. Build a
-// base-shaped model (mtp=0) matching the checkpoint, strict-load it, then copy
-// matching params into the finetune model by name. Params absent from the base
-// (the fresh MTP heads) keep their init. Avoids torch::load's strict key match.
-static void load_base_nonstrict(Transformer& model, const TransformerConfig& model_cfg,
+// Non-strict base load for finetuning + MTP retrofit / DoRA. The base .pt is a
+// plain model (no MTP heads, no dora_* submodules); load_matching copies every
+// tensor it has into the finetune model's existing parameters (dtype and device
+// follow the model). Only the archive is held on the host: the old version built
+// a second full model in fp32, which a 14B base (2 x 59 GB) cannot afford.
+// Params absent from the base must be adapters or fresh MTP heads; anything
+// else missing is an error (it would silently train from random weights).
+static void load_base_nonstrict(Transformer& model, const TransformerConfig& /*model_cfg*/,
                                 const std::string& path, int rank) {
-  auto base_cfg = model_cfg;
-  base_cfg.num_mtp_heads = 0;
-  base_cfg.use_dora = false;   // the base .pt is a plain model (no dora_* submodules);
-                               // building the base-shaped model with DoRA made the strict
-                               // load fail ('No such serialized submodule: dora_q'). The
-                               // finetune model's host Linears (w_q ...) still match by name.
-  Transformer base(base_cfg);
-  try {
-    torch::load(base, path, torch::kCPU);
-  } catch (const c10::Error&) {              // bf16-saved base: match dtype then load
-    base = Transformer(base_cfg);
-    base->to(torch::kBFloat16);
-    torch::load(base, path, torch::kCPU);
-    base->to(torch::kFloat32);
+  auto r = load_matching(*model, path);
+  int fresh = 0;
+  std::vector<std::string> bad;
+  for (auto& k : r.missing) {
+    if (k.find("dora_") != std::string::npos || k.find("lora_") != std::string::npos ||
+        k.rfind("mtp_heads.", 0) == 0) ++fresh;
+    else bad.push_back(k);
   }
-  auto ft = model->named_parameters();        // hold OrderedDict alive (find returns into it)
-  auto ft_bufs = model->named_buffers();
-  int loaded = 0, skipped = 0;
-  for (auto& it : base->named_parameters()) {
-    if (auto* dst = ft.find(it.key())) {
-      torch::NoGradGuard ng; dst->copy_(it.value()); ++loaded;   // copy_ converts dtype
-    } else ++skipped;
+  if (!r.unexpected.empty()) {
+    std::string msg = std::to_string(r.unexpected.size()) + " tensor(s) in '" + path +
+                      "' have no place in this model (config does not match the checkpoint?), e.g.";
+    for (size_t i = 0; i < r.unexpected.size() && i < 8; ++i) msg += " " + r.unexpected[i];
+    throw std::runtime_error(msg);
   }
-  for (auto& it : base->named_buffers()) {
-    if (auto* dst = ft_bufs.find(it.key())) { torch::NoGradGuard ng; dst->copy_(it.value()); }
+  if (!bad.empty()) {
+    std::string msg = std::to_string(bad.size()) + " base parameter(s) missing from '" + path + "', e.g.";
+    for (size_t i = 0; i < bad.size() && i < 8; ++i) msg += " " + bad[i];
+    throw std::runtime_error(msg);
   }
   if (rank == 0)
-    std::cout << "Finetune: non-strict base load '" << path << "' — " << loaded
-              << " params copied, " << skipped
-              << " base unmatched; fresh MTP heads kept at init.\n";
+    std::cout << "Finetune: base load '" << path << "' — " << r.loaded
+              << " params copied; " << fresh << " adapter/MTP params kept at init.\n";
 }
 
 // Fold trained DoRA adapters into their base Linear weights and export a PLAIN
@@ -426,16 +421,27 @@ static void merge_dora_export(Transformer& model, const TransformerConfig& model
     merged += merge_one(f + "w2.weight", f + "dora_w2");
   }
   // Copy every non-dora param/buffer into a freshly-built plain model and save.
+  // The plain model is built in the trained model's dtype (bf16 for bf16=1):
+  // an fp32 copy of a 14B model is 59 GB on top of the 29.5 GB being exported.
+  // This runs only in the MERGE_EXPORT exit path, so each source weight is
+  // freed once copied and the host peak stays near one model.
   auto std_cfg = model_cfg;
   std_cfg.use_dora = false;
+  const auto prev_dtype = torch::get_default_dtype();
+  torch::set_default_dtype(model->lm_head_weight().dtype());
   Transformer plain(std_cfg);
+  torch::set_default_dtype(prev_dtype);
   plain->to(torch::kCPU);
   auto SP = plain->named_parameters();
   auto SB = plain->named_buffers();
   int copied = 0;
   for (auto& kv : P) {
     if (kv.key().find("dora_") != std::string::npos) continue;  // adapters now folded in
-    if (auto* dst = SP.find(kv.key())) { dst->copy_(kv.value()); ++copied; }
+    if (auto* dst = SP.find(kv.key())) {
+      dst->copy_(kv.value());
+      kv.value().set_data(torch::empty({0}, kv.value().options()));
+      ++copied;
+    }
   }
   auto PB = model->named_buffers();
   for (auto& kv : PB)

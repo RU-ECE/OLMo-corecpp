@@ -15,6 +15,7 @@
  */
 #include "olmo_cpp/backend/cuda_backend.hpp"
 #include "olmo_cpp/config.hpp"
+#include "olmo_cpp/io/load_matching.hpp"
 #include "olmo_cpp/model/transformer.hpp"
 
 #include <cnpy.h>
@@ -63,7 +64,11 @@ int main(int argc, char** argv) {
   cfg.dora_rank = 32;
   cfg.dora_alpha = 32.0;
   if (ckpt_act) cfg.activation_checkpoint_mode = TransformerConfig::ActivationCheckpointMode::Full;
+  // bf16: build the parameters in bf16 from the start (an fp32 14B is 59 GB on the host).
+  const auto prev_dtype = torch::get_default_dtype();
+  if (bf16) torch::set_default_dtype(caffe2::TypeMeta::Make<at::BFloat16>());
   Transformer model(cfg);
+  torch::set_default_dtype(prev_dtype);
   if (do_init) model->init_weights();
   // Model to the device (and dtype) first, as main.cpp + train.cpp do: holding both a
   // CPU fp32 model and the CPU fp32 base needs 2 x 29 GB plus load buffers for the 7B.
@@ -76,17 +81,13 @@ int main(int argc, char** argv) {
       if (b.is_floating_point()) b.set_data(b.to(torch::kBFloat16));
   }
   {
-    Transformer base(base_cfg);
-    torch::load(base, get("ckpt"), torch::kCPU);
-    torch::NoGradGuard ng;
-    auto dst = model->named_parameters();
-    auto dbuf = model->named_buffers();
-    int64_t np = 0, nb = 0;
-    for (auto& it : base->named_parameters())
-      if (auto* d = dst.find(it.key())) { d->copy_(it.value()); ++np; }
-    for (auto& it : base->named_buffers())
-      if (auto* d = dbuf.find(it.key())) { d->copy_(it.value()); ++nb; }
-    std::fprintf(stderr, "copied %lld parameters, %lld buffers\n", (long long)np, (long long)nb);
+    // Straight into the (device, dtype) model, as train.cpp's base load does.
+    auto r = load_matching(*model, get("ckpt"));
+    int64_t bad = 0;
+    for (auto& k : r.missing) if (k.find("dora_") == std::string::npos) ++bad;
+    std::fprintf(stderr, "copied %lld parameters; %zu not in the checkpoint (%lld non-adapter)\n",
+                 (long long)r.loaded, r.missing.size(), (long long)bad);
+    if (bad) return 1;
   }
   if (train_mode) model->train(); else model->eval();
   if (with_grad && dora) {  // olmo_train freezes everything but the adapters

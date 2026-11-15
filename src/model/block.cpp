@@ -65,6 +65,7 @@ ReorderedNormTransformerBlockImpl::ReorderedNormTransformerBlockImpl(
   if (cfg.use_float8) feed_forward_->enable_float8(true);
   // DoRA: attention reads cfg.use_dora itself; the FFN needs it wired from here.
   if (cfg.use_dora) feed_forward_->enable_dora(cfg.dora_rank, cfg.dora_alpha);
+  pre_norm_ = cfg.block_type == TransformerConfig::BlockType::PreNorm;
 }
 
 torch::Tensor ReorderedNormTransformerBlockImpl::forward(
@@ -74,9 +75,15 @@ torch::Tensor ReorderedNormTransformerBlockImpl::forward(
     LayerKVCache* layer_cache) {
   auto& backend = get_backend();
   backend.begin_scope();  // Arena scope for block intermediates
-  auto h = attention_norm_->forward_add(
-      attention_(x, rope_bufs, start_pos, layer_cache), x);
-  auto out = feed_forward_norm_->forward_add(feed_forward_(h), h);
+  torch::Tensor out;
+  if (pre_norm_) {
+    auto h = x + attention_(attention_norm_(x), rope_bufs, start_pos, layer_cache);
+    out = h + feed_forward_(feed_forward_norm_(h));
+  } else {
+    auto h = attention_norm_->forward_add(
+        attention_(x, rope_bufs, start_pos, layer_cache), x);
+    out = feed_forward_norm_->forward_add(feed_forward_(h), h);
+  }
   backend.end_scope();    // Free all scratch within this block
   return out;
 }
@@ -89,6 +96,12 @@ torch::Tensor ReorderedNormTransformerBlockImpl::forward_paged(
     int64_t layer_idx) {
   auto& backend = get_backend();
   backend.begin_scope();
+  if (pre_norm_) {
+    auto h = x + attention_->forward_paged(attention_norm_(x), rope_bufs, start_pos, paged, layer_idx);
+    auto out = h + feed_forward_(feed_forward_norm_(h));
+    backend.end_scope();
+    return out;
+  }
   auto attn_out = attention_->forward_paged(x, rope_bufs, start_pos, paged, layer_idx);
   auto h = attention_norm_->forward_add(attn_out, x);
   auto out = feed_forward_norm_->forward_add(feed_forward_(h), h);
@@ -104,6 +117,12 @@ torch::Tensor ReorderedNormTransformerBlockImpl::forward_with_mask(
     const torch::Tensor& positions) {
   auto& backend = get_backend();
   backend.begin_scope();
+  if (pre_norm_) {
+    auto h = x + attention_->forward_with_mask(attention_norm_(x), rope_bufs, attn_mask, prefix, positions);
+    auto out = h + feed_forward_(feed_forward_norm_(h));
+    backend.end_scope();
+    return out;
+  }
   auto attn_out = attention_->forward_with_mask(x, rope_bufs, attn_mask, prefix, positions);
   auto h = attention_norm_->forward_add(attn_out, x);
   auto out = feed_forward_norm_->forward_add(feed_forward_(h), h);

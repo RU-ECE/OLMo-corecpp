@@ -61,6 +61,11 @@ void run(Model& model, const olmo_cpp::TransformerConfig& cfg,
     mup_cfg.base_width = 256.0;
     mup_cfg.target_width = static_cast<double>(cfg.d_model);
     olmo_cpp::apply_mup_init(*model, cfg, mup_cfg, seed_state.torch_gen);
+  } else if (train_cfg.finetune_from && !train_cfg.finetune_from->empty() && cfg.num_mtp_heads == 0) {
+    // Finetune with no new heads: every base weight is overwritten from the checkpoint
+    // (train.cpp refuses a checkpoint that leaves one out) and DoRA adapters initialise in
+    // their constructor. A random init here only costs time: ~5 min single-threaded for 14B.
+    std::cout << "Init: skipped (every weight comes from finetune_from)\n";
   } else {
     model->init_weights(seed_state.torch_gen);
   }
@@ -181,7 +186,9 @@ int main(int argc, char** argv) {
     cfg.use_embedding_norm  = model_ini.get_or<bool>("use_embedding_norm", true);  // OLMo-2: set 0
     cfg.hidden_size_multiple_of = model_ini.get_or<int64_t>("hidden_size_multiple_of", 256);
     cfg.hidden_size_multiplier  = model_ini.get_or<double>("hidden_size_multiplier", 1.5);
-    cfg.num_mtp_heads       = model_ini.get_or<int64_t>("num_mtp_heads", 0);
+    cfg.ffn_hidden_size     = model_ini.get_or<int64_t>("ffn_hidden_size", -1);   // Qwen2: intermediate_size
+    cfg.attention_bias      = model_ini.get_or<bool>("attention_bias", false);    // Qwen2: q/k/v bias
+    cfg.num_mtp_heads      = model_ini.get_or<int64_t>("num_mtp_heads", 0);
     cfg.mtp_loss_weight     = model_ini.get_or<double>("mtp_loss_weight", 0.1);
     cfg.mtp_head_type       = model_ini.get_or<std::string>("mtp_head_type", "full");
     cfg.mtp_rank            = model_ini.get_or<int64_t>("mtp_rank", 64);
@@ -205,7 +212,9 @@ int main(int argc, char** argv) {
       else if (s == "layer_norm_scaled")       cfg.block_type = olmo_cpp::TransformerConfig::BlockType::LayerNormScaled;
       else if (s == "moe_reordered_norm")      cfg.block_type = olmo_cpp::TransformerConfig::BlockType::MoEReorderedNorm;
       else if (s == "moe_hybrid_reordered_norm") cfg.block_type = olmo_cpp::TransformerConfig::BlockType::MoEHybridReorderedNorm;
-      else                                     cfg.block_type = olmo_cpp::TransformerConfig::BlockType::ReorderedNorm;
+      else if (s == "pre_norm")                cfg.block_type = olmo_cpp::TransformerConfig::BlockType::PreNorm;
+      else if (s == "reordered_norm")          cfg.block_type = olmo_cpp::TransformerConfig::BlockType::ReorderedNorm;
+      else throw std::runtime_error("unknown block_type '" + s + "'");  // a typo silently fell back to OLMo-2
     }
 
     // Attention backend: sdpa, flash2, flash3, transformer_engine
@@ -415,7 +424,15 @@ int main(int argc, char** argv) {
       run(model, cfg, train_cfg, device, use_mup, true,
           use_multi_res, enable_profile, save_path, seed_state);
     } else {
+      // bf16=1 on CUDA: build the parameters in bf16 from the start. Building
+      // in fp32 and converting needs 4 bytes/param on the host first, which a
+      // 14B model (59 GB) cannot afford. The default dtype is restored at once
+      // so data, loss and optimizer tensors stay fp32.
+      const auto prev_dtype = torch::get_default_dtype();
+      if (train_cfg.use_bf16 && device.is_cuda())
+        torch::set_default_dtype(caffe2::TypeMeta::Make<at::BFloat16>());
       auto model = olmo_cpp::Transformer(cfg);
+      torch::set_default_dtype(prev_dtype);
       run(model, cfg, train_cfg, device, use_mup, false,
           use_multi_res, enable_profile, save_path, seed_state);
     }

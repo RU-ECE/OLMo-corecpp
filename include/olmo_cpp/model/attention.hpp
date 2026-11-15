@@ -161,6 +161,11 @@ class AttentionImpl : public torch::nn::Module {
   const void* cached_w_packed_p_k_ = nullptr;
   const void* cached_w_packed_p_v_ = nullptr;
   torch::Tensor packed_qkv_weight();
+  /// Qwen2-style q/k/v bias (cfg.attention_bias). The fused QKV+RoPE kernel has
+  /// no bias input, so a biased model takes the packed-Linear path instead.
+  bool qkv_bias_ = false;
+  torch::Tensor packed_qkv_bias() const;
+  void add_qkv_bias(torch::Tensor& q, torch::Tensor& k, torch::Tensor& v) const;
 
   /// DoRA finetune: when true, route q/k/v/out through these adapters (frozen
   /// w_*_->weight + trainable low-rank delta), skipping the packed-QKV fast path.

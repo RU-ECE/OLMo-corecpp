@@ -103,12 +103,18 @@ struct TransformerConfig {
   int64_t hidden_size_multiple_of = 256;
   /// SwiGLU expansion factor before rounding. 1.5 yields ~5.33x d_model.
   double hidden_size_multiplier = 1.5;
+  /// Exact FFN hidden size (HF "intermediate_size"). > 0 overrides the
+  /// multiplier/rounding rule, which cannot produce e.g. Qwen2.5-14B's 13824.
+  int64_t ffn_hidden_size = -1;
+  /// Bias on the q/k/v projections (Qwen2). The output projection has none.
+  bool attention_bias = false;
 
   // === Block variant ===
   /// Selects which transformer-block recipe to instantiate. Each variant
   /// differs in the placement of LayerNorm, residual connections, and
   /// MoE wiring. ReorderedNorm is the olmo2 default.
-  enum class BlockType { ReorderedNorm, PeriNorm, NormalizedNGPT, LayerNormScaled, MoEReorderedNorm, MoEHybridReorderedNorm };
+  /// PreNorm is the Llama/Qwen2 order: x + attn(norm(x)), then h + ffn(norm(h)).
+  enum class BlockType { ReorderedNorm, PeriNorm, NormalizedNGPT, LayerNormScaled, MoEReorderedNorm, MoEHybridReorderedNorm, PreNorm };
   /// Active block recipe — see the enum above.
   BlockType block_type = BlockType::ReorderedNorm;
 
@@ -251,6 +257,7 @@ struct TransformerConfig {
   /// param count comparable to a single 4*d_model GeLU FFN). Rounded up
   /// to `hidden_size_multiple_of` for tensor-core alignment.
   int64_t get_hidden_size() const {
+    if (ffn_hidden_size > 0) return ffn_hidden_size;
     int64_t base = static_cast<int64_t>(8 * d_model / 3.0 * hidden_size_multiplier);
     return ensure_multiple_of(base, hidden_size_multiple_of);
   }

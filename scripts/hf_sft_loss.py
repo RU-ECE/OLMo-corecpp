@@ -43,6 +43,8 @@ for name, (s, n) in tot.items():
     print(f"{path}: main loss on {name} labels = {s / max(n, 1):.4f} over {n} tokens ({n_win} windows x {L})")
 print(f"{path}: mean of per-window main loss = {sum(win_means) / len(win_means):.4f} over {len(win_means)} windows")
 
+if GEN <= 0:  # loss only
+    sys.exit(0)
 conv = json.loads(open(sft).readline())["messages"]
 if TEMPLATE == "chatml":
     prompt = "".join(f"<|im_start|>{mm['role']}\n{mm['content']}<|im_end|>\n" for mm in conv[:2]) + "<|im_start|>assistant\n"

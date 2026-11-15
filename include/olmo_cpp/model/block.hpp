@@ -86,6 +86,9 @@ class ReorderedNormTransformerBlockImpl : public torch::nn::Module {
   RMSNorm feed_forward_norm_;
   /// SwiGLU FeedForward sublayer.
   FeedForward feed_forward_;
+  /// BlockType::PreNorm (Llama/Qwen2): the norms run on the sublayer INPUT,
+  /// x + attn(attention_norm(x)), instead of OLMo-2's x + attention_norm(attn(x)).
+  bool pre_norm_ = false;
 };
 
 /// Module-holder macro for ReorderedNormTransformerBlockImpl.

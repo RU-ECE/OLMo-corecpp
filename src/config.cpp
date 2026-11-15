@@ -87,6 +87,8 @@ TransformerConfig load_config_from_json(const std::string& path) {
   cfg.use_embedding_norm = j.value("use_embedding_norm", cfg.use_embedding_norm);
   cfg.hidden_size_multiple_of = j.value("hidden_size_multiple_of", cfg.hidden_size_multiple_of);
   cfg.hidden_size_multiplier = j.value("hidden_size_multiplier", cfg.hidden_size_multiplier);
+  cfg.ffn_hidden_size = j.value("ffn_hidden_size", cfg.ffn_hidden_size);
+  cfg.attention_bias = j.value("attention_bias", cfg.attention_bias);
   if (j.contains("embed_scale")) cfg.embed_scale = j["embed_scale"].get<double>();
   if (j.contains("embedding_init_std")) cfg.embedding_init_std = j["embedding_init_std"].get<double>();
 
@@ -99,6 +101,7 @@ TransformerConfig load_config_from_json(const std::string& path) {
     else if (s == "layer_norm_scaled") cfg.block_type = TransformerConfig::BlockType::LayerNormScaled;
     else if (s == "moe_reordered_norm") cfg.block_type = TransformerConfig::BlockType::MoEReorderedNorm;
     else if (s == "moe_hybrid_reordered_norm") cfg.block_type = TransformerConfig::BlockType::MoEHybridReorderedNorm;
+    else if (s == "pre_norm") cfg.block_type = TransformerConfig::BlockType::PreNorm;
     else throw std::runtime_error("Unknown block_type: " + s);
   }
 

@@ -1,0 +1,21 @@
+{
+  "_comment": "Qwen/Qwen2.5-Coder-14B(-Instruct) exactly (convert_hf / export_hf / eval tools): d=5120, 48 layers, 40 heads, GQA 8 KV heads (head_dim 128), FFN 13824, vocab 152064 (padded), untied LM head, pre-norm blocks, q/k/v bias, no QK-norm, rope_theta 1e6, no rope scaling.",
+  "d_model": 5120,
+  "vocab_size": 152064,
+  "n_layers": 48,
+  "n_heads": 40,
+  "n_kv_heads": 8,
+  "head_dim": -1,
+  "rope_theta": 1000000.0,
+  "layer_norm_eps": 1e-6,
+  "init_std": 0.02,
+  "use_qk_norm": false,
+  "use_head_qk_norm": false,
+  "block_type": "pre_norm",
+  "attention_backend": "sdpa",
+  "layer_norm_type": "rms_norm",
+  "ffn_hidden_size": 13824,
+  "attention_bias": true,
+  "use_embedding_norm": false,
+  "num_mtp_heads": 0
+}

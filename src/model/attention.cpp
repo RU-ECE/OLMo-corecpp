@@ -73,10 +73,22 @@ torch::Tensor AttentionImpl::packed_qkv_weight() {
   return cached_w_packed_;
 }
 
+torch::Tensor AttentionImpl::packed_qkv_bias() const {
+  if (!qkv_bias_) return torch::Tensor();
+  return torch::cat({w_q_->bias, w_k_->bias, w_v_->bias}, /*dim=*/0);  // tiny; kept in autograd
+}
+
+void AttentionImpl::add_qkv_bias(torch::Tensor& q, torch::Tensor& k, torch::Tensor& v) const {
+  if (!qkv_bias_) return;
+  q = q + w_q_->bias;
+  k = k + w_k_->bias;
+  v = v + w_v_->bias;
+}
+
 AttentionImpl::AttentionImpl(const TransformerConfig& cfg, int64_t /*layer_idx*/)
-    : w_q_(register_module("w_q", torch::nn::Linear(torch::nn::LinearOptions(cfg.d_model, cfg.n_heads * cfg.get_head_dim()).bias(false)))),
-      w_k_(register_module("w_k", torch::nn::Linear(torch::nn::LinearOptions(cfg.d_model, cfg.get_n_kv_heads() * cfg.get_head_dim()).bias(false)))),
-      w_v_(register_module("w_v", torch::nn::Linear(torch::nn::LinearOptions(cfg.d_model, cfg.get_n_kv_heads() * cfg.get_head_dim()).bias(false)))),
+    : w_q_(register_module("w_q", torch::nn::Linear(torch::nn::LinearOptions(cfg.d_model, cfg.n_heads * cfg.get_head_dim()).bias(cfg.attention_bias)))),
+      w_k_(register_module("w_k", torch::nn::Linear(torch::nn::LinearOptions(cfg.d_model, cfg.get_n_kv_heads() * cfg.get_head_dim()).bias(cfg.attention_bias)))),
+      w_v_(register_module("w_v", torch::nn::Linear(torch::nn::LinearOptions(cfg.d_model, cfg.get_n_kv_heads() * cfg.get_head_dim()).bias(cfg.attention_bias)))),
       w_out_(register_module("w_out", torch::nn::Linear(torch::nn::LinearOptions(cfg.n_heads * cfg.get_head_dim(), cfg.d_model).bias(false)))),
       n_heads_(cfg.n_heads),
       n_kv_heads_(cfg.get_n_kv_heads()),
@@ -84,6 +96,7 @@ AttentionImpl::AttentionImpl(const TransformerConfig& cfg, int64_t /*layer_idx*/
       n_heads_rep_(cfg.n_heads / cfg.get_n_kv_heads()),
       use_head_qk_norm_(cfg.use_head_qk_norm),
       sliding_window_size_(cfg.sliding_window_size) {
+  qkv_bias_ = cfg.attention_bias;
   // Optional QK-norm: stabilizes attention scores at large depths/widths.
   if (cfg.use_qk_norm) {
     if (cfg.use_head_qk_norm) {
@@ -162,7 +175,8 @@ torch::Tensor AttentionImpl::forward(
   // 3 Linears + 3 reshapes + 1 RoPE = 7 ATen calls.
   torch::Tensor q, k, v;
   const bool can_use_fused_qkv =
-      x.is_cuda() && !use_float8_ && !use_dora_ && !use_int4_ && !q_norm_ && !k_norm_ && rope_bufs != nullptr;
+      x.is_cuda() && !use_float8_ && !use_dora_ && !use_int4_ && !q_norm_ && !k_norm_ && !qkv_bias_ &&
+      rope_bufs != nullptr;
   if (can_use_fused_qkv) {
     auto w_packed = packed_qkv_weight();
     // RoPEBuffers stores pos_cos/pos_sin as [seq_len, head_dim] full-dim
@@ -205,14 +219,17 @@ torch::Tensor AttentionImpl::forward(
     q = int4_linear(int4_q_, x);
     k = int4_linear(int4_k_, x);
     v = int4_linear(int4_v_, x);
+    add_qkv_bias(q, k, v);
   } else if (use_dora_) {
-    // DoRA: per-projection frozen base + trainable low-rank adapter.
+    // DoRA: per-projection frozen base + trainable low-rank adapter. The
+    // adapter scales the WEIGHT only; the (frozen) bias is added after.
     q = (*dora_q_)->forward(x, w_q_->weight);
     k = (*dora_k_)->forward(x, w_k_->weight);
     v = (*dora_v_)->forward(x, w_v_->weight);
+    add_qkv_bias(q, k, v);
   } else if (!use_float8_) {
     auto w_packed = packed_qkv_weight();
-    auto qkv = fast_linear(x, w_packed, torch::Tensor());
+    auto qkv = fast_linear(x, w_packed, packed_qkv_bias());
     const int64_t q_dim  = n_heads_    * head_dim_;
     const int64_t kv_dim = n_kv_heads_ * head_dim_;
     q = qkv.narrow(-1, 0,                  q_dim);
@@ -295,9 +312,13 @@ torch::Tensor AttentionImpl::forward_with_mask(
     const torch::Tensor& positions) {
   auto B = x.size(0);
   auto S = x.size(1);
-  auto q = use_int4_ ? int4_linear(int4_q_, x) : w_q_(x);
-  auto k = use_int4_ ? int4_linear(int4_k_, x) : w_k_(x);
-  auto v = use_int4_ ? int4_linear(int4_v_, x) : w_v_(x);
+  torch::Tensor q, k, v;
+  if (use_int4_) {
+    q = int4_linear(int4_q_, x); k = int4_linear(int4_k_, x); v = int4_linear(int4_v_, x);
+    add_qkv_bias(q, k, v);
+  } else {
+    q = w_q_(x); k = w_k_(x); v = w_v_(x);   // nn::Linear adds its own bias
+  }
   if (q_norm_ && !use_head_qk_norm_) q = (*q_norm_)(q);
   if (k_norm_ && !use_head_qk_norm_) k = (*k_norm_)(k);
   q = q.view({B, S, n_heads_,   head_dim_}).transpose(1, 2);
@@ -358,7 +379,8 @@ torch::Tensor AttentionImpl::forward_paged(
   // training-side `forward` uses, dropped into the inference (paged) path.
   // Replaces 3 Linears + 3 reshapes + 1 RoPE with a single launch.
   const bool can_use_fused_qkv =
-      x.is_cuda() && !use_float8_ && !use_dora_ && !use_int4_ && !q_norm_ && !k_norm_ && rope_bufs != nullptr;
+      x.is_cuda() && !use_float8_ && !use_dora_ && !use_int4_ && !q_norm_ && !k_norm_ && !qkv_bias_ &&
+      rope_bufs != nullptr;
   if (can_use_fused_qkv) {
     auto w_packed = packed_qkv_weight();
     auto cos_full = rope_bufs->pos_cos.narrow(0, start_pos, S);
@@ -384,6 +406,7 @@ torch::Tensor AttentionImpl::forward_paged(
       q = int4_linear(int4_q_, x);
       k = int4_linear(int4_k_, x);
       v = int4_linear(int4_v_, x);
+      add_qkv_bias(q, k, v);
     } else {
       q = linear_maybe_fp8(w_q_, fp8_qx_.get(), fp8_qw_.get(), x);
       k = linear_maybe_fp8(w_k_, fp8_kx_.get(), fp8_kw_.get(), x);

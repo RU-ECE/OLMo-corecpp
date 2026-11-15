@@ -243,6 +243,7 @@ set(OLMO_SOURCES
     src/train/callbacks/all_callbacks.cpp
     # IO abstraction
     src/io/filesystem.cpp
+    src/io/load_matching.cpp
     # HuggingFace conversion
     src/nn/hf_convert.cpp
     # Multi-Resolution Embedding (DC-MRE)
@@ -789,6 +790,12 @@ add_executable(eval_sft_loss tools/eval_sft_loss.cpp)
 target_link_libraries(eval_sft_loss PRIVATE olmo_cpp)
 target_include_directories(eval_sft_loss PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cnpy)
 target_compile_options(eval_sft_loss PRIVATE -O2)
+
+# Logits parity with Hugging Face (full forward, KV-cached decode, DoRA at init).
+add_executable(test_hf_logits tools/test_hf_logits.cpp)
+target_link_libraries(test_hf_logits PRIVATE olmo_cpp)
+target_include_directories(test_hf_logits PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cnpy)
+target_compile_options(test_hf_logits PRIVATE -O2)
 
 # A DoRA finetune starts exactly at the base model (init_weights must not touch the adapters).
 add_executable(test_dora_init tools/test_dora_init.cpp)

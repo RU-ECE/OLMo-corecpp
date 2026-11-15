@@ -47,6 +47,9 @@
 #include <filesystem>
 #include <iostream>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #ifdef HAS_NLOHMANN_JSON
 #include <nlohmann/json.hpp>
@@ -64,7 +67,7 @@ namespace {
 ///   blocks.{i}.feed_forward.{w1,w2,w3}.weight
 ///   lm_head.norm.weight, lm_head.w_out.weight
 ///   mtp_heads.{k}.proj.weight, mtp_heads.{k}.norm.weight
-std::string hf_to_olmo_name(const std::string& hf_name) {
+std::string hf_to_olmo_name(const std::string& hf_name, bool pre_norm) {
   // Embeddings
   if (hf_name == "model.embed_tokens.weight") return "embeddings.weight";
 
@@ -89,6 +92,10 @@ std::string hf_to_olmo_name(const std::string& hf_name) {
     if (suffix == "self_attn.k_proj.weight") return prefix + ".attention.w_k.weight";
     if (suffix == "self_attn.v_proj.weight") return prefix + ".attention.w_v.weight";
     if (suffix == "self_attn.o_proj.weight") return prefix + ".attention.w_out.weight";
+    // Qwen2 q/k/v bias (attention_bias=true in the model config)
+    if (suffix == "self_attn.q_proj.bias") return prefix + ".attention.w_q.bias";
+    if (suffix == "self_attn.k_proj.bias") return prefix + ".attention.w_k.bias";
+    if (suffix == "self_attn.v_proj.bias") return prefix + ".attention.w_v.bias";
 
     // QK norms
     if (suffix == "self_attn.q_norm.weight") return prefix + ".attention.q_norm.weight";
@@ -107,9 +114,19 @@ std::string hf_to_olmo_name(const std::string& hf_name) {
     // (The previous mapping assumed Llama pre-norm names: it left attention_norm
     //  random and dropped post_feedforward_layernorm -> the 32 skipped tensors ->
     //  garbage generation.)
+    //
+    // Llama/Qwen2 PRE-norm (block_type pre_norm) uses the same HF name for a
+    // different norm: input_layernorm normalizes the attention INPUT and
+    // post_attention_layernorm the FFN INPUT, so there
+    //   input_layernorm          -> attention_norm
+    //   post_attention_layernorm -> feed_forward_norm
+    if (pre_norm) {
+      if (suffix == "input_layernorm.weight")          return prefix + ".attention_norm.weight";
+      if (suffix == "post_attention_layernorm.weight") return prefix + ".feed_forward_norm.weight";
+      return hf_name;
+    }
     if (suffix == "post_attention_layernorm.weight")   return prefix + ".attention_norm.weight";
     if (suffix == "post_feedforward_layernorm.weight") return prefix + ".feed_forward_norm.weight";
-    if (suffix == "input_layernorm.weight")            return prefix + ".attention_norm.weight";  // Llama pre-norm fallback
 
     return hf_name;  // unmapped
   }
@@ -161,8 +178,16 @@ int main(int argc, char** argv) {
     // initialization. MTP head weights stay at this random init since
     // they don't exist in upstream HF checkpoints.
     // -----------------------------------------------------------------
+    // Built in bf16 unless --fp32: a 14B model is 59 GB in fp32. The default
+    // dtype is restored right after construction. Every base parameter is
+    // overwritten from the safetensors (checked below), so init_weights only
+    // matters for MTP heads.
+    const auto prev_dtype = torch::get_default_dtype();
+    if (!fp32) torch::set_default_dtype(caffe2::TypeMeta::Make<at::BFloat16>());
     auto model = olmo_cpp::Transformer(cfg);
-    model->init_weights();
+    torch::set_default_dtype(prev_dtype);
+    if (cfg.num_mtp_heads > 0) model->init_weights();
+    const bool pre_norm = cfg.block_type == olmo_cpp::TransformerConfig::BlockType::PreNorm;
 
     // -----------------------------------------------------------------
     // Phase 4: find all .safetensors shards in --hf-dir and sort them
@@ -198,6 +223,8 @@ int main(int argc, char** argv) {
     }
 
     int loaded = 0, skipped = 0;
+    std::unordered_set<std::string> filled;
+    std::vector<std::string> unused;  // checkpoint tensors the model did not take
 
     // -----------------------------------------------------------------
     // Phase 6: stream every safetensors shard and copy each tensor into
@@ -209,29 +236,64 @@ int main(int argc, char** argv) {
       auto tensors = olmo_cpp::safetensors::load(st_file);
 
       for (const auto& [hf_name, hf_tensor] : tensors) {
-        std::string our_name = hf_to_olmo_name(hf_name);
+        std::string our_name = hf_to_olmo_name(hf_name, pre_norm);
         auto it = our_params.find(our_name);
         if (it != our_params.end()) {
-          auto target = fp32 ? hf_tensor.to(torch::kFloat32) : hf_tensor;
+          auto target = hf_tensor.to(it->second->scalar_type());
           // Check shape match
           if (it->second->sizes() != target.sizes()) {
             std::cerr << "  Shape mismatch: " << our_name
                       << " expected " << it->second->sizes()
-                      << " got " << target.sizes() << " — skipping\n";
+                      << " got " << target.sizes() << "\n";
+            unused.push_back(hf_name);
             skipped++;
             continue;
           }
           torch::NoGradGuard no_grad;
           it->second->copy_(target);
+          filled.insert(our_name);
           loaded++;
         } else {
           std::cout << "  Unmapped: " << hf_name << " → " << our_name << "\n";
+          // rotary inv_freq is recomputed from rope_theta; anything else unused
+          // means the config does not describe this checkpoint.
+          if (hf_name.find("rotary_emb.inv_freq") == std::string::npos) unused.push_back(hf_name);
           skipped++;
         }
       }
     }
 
+    // Tied embeddings (Qwen2.5-0.5B/1.5B/3B): the file has no lm_head.weight.
+    if (!filled.count("lm_head.w_out.weight") && filled.count("embeddings.weight")) {
+      torch::NoGradGuard no_grad;
+      our_params.at("lm_head.w_out.weight")->copy_(*our_params.at("embeddings.weight"));
+      filled.insert("lm_head.w_out.weight");
+      std::cout << "lm_head.w_out.weight <- embeddings.weight (tied word embeddings)\n";
+    }
+
     std::cout << "\nLoaded " << loaded << " params, skipped " << skipped << "\n";
+
+    // Every parameter except fresh MTP heads and the unused embedding norm must
+    // come from the checkpoint. A missed name used to leave random weights and
+    // garbage output with only an "Unmapped" line in a long log.
+    std::vector<std::string> missing;
+    for (auto& item : named_params) {
+      const auto& k = item.key();
+      if (filled.count(k) || k.rfind("mtp_heads.", 0) == 0) continue;
+      if (k == "embedding_norm.weight" && !cfg.use_embedding_norm) continue;
+      missing.push_back(k);
+    }
+    if (!unused.empty()) {
+      std::cerr << unused.size() << " checkpoint tensor(s) did not fit the model config"
+                   " (wrong block_type / attention_bias / sizes?), e.g.:\n";
+      for (size_t i = 0; i < unused.size() && i < 10; ++i) std::cerr << "  " << unused[i] << "\n";
+      return 1;
+    }
+    if (!missing.empty()) {
+      std::cerr << missing.size() << " parameter(s) were not in the checkpoint, e.g.:\n";
+      for (size_t i = 0; i < missing.size() && i < 10; ++i) std::cerr << "  " << missing[i] << "\n";
+      return 1;
+    }
 
     if (cfg.num_mtp_heads > 0) {
       std::cout << "MTP heads (" << cfg.num_mtp_heads

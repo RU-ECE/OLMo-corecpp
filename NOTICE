@@ -1,0 +1,11 @@
+OLMo-corecpp (llm-cpp)
+Copyright 2026 The OLMo-corecpp contributors
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This project is a C++/LibTorch implementation of models and training recipes from the OLMo family
+(Allen Institute for AI, https://github.com/allenai/OLMo-core, Apache License 2.0); model weights loaded by
+this code (OLMo-2, Qwen2) carry their own licences.
+
+Third-party code included in this repository:
+- third_party/cnpy: cnpy by Carl Rogers, MIT License (https://github.com/rogersce/cnpy).

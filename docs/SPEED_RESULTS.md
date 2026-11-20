@@ -252,11 +252,20 @@ rows fit the default 48 KB up to D = 6140, wider rows now opt in to the device's
 and rows that still do not fit use the exact formula in ATen. `test_cuda_parity` checks the gradient at
 D = 768, 5120, 8192 (opt-in) and 24576 (fallback), bf16 and fp32: all pass on the A100.
 
-Open, found by the same `test_cuda_parity` run (A100, 2026-11-15) and not on the DoRA training path:
-the fused FFN WMMA kernel's bf16 forward is off by 128 (tolerance 0.2), and the fused QKV+RoPE kernel's
-bf16 forward q/k are off by 0.5 (tolerance 0.05). The fused FFN runs only with `fused 1`; the fused QKV
-path runs on CUDA for models with no QK-norm, no q/k/v bias and no DoRA (e.g. Llama-style), training and
-paged inference. Both need a root cause before either path is trusted.
+Closed 2026-11-20 (Colab A100-40GB): the two fused-kernel "failures" of 2026-11-15 (fused FFN WMMA bf16 forward
+off by 128, fused QKV+RoPE bf16 q/k off by 0.5) were the test's fixed absolute tolerances, not the kernels.
+Unscaled randn inputs put the FFN output at 2.3e4 (one bf16 step = 128) and q/k at ~150. Against an fp64 truth
+the fused kernels' relative error equals plain ATen bf16's (FFN 3.464e-3 vs 3.464e-3; q 4.00e-3 vs 3.97e-3;
+k 2.97e-3 vs 3.86e-3), and on inputs scaled to O(1) outputs they pass the original absolute tolerances with
+room (FFN 0.016 vs 0.2; q 0.031, k 0.016 vs 0.05). Planted 2% errors fail the new check. The same work found
+the RMSNorm bf16 grad_w tolerance (0.15) below one bf16 step at d = 24576; it is now one step of the value's
+magnitude, with a planted 5% error shown to fail. Full output: `docs/results/colab-2026-11-20/cuda_parity_a100.md`.
+
+## 5b. Colab run of 2026-11-20 (all compute on Colab)
+
+Results and raw-number tables in `docs/results/colab-2026-11-20/`: SL-MTP heads on 16M tokens (1.178x at
+30 prompts, 48.3% draft acceptance; head capacity ruled out as the limit), CUDA parity (fused-kernel items
+closed), the colibri CPU baseline, and the first gaze-model check against UEyes.
 
 ## 6. Ideas and open problems (not yet measured)
 

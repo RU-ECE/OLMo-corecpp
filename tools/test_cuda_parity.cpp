@@ -56,6 +56,28 @@ void result(const std::string& tag, float diff, float tol) {
   std::cout << "  [ok]\n";
 }
 
+// Forward check against an fp64 truth computed from the same bf16 inputs. A fixed absolute
+// tolerance is wrong for unscaled randn inputs: the FFN output reaches ~1e4, where one bf16 step is
+// 64, so "off by 128" is 2 steps, not a bug. The fused kernel passes when its relative error is no
+// worse than twice plain ATen bf16's (plus 1e-3), and under 2%. The same check is run on a planted
+// 2% error first, which must fail, so the gate is shown able to fail.
+bool rel_ok(float e_f, float e_a) { return e_f <= 2.f * e_a + 1e-3f && e_f < 2e-2f; }
+float rel_err(torch::Tensor a, torch::Tensor truth) {
+  return ((a.to(torch::kFloat64) - truth).abs().max() / truth.abs().max()).item<float>();
+}
+void vs_truth(const std::string& tag, torch::Tensor fused, torch::Tensor aten, torch::Tensor truth) {
+  const float e_f = rel_err(fused, truth), e_a = rel_err(aten, truth);
+  const float e_p = rel_err(fused.to(torch::kFloat64) * 1.02, truth);
+  std::cout << "  " << std::left << std::setw(40) << tag << std::scientific << std::setprecision(3)
+            << " rel err fused " << e_f << ", ATen bf16 " << e_a << ", |truth| max "
+            << truth.abs().max().item<double>() << ", planted 2% " << e_p;
+  if (rel_ok(e_p, e_a)) {
+    std::cout << "  [FAIL — planted error passed: the gate cannot fail]\n"; ++g_parity_failures; return;
+  }
+  if (!rel_ok(e_f, e_a)) { std::cout << "  [FAIL]\n"; ++g_parity_failures; return; }
+  std::cout << "  [ok]\n";
+}
+
 // Half-rotation RoPE reference used by both forward and inverse.
 torch::Tensor apply_rope_ref(torch::Tensor t, torch::Tensor cos, torch::Tensor sin) {
   const int64_t hd = t.size(-1);
@@ -115,7 +137,14 @@ int main() {
     // Tolerances are loose for bf16: the WMMA matmul rounds in fp32 then
     // narrows; ATen's linear does the same so they should match closely.
     // Backward gradient mismatch scales with the magnitude of the inputs.
-    result("forward y",          max_diff(y_fused, y_ref),        2e-1f);
+    std::cout << "  (info) forward y max |diff| " << max_diff(y_fused, y_ref) << "\n";
+    {
+      auto f64 = [](torch::Tensor t) { return t.detach().to(torch::kFloat64); };
+      auto gu = torch::nn::functional::linear(f64(x), f64(w_gate_up));
+      auto truth = torch::nn::functional::linear(
+          torch::silu(gu.narrow(-1, 0, H)) * gu.narrow(-1, H, H), f64(w_down));
+      vs_truth("forward y (vs fp64)", y_fused, y_ref, truth);
+    }
     result("backward grad_x",    max_diff(gx_f, x_r.grad()),       1e-1f);
     result("backward grad_w_gu", max_diff(gW_gu_f, wgu_r.grad()),  1e-1f);
     result("backward grad_w_dn", max_diff(gW_dn_f, wdn_r.grad()),  1e-1f);
@@ -157,11 +186,49 @@ int main() {
     auto loss_r = (qref * uq).sum() + (kref * uk).sum() + (vref * uv).sum();
     loss_r.backward();
 
-    result("forward q",        max_diff(qf, qref),         5e-2f);
-    result("forward k",        max_diff(kf, kref),         5e-2f);
+    std::cout << "  (info) forward q/k max |diff| " << max_diff(qf, qref) << " / " << max_diff(kf, kref) << "\n";
+    {
+      auto f64 = [](torch::Tensor t) { return t.detach().to(torch::kFloat64); };
+      auto q64 = torch::nn::functional::linear(f64(x), f64(w_qkv));
+      auto qt = q64.narrow(-1, 0, n_q * hd).view({B, S, n_q, hd}).transpose(1, 2).contiguous();
+      auto kt = q64.narrow(-1, n_q * hd, n_kv * hd).view({B, S, n_kv, hd}).transpose(1, 2).contiguous();
+      vs_truth("forward q (vs fp64)", qf, qref, apply_rope_ref(qt, f64(cos), f64(sin)));
+      vs_truth("forward k (vs fp64)", kf, kref, apply_rope_ref(kt, f64(cos), f64(sin)));
+    }
     result("forward v",        max_diff(vf, vref),         5e-2f);
     result("backward grad_x",  max_diff(gx_f, xr.grad()),  2e-1f);
     result("backward grad_W",  max_diff(gW_f, wr.grad()),  2e-1f);
+  }
+
+  // ── 2b. Discriminating check: the same fused kernels on inputs scaled so every output is O(1),
+  //        under the ORIGINAL absolute tolerances (0.2 FFN, 0.05 QKV). Rounding error shrinks with the
+  //        output's magnitude; a real indexing or math bug does not. Passing here plus the fp64 check
+  //        above means the 2026-11-15 failures were bf16 rounding on large outputs.
+  section("Fused FFN + QKV+RoPE on O(1) outputs — original absolute tolerances");
+  {
+    const int64_t B = 2, S = 32, d = 256, H = 768;
+    auto bf16 = torch::TensorOptions().dtype(torch::kBFloat16).device(dev);
+    auto x   = torch::randn({B, S, d}, bf16);
+    auto wgu = (torch::randn({2 * H, d}, bf16) / std::sqrt((double)d)).to(torch::kBFloat16);
+    auto wdn = (torch::randn({d, H}, bf16) / std::sqrt((double)H)).to(torch::kBFloat16);
+    auto y_f = olmo_cpp::fused_ffn_autograd(x, wgu, wdn);
+    auto gu  = torch::nn::functional::linear(x, wgu);
+    auto y_r = torch::nn::functional::linear(torch::silu(gu.narrow(-1, 0, H)) * gu.narrow(-1, H, H), wdn);
+    std::cout << "  (info) |y| max " << y_r.abs().max().item<float>() << "\n";
+    result("FFN forward y, O(1) outputs", max_diff(y_f, y_r), 2e-1f);
+
+    const int64_t S2 = 16, n_q = 8, n_kv = 8, hd = d / n_q, half = hd / 2;
+    auto x2 = torch::randn({B, S2, d}, bf16);
+    auto wq = (torch::randn({(n_q + 2 * n_kv) * hd, d}, bf16) / std::sqrt((double)d)).to(torch::kBFloat16);
+    auto ang = torch::rand({S2, half}, torch::TensorOptions().dtype(torch::kFloat32).device(dev)) * 6.2831853;
+    auto cs = ang.cos().to(torch::kBFloat16), sn = ang.sin().to(torch::kBFloat16);  // real RoPE tables: |cos|,|sin| <= 1
+    auto out = olmo_cpp::fused_qkv_rope_autograd(x2, wq, cs, sn, n_q, n_kv, hd);
+    auto qkv = torch::nn::functional::linear(x2, wq);
+    auto qr = apply_rope_ref(qkv.narrow(-1, 0, n_q * hd).view({B, S2, n_q, hd}).transpose(1, 2).contiguous(), cs, sn);
+    auto kr = apply_rope_ref(qkv.narrow(-1, n_q * hd, n_kv * hd).view({B, S2, n_kv, hd}).transpose(1, 2).contiguous(), cs, sn);
+    std::cout << "  (info) |q| max " << qr.abs().max().item<float>() << "\n";
+    result("QKV+RoPE forward q, O(1) outputs", max_diff(std::get<0>(out), qr), 5e-2f);
+    result("QKV+RoPE forward k, O(1) outputs", max_diff(std::get<1>(out), kr), 5e-2f);
   }
 
   // ── 3. Fused LM-head + softmax-CE ────────────────────────────────
@@ -231,9 +298,24 @@ int main() {
       (yr * upstream).sum().backward();
 
       const std::string tag = " d=" + std::to_string(d) + (bf ? " bf16" : " fp32");
-      result("forward y" + tag,        max_diff(y, yr),               bf ? 8e-2f : 1e-4f);
-      result("backward grad_x" + tag,  max_diff(x.grad(), xr.grad()), bf ? 1e-1f : 1e-3f);
-      result("backward grad_w" + tag,  max_diff(w.grad(), wr.grad()), bf ? 1.5e-1f : 1e-3f);
+      // bf16 keeps 8 significant bits: one rounding step is 2^-7 of the value's magnitude. grad_w sums
+      // B*S = 64 rows, so its largest entries reach ~32-64 where one step is 0.25; a fixed 0.15 failed
+      // or passed by the seed. The bf16 tolerance is the fixed one or one step at max|ref|, whichever is
+      // larger, and a planted 5% error must still fail it.
+      auto tol = [&](torch::Tensor ref, float fixed) {
+        return bf ? std::max(fixed, ref.abs().max().item<float>() / 128.f) : fixed;
+      };
+      result("forward y" + tag,        max_diff(y, yr),               tol(yr, bf ? 8e-2f : 1e-4f));
+      result("backward grad_x" + tag,  max_diff(x.grad(), xr.grad()), tol(xr.grad(), bf ? 1e-1f : 1e-3f));
+      result("backward grad_w" + tag,  max_diff(w.grad(), wr.grad()), tol(wr.grad(), bf ? 1.5e-1f : 1e-3f));
+      {
+        const float planted = max_diff(wr.grad().to(torch::kFloat32) * 1.05, wr.grad());
+        const float t = tol(wr.grad(), bf ? 1.5e-1f : 1e-3f);
+        std::cout << "  " << std::left << std::setw(40) << ("planted 5% grad_w error" + tag) << " max |diff| = "
+                  << std::scientific << std::setprecision(3) << planted
+                  << (planted > t ? "  [ok: the check can fail]\n" : "  [FAIL — tolerance too loose to see it]\n");
+        if (planted <= t) ++g_parity_failures;
+      }
     }
   }
 

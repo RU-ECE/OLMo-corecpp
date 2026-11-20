@@ -13,7 +13,17 @@ set -uo pipefail
 L=${LLMCPP:-/content/llm-cpp}; K=${KILLTEST:-/content/killtest}
 W=${WORK:-/mnt/local-scratch/slmtp}; R=$W/results
 TOKENS=${TOKENS:-16000000}
-mkdir -p "$W" "$R"
+# Results must outlive the runtime (the 2026-11-15 run was lost at step 6,000): refuse to start
+# without a durable copy target unless SAVE=none is given on purpose.
+SAVE=${SAVE:-/content/drive/MyDrive/llm-cpp-slmtp}
+if [ "$SAVE" != none ] && [ ! -d "$(dirname "$SAVE")" ]; then
+  echo "FAILED: $(dirname "$SAVE") missing; mount Drive first (or SAVE=none)"; exit 1
+fi
+mkdir -p "$W" "$R"; [ "$SAVE" != none ] && mkdir -p "$SAVE"
+save() { [ "$SAVE" != none ] && cp -f "$@" "$SAVE"/ 2>/dev/null; true; }
+for f in olmo2_1b.json heads_sl_r128.pt heads_sl_r128_big_greedy.pt; do
+  [ -s "$K/$f" ] || { echo "FAILED: $K/$f missing (upload it before the run)"; exit 1; }
+done
 log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$R/run.log"; }
 fail() { log "FAILED: $*"; exit 1; }
 B=$L/build-cuda
@@ -65,6 +75,7 @@ if [ ! -s "$NEW" ]; then
     --batch 2 --device cuda --variant sl --rank 128 --lr 1e-3 --epochs 1 --target greedy --save "$NEW" \
     > "$R/train.json" 2> "$R/train.log" || { tail -5 "$R/train.log"; fail "train"; }
 fi
+save "$NEW" "$R"/train.json "$R"/train.log "$R"/extract.json "$R"/run.log
 
 log "decode: old and new heads on the unseen valid prompts"
 : > "$R/decode.jsonl"
@@ -74,6 +85,7 @@ for heads in "$K/heads_sl_r128.pt" "$K/heads_sl_r128_big_greedy.pt" "$NEW"; do
           --K 3 --draft "$d" --vocab "$W/hf/vocab.json" --merges "$W/hf/merges.txt" --text "$W/TinyStories-valid.txt" \
           --prompts 6 --prompt-len 64 --new 128 --skip 20000 --device cuda 2>> "$R/decode.log" | tail -1)
     echo "{\"heads\": \"$(basename "$heads")\", \"result\": $out}" >> "$R/decode.jsonl"
+    save "$R/decode.jsonl"
   done
 done
 python3 - <<PY | tee "$R/summary.txt"
@@ -86,5 +98,6 @@ for l in open("$R/decode.jsonl"):
     print(f"{j['heads']:40} draft {r['draft']}  speedup {r['speedup']:.3f}  accept {r['acceptance']:.3f}  "
           f"tok/fwd {r['tokens_per_forward']:.2f}  identical {r['outputs_identical']}")
 PY
-[ -d /content/drive/MyDrive ] && mkdir -p /content/drive/MyDrive/llm-cpp-slmtp && cp "$R"/* "$NEW" /content/drive/MyDrive/llm-cpp-slmtp/ 2>/dev/null
+save "$R"/* "$NEW"
+echo "--- summary.txt"; cat "$R/summary.txt"; echo "--- decode.jsonl"; cat "$R/decode.jsonl"
 log "SLMTP_SCALE_DONE"
